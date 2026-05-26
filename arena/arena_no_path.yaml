@@ -1,0 +1,37 @@
+world:
+  height: 50
+  width: 50
+
+robot:
+  kinematics: {name: 'diff'}
+  shape: {name: 'circle', radius: 0.2}
+  state: [2, 2, 0]
+  goal:  [48, 48, 0]
+  color: 'g'
+  sensors:
+    - name: 'lidar2d'
+      range_min: 0.05
+      range_max: 10.0
+      angle_range: 6.283185307179586   # 2*pi
+      number: 360
+      alpha: 0.2                       # opacity; if T0 finds alpha invalid in irsim parser, the orchestrator will strip this later
+  plot:
+    show_trajectory: True
+    show_goal: True
+
+obstacle:
+  # Top wall — horizontal, north side of the box
+  - shape: {name: 'rectangle', length: 1.5, width: 0.2}
+    state: [2, 3, 0]
+
+  # Bottom wall — horizontal, south side
+  - shape: {name: 'rectangle', length: 1.5, width: 0.2}
+    state: [2, 1, 0]
+
+  # Left wall — vertical, west side (rotated by pi/2)
+  - shape: {name: 'rectangle', length: 1.5, width: 0.2}
+    state: [1, 2, 1.5707963267948966]
+
+  # Right wall — vertical, east side (rotated by pi/2)
+  - shape: {name: 'rectangle', length: 1.5, width: 0.2}
+    state: [3, 2, 1.5707963267948966]
