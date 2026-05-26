@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import filecmp
+import json
 import os
+import re
+import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -563,6 +568,248 @@ def tc13(yaml_path: str, seed: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# TC14..TC16 — runner integration checks. These subprocess-invoke
+# `python -m runners.run_episode`, then validate the resulting metrics JSON
+# and trace JSONL artifacts under a tempdir. Subprocess cwd is the repo root
+# (parent of arena/) so `runners.run_episode` resolves correctly and relative
+# --world paths like `arena/arena_v1.yaml` resolve from the same anchor.
+# ---------------------------------------------------------------------------
+
+
+TC14_TRACE_REQUIRED_KEYS = frozenset(
+    {"action", "crashed", "done", "lidar_sha256", "reached_goal", "state", "step"}
+)
+TC14_METRICS_REQUIRED_KEYS = frozenset(
+    {
+        "time_to_goal",
+        "crashed",
+        "timed_out",
+        "path_length",
+        "mean_speed",
+        "wallclock_per_step",
+        "planner_error",
+    }
+)
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def tc14(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses fixed internal seed for determinism
+    """Full a_star_once drive through run_episode + trace-line schema audit."""
+    repo_root = Path(__file__).resolve().parent.parent
+    with tempfile.TemporaryDirectory() as td:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "runners.run_episode",
+                "--algorithm",
+                "a_star_once",
+                "--seed",
+                "42",
+                "--world",
+                yaml_path,
+                "--results-dir",
+                td,
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert result.returncode == 0, (
+            f"TC14 runner exit code {result.returncode}; "
+            f"stderr={result.stderr[-500:]}"
+        )
+
+        json_path = Path(td) / "a_star_once" / "42.json"
+        jsonl_path = Path(td) / "a_star_once" / "42.trace.jsonl"
+        assert json_path.exists(), f"TC14: metrics JSON missing at {json_path}"
+        assert jsonl_path.exists(), f"TC14: trace JSONL missing at {jsonl_path}"
+
+        metrics = json.loads(json_path.read_text(encoding="utf-8"))
+        # Lazy-import speed bounds from manual_astar (mirrors tc10's sys.path pattern).
+        repo_root_str = str(repo_root)
+        if repo_root_str not in sys.path:
+            sys.path.insert(0, repo_root_str)
+        from manual_astar import (  # type: ignore[import-not-found]
+            MAX_LINEAR_SPEED,
+            MIN_LINEAR_SPEED,
+        )
+
+        assert set(metrics) == TC14_METRICS_REQUIRED_KEYS, (
+            f"TC14 metrics keys mismatch: got {set(metrics)}, "
+            f"expected {set(TC14_METRICS_REQUIRED_KEYS)}"
+        )
+        assert metrics["planner_error"] is None, f"TC14 planner_error not None: {metrics}"
+        assert metrics["crashed"] is False, f"TC14 crashed: {metrics}"
+        assert metrics["timed_out"] is False, f"TC14 timed_out: {metrics}"
+        assert metrics["time_to_goal"] is not None, f"TC14 time_to_goal is None: {metrics}"
+        assert 50.0 < metrics["time_to_goal"] < 120.0, (
+            f"TC14 time_to_goal out of range (50, 120): {metrics}"
+        )
+        assert metrics["path_length"] > 64.0, f"TC14 path_length too short: {metrics}"
+        assert MIN_LINEAR_SPEED <= metrics["mean_speed"] <= MAX_LINEAR_SPEED, (
+            f"TC14 mean_speed out of [{MIN_LINEAR_SPEED}, {MAX_LINEAR_SPEED}]: {metrics}"
+        )
+        assert metrics["mean_speed"] > 0.5, f"TC14 mean_speed too low: {metrics}"
+
+        lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) > 1, f"TC14 trace too short: {len(lines)} lines"
+        for idx, line in enumerate(lines):
+            row = json.loads(line)
+            assert set(row) == TC14_TRACE_REQUIRED_KEYS, (
+                f"TC14 trace line {idx} keys mismatch: got {set(row)}, "
+                f"expected {set(TC14_TRACE_REQUIRED_KEYS)}"
+            )
+            assert isinstance(row["step"], int), (
+                f"TC14 line {idx} step type: {type(row['step']).__name__}"
+            )
+            assert isinstance(row["state"], list) and len(row["state"]) == 3, (
+                f"TC14 line {idx} state shape: {row['state']!r}"
+            )
+            assert all(isinstance(x, (int, float)) for x in row["state"]), (
+                f"TC14 line {idx} state element types: {row['state']!r}"
+            )
+            assert isinstance(row["action"], list) and len(row["action"]) == 2, (
+                f"TC14 line {idx} action shape: {row['action']!r}"
+            )
+            assert all(isinstance(x, (int, float)) for x in row["action"]), (
+                f"TC14 line {idx} action element types: {row['action']!r}"
+            )
+            assert isinstance(row["lidar_sha256"], str) and _HEX64_RE.match(
+                row["lidar_sha256"]
+            ), f"TC14 line {idx} lidar_sha256: {row['lidar_sha256']!r}"
+            assert isinstance(row["crashed"], bool), (
+                f"TC14 line {idx} crashed type: {type(row['crashed']).__name__}"
+            )
+            assert isinstance(row["reached_goal"], bool), (
+                f"TC14 line {idx} reached_goal type: {type(row['reached_goal']).__name__}"
+            )
+            assert isinstance(row["done"], bool), (
+                f"TC14 line {idx} done type: {type(row['done']).__name__}"
+            )
+
+        first = json.loads(lines[0])
+        assert first["step"] == 0, f"TC14 first line step != 0: {first}"
+        assert first["state"] == [2.0, 2.0, 0.0], (
+            f"TC14 first line state != [2.0, 2.0, 0.0]: {first}"
+        )
+        assert first["action"] == [0.0, 0.0], (
+            f"TC14 first line action != [0.0, 0.0]: {first}"
+        )
+        assert first["done"] is False and first["reached_goal"] is False, (
+            f"TC14 first line done/reached_goal flags: {first}"
+        )
+
+        last = json.loads(lines[-1])
+        assert last["done"] is True, f"TC14 last line done != True: {last}"
+        assert last["reached_goal"] is True, (
+            f"TC14 last line reached_goal != True: {last}"
+        )
+
+
+def tc15(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """Determinism: two same-seed subprocess runs produce byte-identical trace JSONL."""
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    runner_args = [
+        sys.executable,
+        "-m",
+        "runners.run_episode",
+        "--algorithm",
+        "a_star_once",
+        "--seed",
+        "42",
+        "--world",
+        yaml_path,
+    ]
+    with tempfile.TemporaryDirectory() as td_a, tempfile.TemporaryDirectory() as td_b:
+        for td in (td_a, td_b):
+            r = subprocess.run(
+                [*runner_args, "--results-dir", td],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            assert r.returncode == 0, (
+                f"TC15 runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+            )
+
+        jsonl_a = Path(td_a) / "a_star_once" / "42.trace.jsonl"
+        jsonl_b = Path(td_b) / "a_star_once" / "42.trace.jsonl"
+        assert jsonl_a.exists() and jsonl_b.exists(), (
+            f"TC15 trace JSONLs missing: a_exists={jsonl_a.exists()}, "
+            f"b_exists={jsonl_b.exists()}"
+        )
+        assert filecmp.cmp(str(jsonl_a), str(jsonl_b), shallow=False), (
+            "TC15 trace JSONLs differ — same-seed determinism broken (issue lives in "
+            "runners/run_episode.py, not arena.py)"
+        )
+
+        json_a = json.loads(
+            (Path(td_a) / "a_star_once" / "42.json").read_text(encoding="utf-8")
+        )
+        json_b = json.loads(
+            (Path(td_b) / "a_star_once" / "42.json").read_text(encoding="utf-8")
+        )
+        json_a.pop("wallclock_per_step", None)
+        json_b.pop("wallclock_per_step", None)
+        assert json_a == json_b, (
+            f"TC15 metrics differ (excluding wallclock_per_step): "
+            f"a={json_a} b={json_b}"
+        )
+
+
+def tc16(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal world
+    """Planner failure path: arena_no_path.yaml yields planner_error and no trace JSONL."""
+    repo_root = Path(__file__).resolve().parent.parent
+    no_path_yaml = str(repo_root / "arena" / "arena_no_path.yaml")
+    with tempfile.TemporaryDirectory() as td:
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "runners.run_episode",
+                "--algorithm",
+                "a_star_once",
+                "--seed",
+                "0",
+                "--world",
+                no_path_yaml,
+                "--results-dir",
+                td,
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert r.returncode == 0, (
+            f"TC16 runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+        )
+
+        json_path = Path(td) / "a_star_once" / "0.json"
+        jsonl_path = Path(td) / "a_star_once" / "0.trace.jsonl"
+        assert json_path.exists(), f"TC16 metrics JSON missing at {json_path}"
+        assert not jsonl_path.exists(), (
+            f"TC16 trace JSONL must NOT exist on planner failure; found {jsonl_path}"
+        )
+
+        metrics = json.loads(json_path.read_text(encoding="utf-8"))
+        assert metrics["planner_error"] is not None, (
+            f"TC16 planner_error must not be None: {metrics}"
+        )
+        assert "could not find a path" in metrics["planner_error"], (
+            f"TC16 planner_error must contain 'could not find a path': {metrics}"
+        )
+        assert metrics["time_to_goal"] is None, (
+            f"TC16 time_to_goal must be None on planner failure: {metrics}"
+        )
+        assert metrics["crashed"] is False, f"TC16 crashed flag: {metrics}"
+        assert metrics["timed_out"] is False, f"TC16 timed_out flag: {metrics}"
+
+
+# ---------------------------------------------------------------------------
 # CLI runner — --check (default) or --render. See module docstring above.
 # ---------------------------------------------------------------------------
 
@@ -583,6 +830,9 @@ def _run_checks(yaml_path: str, seed: int) -> int:
         ("TC11: YAML schema fields", tc11),
         ("TC12: lidar beam mismatch raises ArenaConfigError", tc12),
         ("TC13: wall crash via teleport", tc13),
+        ("TC14: full A* drive via runner", tc14),
+        ("TC15: determinism — same seed -> byte-identical trace", tc15),
+        ("TC16: planner failure on arena_no_path.yaml", tc16),
     ]
     failures = 0
     for label, fn in cases:
