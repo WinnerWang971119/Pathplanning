@@ -1,0 +1,38 @@
+world:
+  height: 10 
+  width: 10   
+
+robot:
+  kinematics: {name: 'diff'}  
+  shape: {name: 'circle', radius: 0.2}  
+  state: [1, 1, 0]  
+  goal: [9, 9, 0] 
+  color: 'g'
+  sensors:
+    - name: 'lidar2d'
+      range_min: 0.05
+      range_max: 2.5
+      angle_range: 3.141592653589793
+      number: 91
+      alpha: 0.2
+  plot:
+    show_trajectory: True
+    show_goal: True
+
+obstacle:
+  - shape: {name: 'circle', radius: 1.0}  # radius
+    state: [5, 5, 0]  
+  
+  - shape: {name: 'rectangle', length: 1.5, width: 1.2}  # length, width
+    state: [6, 5, 1] 
+
+  - shape: {name: 'linestring', vertices: [[5, 5], [4, 0], [1, 6]] }  # vertices
+    state: [0, 0, 0] 
+
+  - shape:
+      name: 'polygon'
+      vertices: 
+        - [4.5, 4.5]
+        - [5.5, 4.5]
+        - [5.5, 5.5]
+        - [4.5, 5.5]

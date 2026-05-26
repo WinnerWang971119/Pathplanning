@@ -1,0 +1,11 @@
+world:
+  height: 2
+  width: 2
+robot:
+  kinematics: {name: 'diff'}
+  shape: {name: 'circle', radius: 0.2}
+  state: [1, 1, 0]
+  goal: [1.8, 1.8, 0]
+obstacle:
+  - shape: {name: 'circle', radius: 0.4}
+    state: [1, 1, 0]

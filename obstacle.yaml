@@ -1,0 +1,13 @@
+world:
+  height: 10 
+  width: 10   
+
+robot:
+  kinematics: {name: 'diff'}  
+  shape: {name: 'circle', radius: 0.2}  
+  state: [1, 1, 0] # Initial location  
+  goal: [9, 9, 0]  # Goal location
+  color: 'g'
+  plot:
+    show_trajectory: True
+    show_goal: True
