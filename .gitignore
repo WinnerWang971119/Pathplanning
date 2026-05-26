@@ -16,3 +16,7 @@ Thumbs.db
 
 # Scratch files
 _tmp_*
+
+# Generated experiment data — see Mission.md Phase 1
+results/*
+!results/.gitkeep
