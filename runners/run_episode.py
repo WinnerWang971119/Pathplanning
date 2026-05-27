@@ -14,8 +14,10 @@ Programmatic:
                "--world", "arena/arena_v1.yaml", "--results-dir", "out"])
 
 Outputs:
-    <results-dir>/<algorithm>/<seed>.json         — 7-field metrics JSON (always written)
-    <results-dir>/<algorithm>/<seed>.trace.jsonl  — per-step trace (only on planning success)
+    <results-dir>/<world_stem>/<algorithm>/<seed>.json         — 7-field metrics JSON (always written)
+    <results-dir>/<world_stem>/<algorithm>/<seed>.trace.jsonl  — per-step trace (only on planning success)
+    where <world_stem> = Path(args.world).stem (e.g. "arena_v1", "arena_v2_hard", "arena_no_path").
+    World-level partitioning prevents same-seed runs on different worlds from overwriting each other.
 
 Exit codes:
     0 — episode terminated (success, crash, timeout, or planner failure all return 0)
@@ -76,6 +78,7 @@ class RunnerArgs:
     world: str
     render: bool
     results_dir: str
+    traffic: bool
 
 
 def _parse_args(argv: list[str] | None) -> RunnerArgs:
@@ -108,8 +111,22 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
     parser.add_argument(
         "--results-dir",
         default="results",
-        help="Output directory root; results go in <results-dir>/<algorithm>/.",
+        help="Output directory root; results go in <results-dir>/<world_stem>/<algorithm>/.",
     )
+    traffic_group = parser.add_mutually_exclusive_group()
+    traffic_group.add_argument(
+        "--traffic",
+        dest="traffic",
+        action="store_true",
+        help="Enable Phase 2 crossing traffic (default).",
+    )
+    traffic_group.add_argument(
+        "--no-traffic",
+        dest="traffic",
+        action="store_false",
+        help="Disable traffic; produces a Phase-1-compatible run (deterministic, A* succeeds).",
+    )
+    parser.set_defaults(traffic=True)
     ns = parser.parse_args(argv)
     return RunnerArgs(
         algorithm=ns.algorithm,
@@ -117,6 +134,7 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         world=ns.world,
         render=bool(ns.render),
         results_dir=ns.results_dir,
+        traffic=bool(ns.traffic),
     )
 
 
@@ -129,11 +147,16 @@ def _trace_line(
     crashed: bool,
     reached_goal: bool,
     done: bool,
+    dynamic_obstacles_sha256: str | None = None,
 ) -> str:
     """Serialize one trace record to a compact, order-stable JSON string.
 
     `sort_keys=True` and `separators=(",", ":")` are mandatory — they guarantee
     byte-identical lines across two same-seed runs (TC15's identity check).
+
+    When `dynamic_obstacles_sha256` is None (traffic disabled), the key is
+    omitted entirely so the 7-key Phase-1 schema stays byte-identical for
+    --no-traffic runs.
     """
     record = {
         "step": int(step),
@@ -144,6 +167,8 @@ def _trace_line(
         "reached_goal": bool(reached_goal),
         "done": bool(done),
     }
+    if dynamic_obstacles_sha256 is not None:
+        record["dynamic_obstacles_sha256"] = str(dynamic_obstacles_sha256)
     return json.dumps(record, sort_keys=True, separators=(",", ":"))
 
 
@@ -193,9 +218,12 @@ def main(argv: list[str] | None = None) -> int:
     # Arena __init__ may raise ArenaConfigError — let it propagate (exit 2 via
     # the harness convention; the OS surfaces an unhandled exception as nonzero
     # but argparse-style exit 2 happens above before this line).
-    arena = Arena(args.world, args.seed, render=args.render)
+    arena = Arena(args.world, args.seed, render=args.render, traffic=args.traffic)
 
-    out_dir = Path(args.results_dir) / args.algorithm
+    # World-stem partitioning: same seed against different YAMLs writes to different
+    # directories, so a run cannot silently overwrite a previous run on another world.
+    world_stem = Path(args.world).stem
+    out_dir = Path(args.results_dir) / world_stem / args.algorithm
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / f"{args.seed}.json"
     trace_path = out_dir / f"{args.seed}.trace.jsonl"
@@ -203,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
     trace_file: IO[str] | None = None
 
     try:
-        state0, lidar0, _info0 = arena.reset()
+        state0, lidar0, info0 = arena.reset()
 
         # Open the trace file and emit the step-0 anchor BEFORE planning so the
         # post-reset state is always captured even if planning fails mid-way —
@@ -218,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
             crashed=False,
             reached_goal=False,
             done=False,
+            dynamic_obstacles_sha256=info0.dynamic_obstacles_sha256,
         )
 
         # Plan. Only (ValueError, RuntimeError) are caught — these are the
@@ -295,6 +324,7 @@ def main(argv: list[str] | None = None) -> int:
                 crashed=info.crashed,
                 reached_goal=info.reached_goal,
                 done=done,
+                dynamic_obstacles_sha256=info.dynamic_obstacles_sha256,
             )
 
         # Defensive: the only way `info` is None here is a zero-iteration loop,
