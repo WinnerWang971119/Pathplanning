@@ -311,9 +311,6 @@ class TrafficSpawner:
 
     @staticmethod
     def _write_xy(handle: Any, x: float, y: float) -> None:
-        # Theta is fixed at 0.0 for our omni-kinematics dynamic obstacles
-        # (initialized that way in _create_and_attach; our integration is purely
-        # linear in xy). Using the public `handle.state` setter is the contract;
-        # if a future irsim version breaks that, we want the exception to surface.
-        new_state = np.array([[float(x)], [float(y)], [0.0]], dtype=float)
-        handle.state = new_state
+        # ObjectBase.state is read-only; the public mutation API is set_state(state, init=False).
+        # Passing init=False keeps env.reset()'s spawn-pose restore behavior untouched.
+        handle.set_state([float(x), float(y), 0.0], init=False)

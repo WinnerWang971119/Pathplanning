@@ -33,6 +33,16 @@ class ArenaRuntimeError(RuntimeError):
     """Raised mid-episode for irsim contract violations (e.g. lidar dict missing 'ranges')."""
 
 
+# Bootstrap repo root on sys.path so the `from arena.dynamic import ...` below
+# resolves whether this file is run as `python arena/arena.py` (script-mode puts
+# arena/ on sys.path, not the repo root) or as `python -m arena.arena` / via the
+# runner (repo root already on sys.path). Mirrors runners/run_episode.py:39-43.
+import sys as _sys
+from pathlib import Path as _Path
+_repo_root = str(_Path(__file__).resolve().parent.parent)
+if _repo_root not in _sys.path:
+    _sys.path.insert(0, _repo_root)
+
 # NOTE: imported AFTER ArenaRuntimeError is defined so the circular dependency
 # (arena.dynamic imports ArenaRuntimeError from arena.arena) resolves cleanly.
 from arena.dynamic import DynamicObstacleState, TrafficSpawner  # noqa: E402
