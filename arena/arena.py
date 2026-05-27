@@ -22,6 +22,7 @@ import yaml
 DEFAULT_TIMEOUT_S = 120.0
 LIDAR_BEAM_COUNT = 360
 ACTION_SHAPE = (2, 1)
+RENDER_PAUSE_SECONDS = 0.05
 
 
 class ArenaConfigError(ValueError):
@@ -153,6 +154,12 @@ class Arena:
         start = time.perf_counter()
         self._env.step([action])
         wallclock = time.perf_counter() - start
+
+        # Drive irsim's repaint loop when render mode is on. Without this, the window
+        # never updates between steps and the user only sees the final frame.
+        # Excluded from wallclock_per_step on purpose.
+        if self._render:
+            self._env.render(RENDER_PAUSE_SECONDS)
 
         self._step_idx += 1
 
