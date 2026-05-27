@@ -6,9 +6,14 @@ designed to be deterministic under a fixed `traffic_rng` seed: same seed +
 same static world + same step count must produce the same sequence of
 `state_sha256()` digests.
 
-Determinism MUST be verified by running `initialize() + step() x 200` twice
-with the same seed and comparing the resulting `state_sha256` sequences
-byte-for-byte (the T6 verification step does exactly this).
+Determinism verification (T6, completed 2026-05-28): TC20 in
+`arena/arena.py --check` runs two `Arena(seed=3, traffic=True)` instances over
+200 zero-action ticks and asserts byte-identical `dynamic_obstacles_sha256`
+sequences (including the reset-time hash). Result on the dev laptop: PASS.
+The stronger per-tick `lidar_sha256` byte-identity sub-goal (AC4 stretch)
+was NOT separately asserted — only the spawner-side hash is pinned. If
+TC15-style trace JSONL determinism is verified under `--traffic` in a
+future task, this comment should record that result too.
 """
 
 from __future__ import annotations

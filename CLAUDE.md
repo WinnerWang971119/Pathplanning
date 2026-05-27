@@ -69,7 +69,7 @@ When adding a new world, copy an existing one as the template — irsim is stric
 **Smoke and verification:**
 ```powershell
 .venv\Scripts\Activate.ps1
-python arena/arena.py arena/arena_v1.yaml --check     # 13 PASS = harness healthy
+python arena/arena.py arena/arena_v1.yaml --check     # 24 PASS = harness healthy (TC1-TC23, includes Phase 2 traffic)
 python arena/arena.py arena/arena_v1.yaml --render    # visible smoke loop (use to eyeball YAML)
 ```
 

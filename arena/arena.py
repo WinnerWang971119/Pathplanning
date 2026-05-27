@@ -63,7 +63,7 @@ class EpisodeInfo:
 
 
 class Arena:
-    """Static 50x50 arena wrapping irsim. Phase 0 = no dynamic obstacles."""
+    """50x50 arena wrapping irsim. Static-only by default; pass traffic=True for Phase 2 crossing traffic."""
 
     def __init__(
         self,
@@ -128,8 +128,12 @@ class Arena:
         else:
             self._spawner = None
 
-        # Pre-reset snapshot cache: per AC13, initial_dynamic_snapshot must return ()
+        # Pre-reset snapshot caches: per AC13, initial_dynamic_snapshot must return ()
         # and EpisodeInfo.dynamic_obstacles_sha256 must be None until reset() runs.
+        # _initial_snapshot is captured ONCE at reset-time (the t=0 view planners get
+        # via the public property); _last_snapshot tracks the per-tick state for
+        # EpisodeInfo + sha256 bookkeeping inside step().
+        self._initial_snapshot: tuple[DynamicObstacleState, ...] = ()
         self._last_snapshot: tuple[DynamicObstacleState, ...] = ()
         self._last_sha256: str | None = None
 
@@ -175,11 +179,16 @@ class Arena:
                 static_obstacles=self._world_model.obstacles,
             )
 
-        # Step 4: spawn fresh population (if traffic enabled)
+        # Step 4: spawn fresh population (if traffic enabled). The initial snapshot
+        # is pinned here and exposed via the initial_dynamic_snapshot property for the
+        # full episode — _last_snapshot is overwritten on every step() but the t=0
+        # view planners depend on must never drift.
         if self._spawner is not None:
-            self._last_snapshot = self._spawner.initialize()
+            self._initial_snapshot = self._spawner.initialize()
+            self._last_snapshot = self._initial_snapshot
             self._last_sha256 = self._spawner.state_sha256()
         else:
+            self._initial_snapshot = ()
             self._last_snapshot = ()
             self._last_sha256 = None
 
@@ -307,13 +316,15 @@ class Arena:
 
     @property
     def initial_dynamic_snapshot(self) -> tuple[DynamicObstacleState, ...]:
-        """Snapshot of dynamic obstacles after the most recent reset() (() pre-reset).
+        """Snapshot of dynamic obstacles at t=0 of the current episode.
 
         Phase 0/1: always (). Phase 2 with traffic=True: tuple of 20 DynamicObstacleState
-        entries (after reset()). The snapshot is built by TrafficSpawner.initialize()
-        inside Arena.reset(); it is the t=0 view Mission.md guarantees to planners.
+        entries captured by TrafficSpawner.initialize() at reset-time. This is the
+        t=0 view Mission.md guarantees to planners — it does NOT update on subsequent
+        step() calls. Mid-episode dynamic state is not exposed in Phase 2; Phase 6
+        replanners that need the live set will query the spawner separately.
         """
-        return self._last_snapshot
+        return self._initial_snapshot
 
     def close(self) -> None:
         if self._closed:
@@ -1268,7 +1279,7 @@ def _parse_args() -> argparse.Namespace:
     group.add_argument(
         "--check",
         action="store_true",
-        help="Run TC1-TC12 headless",
+        help="Run TC1-TC23 headless (24 cases, including Phase 2 traffic + world-stem partitioning)",
     )
     return parser.parse_args()
 
