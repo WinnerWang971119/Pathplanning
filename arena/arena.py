@@ -976,15 +976,23 @@ def tc17(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own se
                 f"TC17: snapshot[{i}] at ({obs.x}, {obs.y}) is not on a perimeter edge "
                 f"(W={W}, H={H}, tol={tol})"
             )
-            # Inward-heading check: velocity must point AWAY from the boundary it's on.
-            if on_south:
-                assert obs.vy > 0.0, f"TC17: south-edge snapshot[{i}] must have vy>0, got vy={obs.vy}"
-            if on_north:
-                assert obs.vy < 0.0, f"TC17: north-edge snapshot[{i}] must have vy<0, got vy={obs.vy}"
-            if on_west:
-                assert obs.vx > 0.0, f"TC17: west-edge snapshot[{i}] must have vx>0, got vx={obs.vx}"
-            if on_east:
-                assert obs.vx < 0.0, f"TC17: east-edge snapshot[{i}] must have vx<0, got vx={obs.vx}"
+            # Inward-heading check: the velocity must have a non-negative inward
+            # component for AT LEAST ONE edge the obstacle lies on. The spawner draws
+            # heading from a half-open cone, so the inward component can be exactly 0 at
+            # a cone endpoint (non-strict), and a corner spawn lies on two edges while
+            # only the edge it was drawn from is guaranteed inward — so require ANY
+            # satisfying edge rather than asserting every edge it touches.
+            inward = (
+                (on_south and obs.vy >= 0.0)
+                or (on_north and obs.vy <= 0.0)
+                or (on_west and obs.vx >= 0.0)
+                or (on_east and obs.vx <= 0.0)
+            )
+            assert inward, (
+                f"TC17: snapshot[{i}] at ({obs.x}, {obs.y}) vel ({obs.vx}, {obs.vy}) "
+                f"is not inward for any edge it lies on "
+                f"(S={on_south}, N={on_north}, W={on_west}, E={on_east})"
+            )
             # Speed in [0.3, 1.5] m/s (factors of MAX_LINEAR_SPEED=1.0).
             speed = (obs.vx**2 + obs.vy**2) ** 0.5
             assert 0.3 - tol <= speed <= 1.5 + tol, (
@@ -1007,7 +1015,6 @@ def tc18(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own se
         # 50 / 0.3 ≈ 167 ticks, plus 50 margin.
         max_ticks = int(50.0 / 0.3 / arena._dt) + 50
         zero = np.array([[0.0], [0.0]], dtype=float)
-        final_live_ids: set[int] = set()
         for _ in range(max_ticks):
             _, _, _, info = arena.step(zero)
             assert info.dynamic_obstacle_count == TARGET_POPULATION, (
@@ -1018,11 +1025,8 @@ def tc18(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own se
                 # Done early — should not happen with a stationary robot in arena_v1's
                 # safe (2,2) start, but break cleanly if it does.
                 break
-            final_live_ids = set(obs.id for obs in arena.initial_dynamic_snapshot)
-            # Use spawner snapshot via arena's internal cache for the final-id read.
-            # Better: query the most recent snapshot from info — but info doesn't expose
-            # the snapshot. Falling back to arena._spawner.live_ids (intentional).
-        # Replace the prior reads with a direct live_ids check (final state):
+        # initial_dynamic_snapshot is frozen at t=0, so read the final live set
+        # straight from the spawner to detect despawn churn.
         assert arena._spawner is not None
         final_live_ids = set(arena._spawner.live_ids)
         churned = initial_live_ids.symmetric_difference(final_live_ids)
@@ -1206,6 +1210,60 @@ def tc23(yaml_path: str, seed: int) -> None:  # noqa: ARG001
         )
 
 
+def tc24(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own seed (7)
+    """Traffic-ON runner end-to-end: 8-key trace + byte-identical across two seeded runs.
+
+    The runner's shipped default is traffic=True, but TC14/TC15/TC16/TC22 all force
+    --no-traffic, so without this case the default code path is untested: the 8th
+    trace key wiring (step-0 reset sha + per-step post-step sha) and trace-level
+    determinism through the runner under traffic.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    world_stem = Path(yaml_path).stem
+    cmd = [
+        sys.executable, "-m", "runners.run_episode",
+        "--algorithm", "a_star_once",
+        "--seed", "7",
+        "--world", yaml_path,
+        "--traffic",
+    ]
+    with tempfile.TemporaryDirectory() as td_a, tempfile.TemporaryDirectory() as td_b:
+        for td in (td_a, td_b):
+            r = subprocess.run(
+                [*cmd, "--results-dir", td],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            assert r.returncode == 0, (
+                f"TC24 runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+            )
+
+        jsonl_a = Path(td_a) / world_stem / "a_star_once" / "7.trace.jsonl"
+        jsonl_b = Path(td_b) / world_stem / "a_star_once" / "7.trace.jsonl"
+        assert jsonl_a.exists() and jsonl_b.exists(), (
+            f"TC24 trace JSONLs missing: a={jsonl_a.exists()}, b={jsonl_b.exists()}"
+        )
+
+        lines_a = jsonl_a.read_text(encoding="utf-8").splitlines()
+        assert lines_a, "TC24: traffic trace JSONL is empty"
+        for ln, raw in enumerate(lines_a):
+            rec = json.loads(raw)
+            assert "dynamic_obstacles_sha256" in rec, (
+                f"TC24: trace line {ln} missing dynamic_obstacles_sha256 with traffic on; "
+                f"keys={sorted(rec)}"
+            )
+            assert len(rec) == 8, (
+                f"TC24: trace line {ln} must have 8 keys with traffic on, got {len(rec)}: {sorted(rec)}"
+            )
+
+        assert filecmp.cmp(jsonl_a, jsonl_b, shallow=False), (
+            "TC24: two same-seed traffic runs produced differing trace JSONL; "
+            "traffic determinism through the runner is broken"
+        )
+
+
 # ---------------------------------------------------------------------------
 # CLI runner — --check (default) or --render. See module docstring above.
 # ---------------------------------------------------------------------------
@@ -1237,6 +1295,7 @@ def _run_checks(yaml_path: str, seed: int) -> int:
         ("TC21: snapshot shape, type, immutability", tc21),
         ("TC22: world-stem partitioning end-to-end", tc22),
         ("TC23: import-cycle guard (planners <-> arena.arena)", tc23),
+        ("TC24: traffic-ON runner — 8-key trace + determinism", tc24),
     ]
     failures = 0
     for label, fn in cases:
@@ -1279,7 +1338,7 @@ def _parse_args() -> argparse.Namespace:
     group.add_argument(
         "--check",
         action="store_true",
-        help="Run TC1-TC23 headless (24 cases, including Phase 2 traffic + world-stem partitioning)",
+        help="Run TC1-TC24 headless (25 cases, including Phase 2 traffic + world-stem partitioning)",
     )
     return parser.parse_args()
 

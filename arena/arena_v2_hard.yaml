@@ -20,11 +20,11 @@ robot:
     show_goal: True
 
 obstacle:
-  # Wall A — long horizontal, upper. Spans x in [5, 35] at y ~ 30.
+  # Wall A — long horizontal, upper. length 40 centered at x=30 -> spans x in [10, 50] at y=30 (east end on the boundary).
   - shape: {name: 'rectangle', length: 40, width: 0.8}
     state: [30, 30, 0]
 
-  # Wall B — long horizontal, lower. Spans x in [15, 45] at y ~ 20.
+  # Wall B — long horizontal, lower. length 40 centered at x=20 -> spans x in [0, 40] at y=20 (west end on the boundary).
   - shape: {name: 'rectangle', length: 40, width: 0.8}
     state: [20, 20, 0]
 

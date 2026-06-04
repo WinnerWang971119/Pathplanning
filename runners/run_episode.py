@@ -7,6 +7,7 @@ CLI:
         --world <yaml_path>     # required; e.g. arena/arena_v1.yaml
         [--render]              # optional flag; default False
         [--results-dir <dir>]   # optional; default "results"
+        [--traffic|--no-traffic]# optional; Phase 2 crossing traffic, default ON
 
 Programmatic:
     from runners.run_episode import main
@@ -18,6 +19,10 @@ Outputs:
     <results-dir>/<world_stem>/<algorithm>/<seed>.trace.jsonl  — per-step trace (only on planning success)
     where <world_stem> = Path(args.world).stem (e.g. "arena_v1", "arena_v2_hard", "arena_no_path").
     World-level partitioning prevents same-seed runs on different worlds from overwriting each other.
+
+    Trace-line schema is flag-dependent: 7 keys with --no-traffic (Phase-1 byte-compatible),
+    8 keys with traffic on (adds "dynamic_obstacles_sha256"). Consumers must treat that key
+    as optional and branch on its presence rather than assuming a fixed key count.
 
 Exit codes:
     0 — episode terminated (success, crash, timeout, or planner failure all return 0)

@@ -69,7 +69,7 @@ When adding a new world, copy an existing one as the template — irsim is stric
 **Smoke and verification:**
 ```powershell
 .venv\Scripts\Activate.ps1
-python arena/arena.py arena/arena_v1.yaml --check     # 24 PASS = harness healthy (TC1-TC23, includes Phase 2 traffic)
+python arena/arena.py arena/arena_v1.yaml --check     # 25 PASS = harness healthy (TC1-TC24, includes Phase 2 traffic)
 python arena/arena.py arena/arena_v1.yaml --render    # visible smoke loop (use to eyeball YAML)
 ```
 
@@ -120,18 +120,18 @@ Optional flags: `--render` (opens the irsim render window) and `--results-dir <d
 
 ## The traffic harness (Phase 2)
 
-`arena/dynamic.py` adds Mission.md's crossing-traffic substrate. `Arena(..., traffic=True)` instantiates a `TrafficSpawner` that maintains a ~20-obstacle population of straight-line, edge-spawned, uniformly-on-perimeter-distributed dynamic obstacles. Each obstacle is a circle (r=0.3 m) registered into irsim via `env.create_obstacle({'name':'omni'}, ...) + env.add_object`, so lidar and `robot.collision_flag` see them natively — no custom collision code.
+`arena/dynamic.py` adds Mission.md's crossing-traffic substrate. `Arena(..., traffic=True)` instantiates a `TrafficSpawner` that maintains a ~20-obstacle population of straight-line, edge-spawned, uniformly-on-perimeter-distributed dynamic obstacles. Each obstacle is a circle (r=0.3 m) registered into irsim via `env.create_obstacle({'name':'omni'}, ...) + env.add_object`, so lidar and `robot.collision_flag` see them natively — no custom collision code. Traffic runs pass `log_level="ERROR"` to `irsim.make` to mute the per-tick `Behavior not defined` omni warning irsim emits for every obstacle.
 
 **API:**
 - `Arena(yaml, seed, traffic=True, ...)` — opt-in flag; default `False` for Phase 0/1 compatibility.
 - `arena.initial_dynamic_snapshot` — returns `tuple[DynamicObstacleState, ...]` (length 20 after `reset()` when `traffic=True`; `()` pre-reset or when `traffic=False`). `DynamicObstacleState` is a frozen dataclass with fields `(id, x, y, vx, vy, radius)`.
-- `EpisodeInfo.dynamic_obstacles_sha256: str | None` — per-tick deterministic hash of the sorted-by-id obstacle state matrix. Used by the determinism TCs.
+- `EpisodeInfo.dynamic_obstacles_sha256: str | None` — per-tick deterministic hash of the obstacle `(x, y, vx, vy, radius)` matrix, rows ordered by id. The irsim object id itself is excluded from the hash so the digest is reproducible across repeated `reset()` on one Arena (`id_iter` resets per `make()`, not per `reset()`). Used by the determinism TCs.
 - `EpisodeInfo.dynamic_obstacle_count: int` — population each tick (Phase 0/1: always 0; Phase 2: 20).
 
 **Determinism guarantees:**
 - `traffic_rng` (derived from master seed via `SeedSequence.spawn(2)`) draws in a fixed order per spawn attempt: perimeter position → heading → speed; ALL THREE re-drawn on overlap rejection.
 - `motion_rng` is plumbed but never drawn from in Phase 2 (forward-compat for Phase 2b motion noise).
-- Two `Arena(seed=K, traffic=True)` instances produce byte-identical `dynamic_obstacles_sha256` sequences over identical action streams.
+- Two `Arena(seed=K, traffic=True)` runs produce byte-identical `dynamic_obstacles_sha256` sequences over identical action streams — whether two fresh instances or repeated `reset()` on one instance (the hash excludes the per-episode object id).
 
 **Runner default:**
 - `python -m runners.run_episode --algorithm a_star_once --seed 42 --world arena/arena_v1.yaml` — traffic ON by default. A* `_once` planners do not dodge, so most seeds end in collision; that is the experimental signal Mission.md's scatter plot consumes.
@@ -141,7 +141,7 @@ Optional flags: `--render` (opens the irsim render window) and `--results-dir <d
 **Results layout:**
 - `results/<world_stem>/<algorithm>/<seed>.{json,trace.jsonl}` — runner output. World-stem partitioning means same-seed runs on `arena_v1.yaml` and `arena_v2_hard.yaml` do not overwrite each other.
 
-**TC17–TC23** (added to `python arena/arena.py arena/arena_v1.yaml --check`):
+**TC17–TC24** (added to `python arena/arena.py arena/arena_v1.yaml --check`):
 - TC17: init population of 20, every spawn on a perimeter edge with inward heading.
 - TC18: refill maintains population at 20 across a full-traversal window (verifies the despawn/respawn cycle).
 - TC19: robot-vs-dynamic-obstacle collision fires `info.crashed` via `_inject_for_test`.
@@ -149,6 +149,7 @@ Optional flags: `--render` (opens the irsim render window) and `--results-dir <d
 - TC21: `initial_dynamic_snapshot` is a tuple of frozen `DynamicObstacleState` of length 20; mutation raises `FrozenInstanceError`.
 - TC22: world-stem partitioning — same seed against two different YAMLs produces two distinct result files; neither clobbers the other.
 - TC23: subprocess import-cycle guard — `import planners; import arena.arena` and the reverse both exit 0.
+- TC24: traffic-ON runner end-to-end — every trace line carries the 8th `dynamic_obstacles_sha256` key, and two same-seed `--traffic` runs produce byte-identical trace JSONL (trace-level determinism through the runner). Covers the shipped default path, which the other runner TCs force `--no-traffic` to avoid.
 
 `arena/arena_v2_hard.yaml` is a second 50×50 world (same robot start/goal/lidar as arena_v1, but walls relocated) used by TC22 to cross-check the partitioning. It otherwise has no special semantics in Phase 2.
 
