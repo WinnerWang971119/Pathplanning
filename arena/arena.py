@@ -1264,6 +1264,137 @@ def tc24(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own se
         )
 
 
+def tc25(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure computation, no world used
+    """Phase 3 seed derivation: determinism, uniqueness, prefix property, master-sensitivity."""
+    from runners.run_experiment import derive_episode_seeds
+
+    fifty = derive_episode_seeds(7, 50)
+    assert len(fifty) == 50, f"TC25: expected 50 seeds, got {len(fifty)}"
+    assert len(set(fifty)) == 50, "TC25: derived seeds are not unique"
+    assert all(isinstance(s, int) and s >= 0 for s in fifty), (
+        "TC25: seeds must be non-negative ints"
+    )
+    assert derive_episode_seeds(7, 50) == fifty, "TC25: derivation is not deterministic"
+    assert derive_episode_seeds(7, 3) == fifty[:3], (
+        "TC25: prefix property broken (spawn(3) != spawn(50)[:3])"
+    )
+    assert derive_episode_seeds(8, 3) != fifty[:3], (
+        "TC25: a different master seed produced an identical prefix"
+    )
+
+
+def tc26(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses arena_no_path fixture
+    """Phase 3 batch determinism + parallel-ordering.
+
+    Runs the batch runner on the boxed-in-start world (A* fails fast, so each episode
+    terminates in seconds with no driving loop). A and B at --jobs 1 must be byte-identical;
+    C at --jobs 3 must keep the manifest in derivation order (completion order must not leak).
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    world = str(repo_root / "arena" / "arena_no_path.yaml")
+    base = [
+        sys.executable, "-m", "runners.run_experiment",
+        "--algorithm", "a_star_once",
+        "--world", world,
+        "--num-seeds", "3",
+        "--no-traffic",
+    ]
+
+    def _run(td: str, extra: list[str]) -> Path:
+        r = subprocess.run(
+            [*base, "--results-dir", td, *extra],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert r.returncode == 0, (
+            f"TC26 batch failed (extra={extra}): exit={r.returncode}; stderr={r.stderr[-400:]}"
+        )
+        return Path(td) / "arena_no_path" / "a_star_once"
+
+    def _manifest_no_git(out_dir: Path) -> dict:
+        m = json.loads((out_dir / "_manifest.json").read_text(encoding="utf-8"))
+        m.pop("git_sha", None)  # robust to dirty tree / absent git
+        return m
+
+    with tempfile.TemporaryDirectory() as td_a, \
+            tempfile.TemporaryDirectory() as td_b, \
+            tempfile.TemporaryDirectory() as td_c:
+        dir_a = _run(td_a, ["--jobs", "1"])
+        dir_b = _run(td_b, ["--jobs", "1"])
+        dir_c = _run(td_c, ["--jobs", "3"])
+
+        seeds = sorted(int(p.stem) for p in dir_a.glob("[0-9]*.json"))
+        assert len(seeds) == 3, f"TC26: expected 3 episode JSONs, got {len(seeds)}"
+
+        for s in seeds:
+            assert filecmp.cmp(dir_a / f"{s}.json", dir_b / f"{s}.json", shallow=False), (
+                f"TC26: per-seed metrics JSON differ across two same-master-seed runs (seed={s})"
+            )
+            assert not (dir_a / f"{s}.trace.jsonl").exists(), (
+                f"TC26: planner-failure world wrote a trace for seed={s}"
+            )
+
+        man_a = _manifest_no_git(dir_a)
+        assert man_a == _manifest_no_git(dir_b), (
+            "TC26: manifests differ across two same-master-seed --jobs 1 runs"
+        )
+
+        man_c = _manifest_no_git(dir_c)
+        order_a = [e["seed"] for e in man_a["episodes"]]
+        order_c = [e["seed"] for e in man_c["episodes"]]
+        assert order_a == order_c, (
+            "TC26: --jobs 3 reordered the manifest episodes (completion order leaked in)"
+        )
+        assert man_a["derived_seeds"] == man_c["derived_seeds"], (
+            "TC26: derived_seeds differ between --jobs 1 and --jobs 3"
+        )
+
+
+def tc27(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — writes its own malformed world
+    """Phase 3 failure accounting: a malformed (but existing) world makes every child exit
+    non-zero; the batch continues, reports the failures, and itself exits non-zero."""
+    repo_root = Path(__file__).resolve().parent.parent
+    with tempfile.TemporaryDirectory() as td:
+        bad_yaml = Path(td) / "bad.yaml"
+        bad_yaml.write_text("not: [valid: arena", encoding="utf-8")  # irsim/yaml rejects this
+        r = subprocess.run(
+            [
+                sys.executable, "-m", "runners.run_experiment",
+                "--algorithm", "a_star_once",
+                "--world", str(bad_yaml),
+                "--num-seeds", "2",
+                "--no-traffic",
+                "--results-dir", td,
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert r.returncode != 0, (
+            f"TC27: batch should exit non-zero when all seeds fail; got {r.returncode}"
+        )
+        assert "2 runner-failed" in r.stdout, (
+            f"TC27: summary did not report 2 runner failures; stdout tail={r.stdout[-400:]}"
+        )
+        assert "runner failures:" in r.stdout, (
+            "TC27: summary omitted the per-seed failure detail (stderr tail)"
+        )
+
+        manifest = json.loads(
+            (Path(td) / "bad" / "a_star_once" / "_manifest.json").read_text(encoding="utf-8")
+        )
+        statuses = [e["status"] for e in manifest["episodes"]]
+        assert statuses == ["runner_error", "runner_error"], (
+            f"TC27: manifest episodes should both be runner_error, got {statuses}"
+        )
+        assert all(e["exit_code"] != 0 for e in manifest["episodes"]), (
+            "TC27: failed episodes must record a non-zero exit_code"
+        )
+
+
 # ---------------------------------------------------------------------------
 # CLI runner — --check (default) or --render. See module docstring above.
 # ---------------------------------------------------------------------------
@@ -1296,6 +1427,9 @@ def _run_checks(yaml_path: str, seed: int) -> int:
         ("TC22: world-stem partitioning end-to-end", tc22),
         ("TC23: import-cycle guard (planners <-> arena.arena)", tc23),
         ("TC24: traffic-ON runner — 8-key trace + determinism", tc24),
+        ("TC25: Phase 3 seed derivation (determinism/uniqueness/prefix)", tc25),
+        ("TC26: Phase 3 batch determinism + parallel-ordering", tc26),
+        ("TC27: Phase 3 failure accounting + non-zero batch exit", tc27),
     ]
     failures = 0
     for label, fn in cases:
@@ -1338,7 +1472,7 @@ def _parse_args() -> argparse.Namespace:
     group.add_argument(
         "--check",
         action="store_true",
-        help="Run TC1-TC24 headless (25 cases, including Phase 2 traffic + world-stem partitioning)",
+        help="Run TC1-TC27 headless (28 cases, incl. Phase 2 traffic + Phase 3 batch runner)",
     )
     return parser.parse_args()
 
