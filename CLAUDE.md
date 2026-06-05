@@ -69,7 +69,7 @@ When adding a new world, copy an existing one as the template — irsim is stric
 **Smoke and verification:**
 ```powershell
 .venv\Scripts\Activate.ps1
-python arena/arena.py arena/arena_v1.yaml --check     # 25 PASS = harness healthy (TC1-TC24, includes Phase 2 traffic)
+python arena/arena.py arena/arena_v1.yaml --check     # 28 PASS = harness healthy (TC1-TC27; ~9-10 min, dominated by full-episode subprocess TCs)
 python arena/arena.py arena/arena_v1.yaml --render    # visible smoke loop (use to eyeball YAML)
 ```
 
@@ -116,7 +116,7 @@ Optional flags: `--render` (opens the irsim render window) and `--results-dir <d
 - TC15: byte-identical trace JSONL across two seeded subprocess runs — verifies the determinism guarantee end-to-end.
 - TC16: planner-failure path on `arena/arena_no_path.yaml` — verifies that a sealed-box world causes A* to raise and that `planner_error` is populated and `trace.jsonl` is not written.
 
-**`arena/arena_no_path.yaml` fixture:** A Phase-1-only Arena-compatible world where the goal is sealed off so A* cannot find a path (used exclusively by TC16). The legacy `tests/no_path.yaml` cannot substitute here because it lacks the `lidar2d` sensor block that `Arena.__init__` requires.
+**`arena/arena_no_path.yaml` fixture:** An Arena-compatible world where the robot **start** `(2,2)` is walled in by a 1.5 m box of four rectangles (the goal `(48,48)` is open) so A* cannot find a path (used by TC16, and as the fast-failure world for Phase 3's TC26). The legacy `tests/no_path.yaml` cannot substitute here because it lacks the `lidar2d` sensor block that `Arena.__init__` requires.
 
 ## The traffic harness (Phase 2)
 
@@ -152,6 +152,35 @@ Optional flags: `--render` (opens the irsim render window) and `--results-dir <d
 - TC24: traffic-ON runner end-to-end — every trace line carries the 8th `dynamic_obstacles_sha256` key, and two same-seed `--traffic` runs produce byte-identical trace JSONL (trace-level determinism through the runner). Covers the shipped default path, which the other runner TCs force `--no-traffic` to avoid.
 
 `arena/arena_v2_hard.yaml` is a second 50×50 world (same robot start/goal/lidar as arena_v1, but walls relocated) used by TC22 to cross-check the partitioning. It otherwise has no special semantics in Phase 2.
+
+## The batch experiment runner (Phase 3)
+
+`runners/run_experiment.py` runs ONE algorithm against the canonical 50 seeds so every algorithm in Mission.md faces the same 50 traffic streams (what makes the cross-algorithm scatter plot meaningful). It derives the seeds from a single master seed and shells out to the already-deterministic single-episode runner once per seed (one fresh-irsim subprocess each), so per-episode determinism and the `SeedSequence.spawn(2)` traffic/motion substreams carry over unchanged.
+
+**Run command:**
+```powershell
+.venv\Scripts\Activate.ps1
+python -m runners.run_experiment --algorithm a_star_once --world arena/arena_v1.yaml
+# default: master-seed 20260605, 50 seeds, traffic ON, jobs 1 (sequential)
+# writes results/arena_v1/a_star_once/<seed>.{json,trace.jsonl} x50 + _manifest.json
+```
+
+**Seed derivation:** `derive_episode_seeds(master, n)` = `SeedSequence(master).spawn(n)`, each child's first two uint32 words packed into a 64-bit int used as that episode's `--seed`. Prefix-stable (`spawn(3) == spawn(50)[:3]`), so `--num-seeds` selects a prefix of the canonical stream; uniqueness-asserted (64-bit width avoids the silent same-filename collision a 32-bit seed would risk).
+
+**Flags:**
+- `--master-seed N` (default 20260605), `--num-seeds N` (default 50).
+- `--jobs N` — sequential at 1 (default); N>1 runs up to N child subprocesses concurrently via a `ThreadPoolExecutor` over `subprocess.run` (threads, NOT multiprocessing — the Windows spawn/pickle path never enters). Result bytes are identical at any `--jobs`; only `wallclock_per_step` (a Mission.md "freebie") is perturbed by contention, so produce headline wallclock numbers with `--jobs 1`.
+- `--resume` skips seeds whose `<seed>.json` already exists (default: overwrite).
+- `--traffic` / `--no-traffic` forwarded to each episode (default ON).
+
+**Failure policy:** a child exit of 0 includes in-sim crashes, timeouts, and planner failures (those are recorded inside the metrics JSON, not the exit code). Only a non-zero child exit (a runner/config fault — e.g. a malformed world) is a "runner failure": the batch continues past it, lists it in the end summary, and itself exits non-zero if any seed failed.
+
+**Outputs:** per-seed `results/<world_stem>/<algorithm>/<seed>.{json,trace.jsonl}` (identical to the single-episode runner) plus a deterministic provenance receipt `_manifest.json` in the same dir (`master_seed`, `num_seeds`, `derived_seeds`, per-episode `{seed, exit_code, status}` in derivation order, best-effort `git_sha`; no timestamp/elapsed). Phase 5's `plot.py` must select episode files by numeric stem (e.g. glob `[0-9]*.json`) so it skips `_manifest.json`.
+
+**TC25–TC27** (added to `python arena/arena.py arena/arena_v1.yaml --check`):
+- TC25: seed derivation — determinism, 64-bit uniqueness, prefix property, master-sensitivity (pure computation).
+- TC26: batch determinism + parallel-ordering — two same-master-seed `--jobs 1` runs produce byte-identical per-seed JSON and manifest; a `--jobs 3` run keeps the manifest in derivation order (completion order must not leak). Uses `arena_no_path.yaml` so each episode fails fast.
+- TC27: failure accounting — a malformed (but existing) world makes every child exit non-zero; the batch reports the failures and itself exits non-zero.
 
 ## Conventions worth preserving
 

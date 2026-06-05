@@ -106,6 +106,11 @@ Open questions:
   stream challenges each planner. This is what makes the cross-algorithm
   scatter plot meaningful.
 
+_Landed: `runners/run_experiment.py` derives the 50 seeds from one master
+seed via `SeedSequence.spawn(50)` and runs them through the single-episode
+runner; per-episode byte-determinism was already proven in Phases 1–2
+(TC15/TC20/TC24). See "The batch experiment runner (Phase 3)" in CLAUDE.md._
+
 ---
 
 ## Phase 4 — Metrics
