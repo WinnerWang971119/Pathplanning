@@ -1,7 +1,7 @@
 """arena/planners — pluggable planner adapters for the path-planning comparison study."""
 from planners._types import Controller, Path
 from planners._grid import ALGORITHMS, algorithm_label, build_controller
-from planners.a_star import AStarOncePlanner
+from planners.a_star import AStarOnceController, AStarReplanController  # noqa: F401  (registers a_star_once / a_star_replan)
 
 __all__ = [
     "Controller",
@@ -9,5 +9,4 @@ __all__ = [
     "ALGORITHMS",
     "algorithm_label",
     "build_controller",
-    "AStarOncePlanner",
 ]
