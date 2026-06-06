@@ -29,9 +29,16 @@ Execution:
     --jobs 1 (default) runs seeds sequentially. --jobs N>1 runs up to N child
     subprocesses concurrently via a ThreadPoolExecutor (threads waiting on
     subprocess.run — no multiprocessing, so the Windows spawn/pickle path never
-    enters). Result bytes are identical at any --jobs value because each seed is
-    isolated; only `wallclock_per_step` (a Mission.md "freebie") is perturbed by
-    contention. Produce headline wallclock numbers with --jobs 1.
+    enters). Each seed is isolated, so the per-seed trace JSONL and the manifest
+    are byte-identical at any --jobs value; the metrics JSON matches too EXCEPT
+    `wallclock_per_step` (a Mission.md "freebie"), a perf_counter mean that
+    contention perturbs. Produce headline wallclock numbers with --jobs 1.
+
+    Caveat at extreme oversubscription: EPISODE_TIMEOUT_S is a per-child wallclock
+    wall, so a healthy-but-starved child could in principle exceed it under very
+    high --jobs and flip ok -> runner_error. That can't happen with today's
+    fail-fast `_once` planners (the in-sim 120 s cap ends them first); revisit the
+    wall for future real-driving algorithms.
 
 Exit codes:
     0 — every non-skipped seed's subprocess exited 0 (ran to completion)
@@ -62,6 +69,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from runners._layout import episode_out_dir  # noqa: E402
 from runners.run_episode import ALGORITHMS  # noqa: E402
 
 
@@ -73,6 +81,9 @@ STDERR_TAIL_LINES = 20                   # last N lines of a failed child's stde
 EPISODE_TIMEOUT_S = 600.0                # hard wall on one child; the in-sim cap is 120 s sim-time,
                                          # so ~10 min wallclock means the child is wedged, not slow
 TIMEOUT_EXIT_CODE = 124                  # synthetic exit code recorded for a timed-out child (mirrors GNU timeout)
+SPAWN_ERROR_EXIT_CODE = 125              # synthetic exit code for a child that never started (spawn OSError)
+GIT_SHA_TIMEOUT_S = 10.0                  # hard wall on the manifest git-sha probe; a wedged git
+                                          # (held index.lock, slow network FS) must not hang the batch
 
 
 def derive_episode_seeds(master_seed: int, num_seeds: int) -> tuple[int, ...]:
@@ -143,8 +154,9 @@ def _git_sha(repo_root: Path) -> str | None:
             cwd=str(repo_root),
             capture_output=True,
             text=True,
+            timeout=GIT_SHA_TIMEOUT_S,
         )
-    except (OSError, ValueError):
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
     if r.returncode != 0:
         return None
@@ -182,6 +194,10 @@ def _run_one_episode(
         results_dir,
     ]
     cmd.append("--traffic" if traffic else "--no-traffic")
+    # capture_output buffers the child's full stdout/stderr though only the last
+    # STDERR_TAIL_LINES are surfaced; that is intentional — we need the tail on
+    # failure, and a child's output is small (a few lines), so streaming to keep
+    # only the tail would add machinery for no real memory win.
     try:
         proc = subprocess.run(
             cmd,
@@ -198,6 +214,17 @@ def _run_one_episode(
             exit_code=TIMEOUT_EXIT_CODE,
             status="runner_error",
             stderr_tail=f"timed out after {EPISODE_TIMEOUT_S:.0f}s (child killed)",
+        )
+    except OSError as exc:
+        # The child never started: a spawn-level failure such as descriptor/handle
+        # exhaustion under high --jobs or a missing interpreter. Record it as a runner
+        # failure (not a crash) so the batch continues and the accounting for the seeds
+        # that already finished still reaches the manifest — the documented contract.
+        return EpisodeResult(
+            seed=seed,
+            exit_code=SPAWN_ERROR_EXIT_CODE,
+            status="runner_error",
+            stderr_tail=f"failed to spawn child: {exc}",
         )
     if proc.returncode == 0:
         return EpisodeResult(seed=seed, exit_code=0, status="ok", stderr_tail="")
@@ -300,6 +327,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.jobs < 1:
         print(f"error: --jobs must be >= 1, got {args.jobs}", file=sys.stderr)
         return 2
+    # A negative master seed would reach np.random.SeedSequence and raise ValueError
+    # (a bare traceback) instead of the runner's documented validation-failure path.
+    if args.master_seed < 0:
+        print(f"error: --master-seed must be >= 0, got {args.master_seed}", file=sys.stderr)
+        return 2
 
     # Resolve --world to an absolute path ONCE so this process's existence check
     # and the children (launched with cwd=repo_root) agree regardless of cwd.
@@ -316,13 +348,19 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError:
         world_for_manifest = world_abs_str
 
+    # Resolve the results-dir root to an absolute path ONCE (against this process's
+    # cwd) and forward THAT to the children. Children run with cwd=repo_root, so a
+    # relative root would otherwise have the parent's manifest/resume probe and the
+    # children's episode JSONs land in two different trees.
+    results_dir_abs = str(Path(args.results_dir).resolve())
+
     cpu = os.cpu_count() or 1
     if args.jobs > cpu:
         print(f"note: --jobs {args.jobs} exceeds cpu_count {cpu}; oversubscribing.", file=sys.stderr)
 
     seeds = derive_episode_seeds(args.master_seed, args.num_seeds)
 
-    out_dir = Path(args.results_dir) / world_stem / args.algorithm
+    out_dir = episode_out_dir(results_dir_abs, world_stem, args.algorithm)
     out_dir.mkdir(parents=True, exist_ok=True)  # pre-create once; children won't race on it
 
     print(
@@ -340,14 +378,20 @@ def main(argv: list[str] | None = None) -> int:
         # --resume keys off the metrics file existing. run_episode writes <seed>.json only on
         # exit-0 paths (success OR a recorded planner failure); a runner/config fault leaves no
         # file, so resume re-runs those. Resume thus skips "previously ran to completion", not
-        # "previously succeeded at the task". It assumes the prior run wrote files cleanly.
+        # "previously succeeded at the task".
+        #
+        # Known limitation: the probe trusts that <seed>.json means the prior run finished
+        # cleanly. It cannot detect a JSON torn by a kill mid-write, nor a stale JSON whose
+        # matching trace is missing — and trace-absence is NOT a usable completeness signal,
+        # because a recorded planner failure legitimately writes JSON with no trace. If a prior
+        # batch was interrupted, rerun the affected seeds WITHOUT --resume to overwrite cleanly.
         if args.resume and (out_dir / f"{seed}.json").exists():
             return EpisodeResult(seed=seed, exit_code=0, status="skipped", stderr_tail="")
         return _run_one_episode(
             seed=seed,
             algorithm=args.algorithm,
             world_abs=world_abs_str,
-            results_dir=args.results_dir,
+            results_dir=results_dir_abs,
             traffic=args.traffic,
             repo_root=_REPO_ROOT,
         )

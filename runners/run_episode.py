@@ -54,6 +54,7 @@ from manual_astar import (  # noqa: E402
     compute_action,
 )
 from planners import AStarOncePlanner, PathPlanner  # noqa: E402
+from runners._layout import episode_out_dir  # noqa: E402
 
 
 # Algorithm registry. Phase 6 expands this dict with the remaining planners.
@@ -228,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     # World-stem partitioning: same seed against different YAMLs writes to different
     # directories, so a run cannot silently overwrite a previous run on another world.
     world_stem = Path(args.world).stem
-    out_dir = Path(args.results_dir) / world_stem / args.algorithm
+    out_dir = episode_out_dir(args.results_dir, world_stem, args.algorithm)
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / f"{args.seed}.json"
     trace_path = out_dir / f"{args.seed}.trace.jsonl"
