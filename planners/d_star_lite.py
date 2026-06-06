@@ -53,6 +53,28 @@ import itertools
 
 import numpy as np
 
+from manual_astar import (
+    GRID_RESOLUTION,
+    OccupancyGrid,
+    SAFETY_MARGIN,
+    WAYPOINT_REACHED_DISTANCE,
+    WAYPOINT_STRIDE,
+    WaypointFollower,
+    build_occupancy_grid,
+    compute_action_from_state,
+    is_cell_in_bounds,
+    load_world,
+    world_to_grid,
+)
+from planners._grid import (
+    LidarGeometry,
+    grid_path_to_waypoints,
+    lidar_to_occupancy,
+    load_lidar_geometry,
+    register,
+    segment_is_clear_grid,
+)
+
 # The eight 8-connected neighbour deltas, in the SAME order as
 # manual_astar.astar_search. Order is load-bearing for deterministic expansion.
 NEIGHBOR_DELTAS: tuple[tuple[int, int], ...] = (
@@ -507,3 +529,195 @@ class DStarLiteSearch:
         _, _, cell = heapq.heappop(self._heap)
         self._queued.discard(cell)
         self._latest_counter.pop(cell, None)
+
+
+# --------------------------------------------------------------------------- #
+# Controller wiring (T11)                                                      #
+# --------------------------------------------------------------------------- #
+
+
+class DStarLiteController:
+    """Incremental D* Lite `Controller` over a lidar-folded occupancy grid.
+
+    Plans once at `reset()` from the t=0 lidar fold. On every `act()` it re-folds
+    the live scan, feeds ONLY the changed cells to the search via
+    :meth:`DStarLiteSearch.update_cells`, and lets the search incrementally repair
+    its `g`/`rhs` — so the D* Lite machinery runs at every tick, which is the
+    point of this family (there is no `_once` / `_replan` split, Mission.md: D*
+    Lite is inherently incremental).
+
+    The *path the robot steers by* is re-extracted only when the current waypoint
+    follower has finished OR the immediate segment it is about to traverse (the
+    robot pose -> its current target waypoint) is no longer clear in the live
+    folded grid. Re-extracting on every changed cell instead whipsaws the heading:
+    folding a live scan repaints a thick inflation band around every wall return,
+    so the optimal cell path jitters one or two cells each tick even on a static
+    map, and rebuilding the follower from a jittering path (its index reset to the
+    current pose) starves forward speed and the robot times out. Committing to a
+    path until its immediate segment is actually blocked keeps the robot at full
+    speed on a clear run yet still replans the instant a dynamic obstacle crosses
+    in front of it.
+
+    Grid ownership is the load-bearing invariant: `self._cells` is the SAME
+    ndarray the search was constructed with. `act()` mutates that array in place
+    at the flipped positions and reports them through `update_cells`; it never
+    rebinds `self._cells` to a freshly folded array (that would detach the
+    search's view and silently desynchronise the incremental edge costs).
+
+    A t=0 planning failure in `reset()` propagates so the runner records
+    `planner_error`. A mid-episode replan failure in `act()` is swallowed — the
+    last valid follower is kept, never rebuilt — so `act()` never raises (AC8).
+    """
+
+    name = "d_star_lite"
+
+    def __init__(self, replan_k: int | None = None) -> None:
+        # `build_controller` rejects `--replan-k` for d_star_lite (it is not in
+        # REPLAN_FAMILIES) before construction; the kwarg is accepted here only to
+        # match the uniform `ALGORITHMS[name](replan_k=...)` seam, then ignored.
+        del replan_k
+
+        self._grid: OccupancyGrid | None = None
+        self._static_cells: np.ndarray | None = None
+        self._cells: np.ndarray | None = None
+        self._geom: LidarGeometry | None = None
+        self._inflation: float = 0.0
+        self._goal_xy: np.ndarray | None = None
+        self._search: DStarLiteSearch | None = None
+        self._follower: WaypointFollower | None = None
+
+    def reset(
+        self,
+        world_yaml: str,
+        initial_snapshot: tuple,
+        lidar0: np.ndarray,
+        state0: np.ndarray,
+    ) -> None:
+        # `initial_snapshot` is ignored by design: this family is lidar-only and
+        # `lidar0` already encodes the t=0 obstacles.
+        del initial_snapshot
+
+        world = load_world(world_yaml)
+        grid = build_occupancy_grid(world, GRID_RESOLUTION, SAFETY_MARGIN)
+
+        goal_xy = np.asarray(world.goal, dtype=float)
+        goal_cell = world_to_grid(goal_xy, grid)
+        if not is_cell_in_bounds(goal_cell, grid):
+            raise ValueError("The goal position is outside the occupancy grid.")
+        if bool(grid.cells[goal_cell]):
+            raise ValueError("The goal position is blocked after obstacle inflation.")
+
+        self._grid = grid
+        self._static_cells = grid.cells
+        self._geom = load_lidar_geometry(world_yaml)
+        self._inflation = world.robot_radius + SAFETY_MARGIN
+        self._goal_xy = goal_xy
+
+        start_cell = world_to_grid(state0[:2], grid)
+
+        # The MUTABLE working occupancy the search holds a reference to. From here
+        # on it is mutated IN PLACE by act(); it is never rebound.
+        self._cells = lidar_to_occupancy(
+            self._static_cells, grid, state0, lidar0, self._geom, self._inflation
+        )
+
+        self._search = DStarLiteSearch(self._cells, start_cell, goal_cell)
+        self._search.compute_shortest_path()
+        # Raises RuntimeError if the start cannot reach the goal; the runner turns
+        # that into planner_error.
+        cells_path = self._search.extract_path()
+
+        waypoints = grid_path_to_waypoints(
+            cells_path, grid, self._cells, state0[:2], self._goal_xy, WAYPOINT_STRIDE
+        )
+        if not waypoints:
+            raise ValueError("The initial plan produced no waypoints.")
+
+        self._follower = WaypointFollower(list(waypoints), WAYPOINT_REACHED_DISTANCE)
+
+    def act(self, state: np.ndarray, lidar: np.ndarray) -> np.ndarray:
+        if (
+            self._search is None
+            or self._follower is None
+            or self._grid is None
+            or self._static_cells is None
+            or self._cells is None
+            or self._geom is None
+            or self._goal_xy is None
+        ):
+            raise RuntimeError("act() called before reset().")
+
+        position = np.asarray(state[:2], dtype=float)
+
+        new_cells = lidar_to_occupancy(
+            self._static_cells, self._grid, state, lidar, self._geom, self._inflation
+        )
+        diff_mask = self._cells != new_cells
+
+        if bool(diff_mask.any()):
+            # Deterministic, de-duplicated list of the flipped (row, col) cells.
+            changed = sorted(
+                (int(row), int(col)) for row, col in zip(*np.where(diff_mask))
+            )
+
+            # CRITICAL: mutate the EXISTING array in place — the search holds a
+            # reference to it. Do NOT rebind self._cells to new_cells, which would
+            # detach the search's view and desynchronise its incremental costs.
+            self._cells[diff_mask] = new_cells[diff_mask]
+
+            current_cell = world_to_grid(position, self._grid)
+            # Canonical optimized D* Lite order: bump k_m via move_start FIRST, then
+            # repair the changed edges, then recompute the shortest-path tree. This
+            # runs every changed tick so the incremental g/rhs stays current; the
+            # path the robot follows is only re-extracted on demand below.
+            self._search.move_start(current_cell)
+            self._search.update_cells(changed)
+            try:
+                self._search.compute_shortest_path()
+            except (ValueError, RuntimeError):
+                # Keep the last valid follower; never rebuild it (AC8). A failed
+                # incremental pass leaves the previous g/rhs in place, so the held
+                # path stays drivable.
+                return compute_action_from_state(state, self._follower)
+
+        # Re-extract the followed path only when the held one is exhausted or its
+        # imminent segment is now blocked — otherwise keep committing to it so a
+        # clear run holds full speed instead of chasing the lidar-fold jitter.
+        if self._follower.is_finished or self._immediate_segment_blocked(position):
+            try:
+                cells_path = self._search.extract_path()
+                waypoints = grid_path_to_waypoints(
+                    cells_path,
+                    self._grid,
+                    self._cells,
+                    position,
+                    self._goal_xy,
+                    WAYPOINT_STRIDE,
+                )
+                if waypoints:
+                    self._follower = WaypointFollower(
+                        list(waypoints), WAYPOINT_REACHED_DISTANCE
+                    )
+            except (ValueError, RuntimeError):
+                # Keep the last valid path/follower; never rebuild it (AC8).
+                pass
+
+        return compute_action_from_state(state, self._follower)
+
+    def _immediate_segment_blocked(self, position: np.ndarray) -> bool:
+        """Is the segment the robot is about to traverse no longer clear?
+
+        The commitment horizon is exactly the robot pose -> its current target
+        waypoint: the one piece of the held path the robot will drive across next.
+        Checking only this segment (against the live folded grid, so it sees both
+        static walls and dynamic traffic) reacts promptly to an obstacle that
+        actually crosses the robot's path, while ignoring the fold's far-field
+        inflation noise that would otherwise force a replan every tick.
+        """
+        assert self._follower is not None and self._grid is not None
+        assert self._cells is not None
+        target = self._follower.current_waypoint(position)
+        return not segment_is_clear_grid(self._cells, self._grid, position, target)
+
+
+register("d_star_lite", DStarLiteController)
