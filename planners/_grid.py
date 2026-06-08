@@ -311,6 +311,14 @@ class PathFollowingController:
         self._k = 0
         self._follower: WaypointFollower | None = None
 
+        # Commitment-horizon state. `_last_fold` is the occupancy array the most
+        # recent plan was built on (reused by `_immediate_segment_blocked` so the
+        # segment check costs no extra lidar fold — AC9). `_planned_path` is the
+        # freshest plan from the last K-th act, retained even when the follower
+        # has not yet adopted it.
+        self._last_fold: np.ndarray | None = None
+        self._planned_path: Path | None = None
+
         # Static substrate caches, populated by reset().
         self._world = None
         self._grid: OccupancyGrid | None = None
@@ -364,18 +372,39 @@ class PathFollowingController:
 
         self._k += 1
         if self._replan_k is not None and self._k % self._replan_k == 0:
+            # Refresh knowledge every K acts (the cadence the experiments count),
+            # but commit to it only when the held segment is exhausted or blocked.
             try:
                 new_path = self.compute_path(state, lidar)
-                if new_path:
-                    self._follower = WaypointFollower(list(new_path), WAYPOINT_REACHED_DISTANCE)
             except (ValueError, RuntimeError):
-                # Keep the last valid path/follower; never rebuild it (AC8).
-                pass
+                # Keep the last valid path/follower; never rebuild it (AC8/AC10).
+                # `_planned_path` is left untouched on failure.
+                new_path = None
+
+            if new_path:
+                self._planned_path = new_path
+                # Commitment horizon: adopt the fresh plan ONLY when the current
+                # commitment is exhausted or its immediate segment is no longer
+                # clear. On a clear run the committed segment stays clear and the
+                # follower never finishes mid-traverse, so no swap fires and the
+                # robot follows its t=0 plan identically to the `_once` variant —
+                # the lidar-fold jitter that starved forward motion only appeared
+                # when a swap fired every K acts (AC8/AC10).
+                if self._follower.is_finished or self._immediate_segment_blocked(state[:2]):
+                    self._follower = WaypointFollower(
+                        list(new_path), WAYPOINT_REACHED_DISTANCE
+                    )
 
         return compute_action_from_state(state, self._follower)
 
     def compute_path(self, state: np.ndarray, lidar: np.ndarray) -> Path:
-        """Full-search replan from the current pose against the folded grid."""
+        """Full-search replan from the current pose against the folded grid.
+
+        Always stores the folded occupancy in `self._last_fold` (including the
+        initial plan called from `reset()`) so the subsequent commitment check in
+        `_immediate_segment_blocked` can reuse it without a second lidar fold
+        (AC9). The actual search is delegated to the overridable `_plan` hook.
+        """
         if (
             self._grid is None
             or self._static_cells is None
@@ -389,15 +418,44 @@ class PathFollowingController:
         folded = lidar_to_occupancy(
             self._static_cells, self._grid, state, lidar, self._geom, self._inflation
         )
+        self._last_fold = folded
         # astar_search reads grid.cells, so the folded ndarray must be re-wrapped.
         folded_grid = OccupancyGrid(
             cells=folded, resolution=self._grid.resolution, offset=self._grid.offset
         )
+        return self._plan(folded_grid, folded, state)
+
+    def _plan(self, folded_grid: OccupancyGrid, folded: np.ndarray, state: np.ndarray) -> Path:
+        """Overridable search hook: grid A*/Dijkstra by default (AC2/AC15).
+
+        Subclasses (RRT / RRT* in T4/T5) override ONLY this method to substitute
+        a sampling search; the signature `(folded_grid, folded, state)` and the
+        contract — return a `Path` of world-frame waypoints from the robot's
+        current pose to the goal — are fixed. The grid variant selected by the
+        class is recovered from `type(self).heuristic_fn` (None => A*, zero
+        heuristic => Dijkstra).
+        """
         cur_cell = world_to_grid(state[:2], folded_grid)
         cells_path = astar_search(folded_grid, cur_cell, self._goal_cell, type(self).heuristic_fn)
         return grid_path_to_waypoints(
             cells_path, self._grid, folded, state[:2], self._goal_xy, WAYPOINT_STRIDE
         )
+
+    def _immediate_segment_blocked(self, position: np.ndarray) -> bool:
+        """Is the segment the robot is about to traverse no longer clear?
+
+        The commitment horizon is exactly the robot pose -> its current target
+        waypoint: the one piece of the held path the robot drives across next.
+        This reuses the stored `self._last_fold` and calls ONLY
+        `segment_is_clear_grid`, so it performs no additional lidar fold (AC9).
+        `current_waypoint` advances the follower's index past reached waypoints,
+        which is intended and mirrors `DStarLiteController`.
+        """
+        assert self._follower is not None and self._grid is not None
+        if self._last_fold is None:
+            return False
+        target = self._follower.current_waypoint(position)
+        return not segment_is_clear_grid(self._last_fold, self._grid, position, target)
 
 
 # --- Registry machinery -----------------------------------------------------
@@ -407,7 +465,11 @@ class PathFollowingController:
 ALGORITHMS: dict[str, type] = {}
 
 # Families that take a --replan-k cadence and label their results with _k<K>.
-REPLAN_FAMILIES = frozenset({"a_star_replan", "dijkstra_replan"})
+# The RRT replan families (T4/T5) subclass PathFollowingController and override
+# only `_plan`, so they share this same cadence + commitment-horizon machinery.
+REPLAN_FAMILIES = frozenset(
+    {"a_star_replan", "dijkstra_replan", "rrt_replan", "rrt_star_replan"}
+)
 
 
 def register(name: str, cls: type) -> None:
