@@ -146,11 +146,12 @@ Aggregated per algorithm (over 50 seeds):
 
 ## Phase 6 — Algorithms
 
-_Partly landed: the unified `Controller` interface (`reset` + `act`), the
+_Mostly landed: the unified `Controller` interface (`reset` + `act`), the
 planner-agnostic runner loop, the grid family (`a_star_once`, `a_star_replan`,
-`dijkstra_once`, `dijkstra_replan`), and `d_star_lite` all ship. The reactive
-(DWA, APF) and sampling (RRT, RRT*) families and the Phase 6b K-sweep remain
-deferred. See "The planner family (Phase 6)" in CLAUDE.md._
+`dijkstra_once`, `dijkstra_replan`), `d_star_lite`, the reactive family (`dwa`,
+`apf`), and the sampling family (`rrt_once`, `rrt_replan`, `rrt_star_once`,
+`rrt_star_replan`) all ship; all 11 planner keys land. Only the Phase 6b K-sweep
+remains deferred. See "The planner family (Phase 6)" in CLAUDE.md._
 
 Each planner lives in `planners/<name>.py`. Interface:
 
