@@ -124,13 +124,13 @@ population of straight-line crossing traffic.
 # Visible smoke loop — drive the world and watch the render window
 python arena/arena.py arena/arena_v1.yaml --render
 
-# Headless verification suite (38 checks, TC1–TC37; ~30 min)
+# Headless verification suite (47 checks, TC1–TC46; ~50 min)
 python arena/arena.py arena/arena_v1.yaml --check
 ```
 
 `--check` is the health gate for the whole harness. It covers the Arena API,
 the episode runner, the traffic substrate, the batch runner, and the planner
-family end-to-end. All 38 PASS means the harness is healthy. (With neither flag,
+family end-to-end. All 47 PASS means the harness is healthy. (With neither flag,
 it defaults to `--check`.)
 
 | Flag | Default | Meaning |
@@ -138,7 +138,7 @@ it defaults to `--check`.)
 | `yaml_path` (positional) | required | World YAML, e.g. `arena/arena_v1.yaml`. |
 | `--seed N` | 42 | Master seed for the smoke/check run. |
 | `--render` | off | Interactive smoke loop in a visible window. |
-| `--check` | (default) | Run the headless TC1–TC37 verification suite. |
+| `--check` | (default) | Run the headless TC1–TC46 verification suite. |
 
 ### 2. `run_episode` — one planner, one seed
 
