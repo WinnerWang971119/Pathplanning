@@ -74,9 +74,13 @@ PLOTS_DIR_NAME = "plots"             # default out-dir leaf under <results-dir>/
 # order; the default --charts value is exactly this tuple.
 CHART_KEYS = ("a1", "a3", "a4", "b1", "b2", "b3", "b4")
 
-# Outcome buckets in precedence order (see classify_outcome). A record is exactly
-# one of these.
-OUTCOMES = ("success", "crash", "timeout", "planner_error")
+# Outcome buckets. The first four are the per-record buckets `classify_outcome`
+# returns (a JSON record is exactly one of those). "dnf" is a fifth FAILURE
+# subtype that has NO record at all — it is detected at the manifest level (an
+# episode the batch runner killed at the 600s wallclock wall, recorded as
+# `status="runner_error"` with no `<seed>.json`), never from a record. It is
+# listed last so the A3 stack draws it on top of the other failures.
+OUTCOMES = ("success", "crash", "timeout", "planner_error", "dnf")
 
 # Euclidean (2,2) -> (48,48) straight-line distance: the unreachable lower bound
 # every executed path is compared against (the robot must detour around walls).
@@ -162,12 +166,13 @@ class AlgoSummary:
     label: str                          # results dir label, e.g. "a_star_replan_k5"
     display: str                        # legend name, e.g. "A* replan (K=5)"
     family: str                         # "grid" | "incremental" | "reactive" | "sampling"
-    n_present: int
+    n_present: int                      # roster size counted (ok + runner_error); the chart denominator
     n_success: int
     n_crash: int
     n_timeout: int
     n_planner_error: int
-    failure_rate: float                 # (crash+timeout+planner_error)/n_present; NaN if n_present == 0
+    n_dnf: int                          # episodes the batch killed at the wallclock wall (manifest status=runner_error, no JSON)
+    failure_rate: float                 # (crash+timeout+planner_error+dnf)/n_present; NaN if n_present == 0
     times: tuple[float, ...]            # successful time_to_goal values
     path_lengths: tuple[float, ...]     # path_length over successes
     wallclocks: tuple[float, ...]       # wallclock_per_step from the __wallclock__ subtree (empty if absent)
@@ -204,6 +209,7 @@ class _AlgoAccumulator:
     n_crash: int = 0
     n_timeout: int = 0
     n_planner_error: int = 0
+    n_dnf: int = 0
     times: list[float] = field(default_factory=list)
     path_lengths: list[float] = field(default_factory=list)
     per_seed: dict[int, str] = field(default_factory=dict)
@@ -232,22 +238,42 @@ def _seed_from_stem(path: Path) -> int | None:
         return None
 
 
-def _load_manifest_seed_order(label_dir: Path) -> tuple[int, ...] | None:
-    """Return `derived_seeds` from this label dir's manifest, or None if absent/unusable."""
+def _load_manifest(label_dir: Path) -> dict | None:
+    """Return this label dir's parsed `_manifest.json`, or None if absent/unreadable."""
     manifest_path = label_dir / MANIFEST_NAME
     if not manifest_path.is_file():
         return None
-    data = _read_json(manifest_path)
-    if data is None:
+    return _read_json(manifest_path)
+
+
+def _manifest_seed_order_from(manifest: dict | None, label_dir: Path) -> tuple[int, ...] | None:
+    """Return `derived_seeds` from an already-parsed manifest, or None if absent/unusable."""
+    if manifest is None:
         return None
-    derived = data.get("derived_seeds")
+    derived = manifest.get("derived_seeds")
     if not isinstance(derived, list) or not derived:
         return None
     try:
         return tuple(int(seed) for seed in derived)
     except (TypeError, ValueError):
-        print(f"warning: ignoring malformed derived_seeds in {manifest_path}", file=sys.stderr)
+        print(f"warning: ignoring malformed derived_seeds in {label_dir / MANIFEST_NAME}", file=sys.stderr)
         return None
+
+
+def _manifest_episodes(manifest: dict | None) -> list[dict] | None:
+    """Return the manifest's `episodes` roster list, or None if absent/not a list.
+
+    None signals "no usable roster" so the loader falls back to globbing present
+    JSONs (synthetic fixtures and single-episode dirs have no `episodes` key). An
+    EMPTY list is treated as "no roster" too (there is nothing to drive the
+    roster path with), so the fallback still runs.
+    """
+    if manifest is None:
+        return None
+    episodes = manifest.get("episodes")
+    if not isinstance(episodes, list) or not episodes:
+        return None
+    return episodes
 
 
 def _load_wallclocks(
@@ -301,6 +327,19 @@ def _accumulate_episode(acc: _AlgoAccumulator, seed: int, rec: dict) -> None:
         acc.n_planner_error += 1
 
 
+def _accumulate_dnf(acc: _AlgoAccumulator, seed: int) -> None:
+    """Fold one did-not-finish (wallclock-killed) episode into the accumulator.
+
+    A DNF has no `<seed>.json` to classify — it is a roster-level failure subtype
+    (manifest `status="runner_error"`). It counts toward `n_present` (so the
+    denominator stays at the full seed count) and toward `n_dnf`, and marks its
+    seed "dnf" in `per_seed` so the B1 heatmap colors it.
+    """
+    acc.n_present += 1
+    acc.n_dnf += 1
+    acc.per_seed[seed] = "dnf"
+
+
 def _finalize_summary(
     *,
     label: str,
@@ -317,7 +356,7 @@ def _finalize_summary(
     "no data" sentinel everywhere in this module so the dtype stays float and
     downstream charts can drop NaNs uniformly.
     """
-    n_failed = acc.n_crash + acc.n_timeout + acc.n_planner_error
+    n_failed = acc.n_crash + acc.n_timeout + acc.n_planner_error + acc.n_dnf
     failure_rate = (n_failed / acc.n_present) if acc.n_present > 0 else float("nan")
     median_time = statistics.median(acc.times) if acc.times else float("nan")
     mean_time = statistics.fmean(acc.times) if acc.times else float("nan")
@@ -330,6 +369,7 @@ def _finalize_summary(
         n_crash=acc.n_crash,
         n_timeout=acc.n_timeout,
         n_planner_error=acc.n_planner_error,
+        n_dnf=acc.n_dnf,
         failure_rate=failure_rate,
         times=tuple(acc.times),
         path_lengths=tuple(acc.path_lengths),
@@ -341,6 +381,116 @@ def _finalize_summary(
     )
 
 
+def _accumulate_from_glob(acc: _AlgoAccumulator, label_dir: Path, seen_seeds: set[int]) -> None:
+    """Tally one label dir by globbing its present numeric-stem JSONs (the fallback path).
+
+    This is the pre-DNF behavior: every readable `<seed>.json` is classified and
+    folded; `n_present` ends up equal to the JSON count and there are no DNFs.
+    Used when a label has no manifest with an `episodes` roster (synthetic
+    fixtures, single-episode dirs, manifest-less trees).
+    """
+    for json_path in sorted(label_dir.glob(EPISODE_GLOB)):
+        seed = _seed_from_stem(json_path)
+        if seed is None:
+            continue
+        rec = _read_json(json_path)
+        if rec is None:
+            continue
+        _accumulate_episode(acc, seed, rec)
+        seen_seeds.add(seed)
+
+
+def _accumulate_from_roster(
+    acc: _AlgoAccumulator,
+    label_dir: Path,
+    episodes: list[dict],
+    label: str,
+    seen_seeds: set[int],
+) -> None:
+    """Tally one label dir using its manifest `episodes` list as the authoritative roster.
+
+    Per episode entry (`{"seed", "exit_code", "status"}`):
+      - "ok"           -> read `<seed>.json` and classify it (the normal path). If
+                          the JSON is unexpectedly missing or malformed, warn and
+                          treat the episode as a DNF (defensive — an "ok" status
+                          promises a JSON, so its absence is itself a failure).
+      - "runner_error" -> a wallclock-killed episode with NO JSON: count as "dnf".
+      - "skipped"      -> a `--resume` no-op. Count it ONLY if its JSON exists on
+                          disk (resume case: the data is from an earlier run);
+                          otherwise drop it from the roster entirely (it was never
+                          actually run, so it must not inflate the denominator).
+
+    `n_present` (the denominator) thus equals ok + runner_error (+ any skipped
+    that carried data), keeping every planner's denominator at the full seed
+    count whether or not its slow seeds finished.
+
+    Episodes are processed in lexicographic `"<seed>.json"` order (the SAME order
+    the glob path scans files), so the success `times` list stays append-aligned
+    with `_success_times_by_seed`'s filename-sorted reconstruction — the roster's
+    own derivation order would otherwise desync that seed->time recovery.
+    """
+    # Pre-parse seeds so a non-integer / malformed entry is reported once, then
+    # process the survivors in lexicographic filename order (glob-path parity).
+    parsed: list[tuple[int, str | None]] = []
+    for episode in episodes:
+        if not isinstance(episode, dict):
+            print(f"warning: skipping malformed episode entry in {label} roster: {episode!r}", file=sys.stderr)
+            continue
+        raw_seed = episode.get("seed")
+        try:
+            seed = int(raw_seed)
+        except (TypeError, ValueError):
+            print(f"warning: skipping roster entry with non-integer seed in {label}: {raw_seed!r}", file=sys.stderr)
+            continue
+        status = episode.get("status")
+        parsed.append((seed, status if isinstance(status, str) else None))
+
+    for seed, status in sorted(parsed, key=lambda item: f"{item[0]}.json"):
+        if status == "runner_error":
+            _accumulate_dnf(acc, seed)
+            seen_seeds.add(seed)
+            continue
+
+        if status == "skipped":
+            # A skipped seed only contributes if it left data behind (resume);
+            # a skipped-without-data seed never ran, so it leaves the roster.
+            json_path = label_dir / f"{seed}.json"
+            if not json_path.is_file():
+                continue
+            rec = _read_json(json_path)
+            if rec is None:
+                continue
+            _accumulate_episode(acc, seed, rec)
+            seen_seeds.add(seed)
+            continue
+
+        if status == "ok":
+            json_path = label_dir / f"{seed}.json"
+            rec = _read_json(json_path) if json_path.is_file() else None
+            if rec is None:
+                # An "ok" status promises a readable JSON; its absence/corruption
+                # is itself a did-not-finish (defensive — should not happen).
+                print(
+                    f"warning: {label} seed {seed} is status=ok but its JSON is "
+                    f"missing/unreadable; counting it as DNF",
+                    file=sys.stderr,
+                )
+                _accumulate_dnf(acc, seed)
+                seen_seeds.add(seed)
+                continue
+            _accumulate_episode(acc, seed, rec)
+            seen_seeds.add(seed)
+            continue
+
+        # An unknown status string is treated like a skipped-without-data seed:
+        # not counted, but warned so a schema drift is visible.
+        print(
+            f"warning: {label} seed {seed} has unknown manifest status {status!r}; "
+            f"dropping it from the roster",
+            file=sys.stderr,
+        )
+
+
 def load_world_results(
     results_dir: str,
     world_stem: str,
@@ -350,13 +500,24 @@ def load_world_results(
 ) -> WorldResults:
     """Load every canonical algorithm's episodes for one world into summaries.
 
-    For each CANONICAL entry, the dir label is recomputed via
+    For each CANONICAL entry the dir label is recomputed via
     `algorithm_label(name, replan_k or None)` (so the CLI's `--replan-k` picks
-    the `a_star_replan_k<K>` dirs) and the numeric-stem episode JSONs under
-    `<results_dir>/<world_stem>/<label>/` are read, classified, and tallied.
-    `_manifest.json` and any non-numeric-stem file are skipped. A missing label
-    dir, a short count (< `expected`), or an unreadable file warns to stderr and
-    is skipped — the loader NEVER raises (AC11).
+    the `a_star_replan_k<K>` dirs). How that label dir is tallied depends on
+    whether its `_manifest.json` carries an `episodes` roster:
+
+      - WITH a roster: the manifest is authoritative. Every roster episode is
+        counted so the denominator stays at the full seed count — an "ok" seed
+        reads + classifies its `<seed>.json`, a "runner_error" seed (killed at
+        the batch wallclock wall, no JSON) counts as a "dnf" failure, and a
+        "skipped" seed counts only if its JSON exists (resume). See
+        `_accumulate_from_roster`.
+      - WITHOUT a roster (synthetic fixtures, single-episode dirs, manifest-less
+        trees): the pre-DNF fallback — glob the present numeric-stem JSONs,
+        `n_present` == JSON count, zero DNF. See `_accumulate_from_glob`.
+
+    `_manifest.json` and any non-numeric-stem file are skipped by the glob path.
+    A missing label dir, a short count (< `expected`), or an unreadable file
+    warns to stderr and is skipped — the loader NEVER raises (AC11).
 
     The B1 heatmap's seed-column order comes from the first manifest found (any
     label's `derived_seeds`); absent any manifest it falls back to the sorted
@@ -388,20 +549,21 @@ def load_world_results(
                 file=sys.stderr,
             )
         else:
+            manifest = _load_manifest(label_dir)
+
             # The first manifest we encounter fixes the canonical seed-column order
             # for the whole world (all manifests share the same derived_seeds).
             if manifest_seed_order is None:
-                manifest_seed_order = _load_manifest_seed_order(label_dir)
+                manifest_seed_order = _manifest_seed_order_from(manifest, label_dir)
 
-            for json_path in sorted(label_dir.glob(EPISODE_GLOB)):
-                seed = _seed_from_stem(json_path)
-                if seed is None:
-                    continue
-                rec = _read_json(json_path)
-                if rec is None:
-                    continue
-                _accumulate_episode(acc, seed, rec)
-                seen_seeds.add(seed)
+            # When the manifest carries an `episodes` roster it is authoritative
+            # (counts DNF seeds and keeps the denominator at the full seed count);
+            # otherwise fall back to the pre-DNF glob behavior exactly.
+            episodes = _manifest_episodes(manifest)
+            if episodes is not None:
+                _accumulate_from_roster(acc, label_dir, episodes, label, seen_seeds)
+            else:
+                _accumulate_from_glob(acc, label_dir, seen_seeds)
 
             if acc.n_present < expected:
                 print(
@@ -447,6 +609,7 @@ SUMMARY_CSV_COLUMNS = (
     "n_crash",
     "n_timeout",
     "n_planner_error",
+    "n_dnf",
     "failure_rate",
     "median_time",
     "mean_time",
@@ -476,6 +639,7 @@ def write_summary_csv(summaries: tuple[AlgoSummary, ...] | list[AlgoSummary], ou
                     summary.n_crash,
                     summary.n_timeout,
                     summary.n_planner_error,
+                    summary.n_dnf,
                     summary.failure_rate,
                     summary.median_time,
                     summary.mean_time,
@@ -492,6 +656,7 @@ OUTCOME_COLORS = {
     "crash": "#d62728",          # red
     "timeout": "#ff7f0e",        # orange
     "planner_error": "#7f7f7f",  # grey
+    "dnf": "#000000",            # black — wallclock-killed; distinct from crash-red/timeout-orange/error-grey
 }
 
 # Human-readable legend labels for the outcome buckets (A3 legend).
@@ -500,6 +665,7 @@ OUTCOME_DISPLAY = {
     "crash": "crash",
     "timeout": "timeout",
     "planner_error": "planner error",
+    "dnf": "DNF (wallclock)",
 }
 
 # Marker shapes for the A1 centroid markers (one shape per statistic).
@@ -712,8 +878,9 @@ def _chart_a3(results: WorldResults, plt, out_dir: Path) -> Path:
     """A3 — per-algorithm failure-breakdown stacked bars (AC5).
 
     One stacked bar per algorithm (CANONICAL order). Segments are the COUNTS of
-    success / crash / timeout / planner_error, summing to n_present, with fixed
-    per-outcome colors and an outcome legend. An algorithm whose n_present
+    success / crash / timeout / planner_error / dnf, summing to n_present, with
+    fixed per-outcome colors and an outcome legend. DNF (wallclock-killed) is its
+    own black segment on top of the other failures. An algorithm whose n_present
     differs from the expected 50 (partial data) is annotated above its bar.
     """
     summaries = results.summaries
@@ -722,12 +889,14 @@ def _chart_a3(results: WorldResults, plt, out_dir: Path) -> Path:
 
     fig, ax = plt.subplots(figsize=(12, 7))
 
-    # Per-outcome count series, one list aligned to x_positions.
+    # Per-outcome count series, one list aligned to x_positions. Keys cover every
+    # OUTCOMES bucket so the `for outcome in OUTCOMES` stack below never misses one.
     counts_by_outcome = {
         "success": [s.n_success for s in summaries],
         "crash": [s.n_crash for s in summaries],
         "timeout": [s.n_timeout for s in summaries],
         "planner_error": [s.n_planner_error for s in summaries],
+        "dnf": [s.n_dnf for s in summaries],
     }
 
     # Running bottom for the stack, accumulated outcome by outcome.
@@ -909,8 +1078,9 @@ def _success_times_by_seed(summary: AlgoSummary) -> dict[int, float]:
 
 
 # Failure outcomes overlaid as flat categorical cells in the B1 heatmap (success
-# is the continuous-cmap layer, so it is excluded here).
-_B1_FAILURE_OUTCOMES = ("crash", "timeout", "planner_error")
+# is the continuous-cmap layer, so it is excluded here). DNF is included so a
+# wallclock-killed seed colors its cell like the other failure types.
+_B1_FAILURE_OUTCOMES = ("crash", "timeout", "planner_error", "dnf")
 
 
 def _chart_b1(results: WorldResults, plt, out_dir: Path) -> Path:
@@ -920,9 +1090,10 @@ def _chart_b1(results: WorldResults, plt, out_dir: Path) -> Path:
     `derived_seeds`, else sorted stems), so reading down a column exposes
     universally-hard seeds. A SUCCESS cell is shaded by its time_to_goal on a
     continuous viridis colormap (colorbar "time to goal (s)"); a FAILURE cell is a
-    flat categorical color per type (crash / timeout / planner_error, reusing
-    OUTCOME_COLORS for parity with A3); an absent cell (no entry for that seed)
-    keeps a neutral background. Never raises on missing seeds or 0-success rows.
+    flat categorical color per type (crash / timeout / planner_error / dnf,
+    reusing OUTCOME_COLORS for parity with A3); an absent cell (no entry for that
+    seed) keeps a neutral background. Never raises on missing seeds or 0-success
+    rows.
     """
     import numpy as np
 
@@ -1456,15 +1627,16 @@ CHART_DISPATCH = {
 
 # --- Self-check (T5) --------------------------------------------------------
 #
-# The suite below runs TC-P1..TC-P10 against synthetic result trees built in a
+# The suite below runs TC-P1..TC-P11 against synthetic result trees built in a
 # TemporaryDirectory — no irsim, no real episodes. Each TC is a plain function
 # that asserts its invariants; `_run_selfcheck_suite` catches per-TC exceptions
 # so one failure never aborts the rest, prints a PASS/FAIL line each, and returns
 # an int exit code (0 = all passed, 1 = any failed). The fixture helper writes
 # `<seed>.json` records with the 7 metric fields plus a `_manifest.json` carrying
-# `derived_seeds`, and is parametrizable so each TC can inject the edge cases
-# (0-success algos, short seed counts, malformed JSON, decoy files, a
-# `__wallclock__` subtree). Charts are rendered through the real chart functions
+# `derived_seeds` (and, for the DNF roster TC, an `episodes` list), and is
+# parametrizable so each TC can inject the edge cases (0-success algos, short
+# seed counts, malformed JSON, decoy files, a `__wallclock__` subtree, a
+# wallclock-killed roster). Charts are rendered through the real chart functions
 # under the headless Agg backend selected by `ensure_matplotlib()`.
 
 # The 7 metric fields run_episode writes (mirrors runners/run_episode.py:78-84).
@@ -2114,7 +2286,72 @@ def _tc_p10_run_all_canonical(_tmp: Path) -> str:
     return "11 tuples; 4 replan families k=5/_k5; command builder gates --replan-k"
 
 
-# Ordered registry of the 10 test cases. Each entry is (id, callable).
+def _tc_p11_dnf_roster(tmp: Path) -> str:
+    """TC-P11: a manifest `episodes` roster counts wallclock-killed seeds as DNF failures.
+
+    Build one label dir whose `_manifest.json` carries an `episodes` list with 3
+    "ok" seeds (JSONs present: 2 success + 1 crash) and 2 "runner_error" seeds
+    (NO JSON — the batch killed them at the wallclock wall). The loader must use
+    the roster as the authoritative denominator: n_total == 5, n_dnf == 2,
+    n_success == 2, failure_rate == 3/5 (1 crash + 2 dnf), and the two
+    runner_error seeds marked "dnf" in per_seed.
+    """
+    from planners import algorithm_label
+
+    results_root = tmp / "tc_p11"
+    world_stem = "w"
+    label = algorithm_label("d_star_lite", None)
+    label_dir = results_root / world_stem / label
+    label_dir.mkdir(parents=True, exist_ok=True)
+
+    ok_seeds = [101, 202, 303]
+    dnf_seeds = [404, 505]
+    derived = ok_seeds + dnf_seeds
+
+    # The 3 "ok" seeds leave JSONs on disk: 2 success + 1 crash.
+    (label_dir / "101.json").write_text(
+        json.dumps(_make_record("success", time_to_goal=10.0), sort_keys=True), encoding="utf-8"
+    )
+    (label_dir / "202.json").write_text(
+        json.dumps(_make_record("success", time_to_goal=20.0), sort_keys=True), encoding="utf-8"
+    )
+    (label_dir / "303.json").write_text(
+        json.dumps(_make_record("crash"), sort_keys=True), encoding="utf-8"
+    )
+    # The 2 "runner_error" seeds leave NO JSON — only a roster entry.
+
+    manifest = {
+        "master_seed": 20260605,
+        "num_seeds": len(derived),
+        "derived_seeds": list(derived),
+        "episodes": [
+            {"seed": 101, "exit_code": 0, "status": "ok"},
+            {"seed": 202, "exit_code": 0, "status": "ok"},
+            {"seed": 303, "exit_code": 0, "status": "ok"},
+            {"seed": 404, "exit_code": 124, "status": "runner_error"},
+            {"seed": 505, "exit_code": 124, "status": "runner_error"},
+        ],
+    }
+    (label_dir / MANIFEST_NAME).write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+    results = load_world_results(str(results_root), world_stem, replan_k=DEFAULT_REPLAN_K)
+    summary = {s.label: s for s in results.summaries}[label]
+
+    assert summary.n_present == 5, f"roster denominator must be 5 (3 ok + 2 runner_error), got {summary.n_present}"
+    assert summary.n_dnf == 2, f"the 2 runner_error seeds must count as DNF, got n_dnf={summary.n_dnf}"
+    assert summary.n_success == 2, f"the 2 success JSONs must count, got n_success={summary.n_success}"
+    assert summary.n_crash == 1, f"the 1 crash JSON must count, got n_crash={summary.n_crash}"
+    assert abs(summary.failure_rate - 3.0 / 5.0) < 1e-9, \
+        f"failure_rate must be (1 crash + 2 dnf)/5 = 0.6, got {summary.failure_rate}"
+    assert summary.per_seed.get(404) == "dnf", "seed 404 (runner_error) must be marked dnf in per_seed"
+    assert summary.per_seed.get(505) == "dnf", "seed 505 (runner_error) must be marked dnf in per_seed"
+    # The DNF seeds carry no time and no success entry.
+    assert summary.per_seed.get(101) == "success" and summary.per_seed.get(303) == "crash", \
+        "the ok-seed JSONs must classify normally alongside the DNF roster entries"
+    return "roster: n_total=5, n_dnf=2, n_success=2, failure_rate=3/5; 404/505 marked dnf"
+
+
+# Ordered registry of the 11 test cases. Each entry is (id, callable).
 _SELFCHECK_CASES = (
     ("TC-P1", _tc_p1_classify_precedence),
     ("TC-P2", _tc_p2_loader_over_tree),
@@ -2126,15 +2363,16 @@ _SELFCHECK_CASES = (
     ("TC-P8", _tc_p8_matplotlib_guard),
     ("TC-P9", _tc_p9_wallclock_source),
     ("TC-P10", _tc_p10_run_all_canonical),
+    ("TC-P11", _tc_p11_dnf_roster),
 )
 
 
 def run_selfcheck() -> int:
-    """Run the plotter's self-check suite (TC-P1..TC-P10). Return 0 if all pass, else 1.
+    """Run the plotter's self-check suite (TC-P1..TC-P11). Return 0 if all pass, else 1.
 
     Builds every fixture inside a single TemporaryDirectory (each TC namespaces its
     own subdir), runs each TC in isolation so one failure never aborts the rest,
-    prints a per-TC PASS/FAIL line, and ends with an "N/10 passed" summary. No
+    prints a per-TC PASS/FAIL line, and ends with an "N/11 passed" summary. No
     irsim, no real episodes — synthetic JSON trees only. Charts are rendered
     through the real chart functions under the headless Agg backend.
     """
