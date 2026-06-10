@@ -1454,11 +1454,710 @@ CHART_DISPATCH = {
 }
 
 
-# --- Self-check (filled by T5) ----------------------------------------------
+# --- Self-check (T5) --------------------------------------------------------
+#
+# The suite below runs TC-P1..TC-P10 against synthetic result trees built in a
+# TemporaryDirectory — no irsim, no real episodes. Each TC is a plain function
+# that asserts its invariants; `_run_selfcheck_suite` catches per-TC exceptions
+# so one failure never aborts the rest, prints a PASS/FAIL line each, and returns
+# an int exit code (0 = all passed, 1 = any failed). The fixture helper writes
+# `<seed>.json` records with the 7 metric fields plus a `_manifest.json` carrying
+# `derived_seeds`, and is parametrizable so each TC can inject the edge cases
+# (0-success algos, short seed counts, malformed JSON, decoy files, a
+# `__wallclock__` subtree). Charts are rendered through the real chart functions
+# under the headless Agg backend selected by `ensure_matplotlib()`.
+
+# The 7 metric fields run_episode writes (mirrors runners/run_episode.py:78-84).
+_SELFCHECK_METRIC_KEYS = (
+    "time_to_goal",
+    "crashed",
+    "timed_out",
+    "path_length",
+    "mean_speed",
+    "wallclock_per_step",
+    "planner_error",
+)
+
+
+def _make_record(
+    outcome: str,
+    *,
+    time_to_goal: float | None = None,
+    path_length: float | None = None,
+    wallclock_per_step: float = 0.01,
+) -> dict:
+    """Build one synthetic metrics record for the given outcome.
+
+    `outcome` is one of OUTCOMES. A "success" record carries a non-null
+    `time_to_goal` (and a `path_length`); every other outcome sets its flag (or
+    `planner_error` string) and leaves `time_to_goal` null, matching exactly what
+    run_episode writes. `path_length` defaults to a value derived from the time so
+    the B2 boxes have spread without the caller spelling it out.
+    """
+    record = {
+        "time_to_goal": None,
+        "crashed": False,
+        "timed_out": False,
+        "path_length": 0.0,
+        "mean_speed": 0.0,
+        "wallclock_per_step": float(wallclock_per_step),
+        "planner_error": None,
+    }
+    if outcome == "success":
+        if time_to_goal is None:
+            raise ValueError("a success record needs a time_to_goal")
+        path = path_length if path_length is not None else (STRAIGHT_LINE_IDEAL_M + time_to_goal)
+        record["time_to_goal"] = float(time_to_goal)
+        record["path_length"] = float(path)
+        record["mean_speed"] = float(path) / float(time_to_goal) if time_to_goal else 0.0
+    elif outcome == "crash":
+        record["crashed"] = True
+    elif outcome == "timeout":
+        record["timed_out"] = True
+    elif outcome == "planner_error":
+        record["planner_error"] = "synthetic planner failure"
+    else:
+        raise ValueError(f"unknown outcome {outcome!r}")
+    return record
+
+
+def _outcomes_for_algo(
+    *,
+    n_success: int,
+    n_crash: int = 0,
+    n_timeout: int = 0,
+    n_planner_error: int = 0,
+) -> list[str]:
+    """Expand per-outcome counts into the per-seed outcome list (success first)."""
+    return (
+        ["success"] * n_success
+        + ["crash"] * n_crash
+        + ["timeout"] * n_timeout
+        + ["planner_error"] * n_planner_error
+    )
+
+
+def _write_algo_tree(
+    *,
+    results_root: Path,
+    world_stem: str,
+    label: str,
+    seeds: list[int],
+    outcomes: list[str],
+    derived_seeds: list[int] | None,
+    success_times: list[float] | None = None,
+    wallclock_per_step: float = 0.01,
+    write_manifest: bool = True,
+    decoy_files: bool = False,
+    malformed_seed: int | None = None,
+) -> None:
+    """Write one algorithm's synthetic result dir under `<results_root>/<world_stem>/<label>/`.
+
+    Writes one `<seed>.json` per (seed, outcome) pair (so `len(seeds)` ==
+    `len(outcomes)`), an optional `_manifest.json` carrying `derived_seeds`, and
+    optional decoy non-episode files (`notes.txt`, a stray `_manifest.json` is
+    always skipped by the loader regardless). `success_times` supplies the
+    `time_to_goal` for the success records in order; absent, a deterministic ramp
+    is used. `malformed_seed`, if set, overwrites that seed's JSON with invalid
+    bytes (to exercise the loader's skip-with-warning path).
+    """
+    if len(seeds) != len(outcomes):
+        raise ValueError("seeds and outcomes must be the same length")
+
+    label_dir = results_root / world_stem / label
+    label_dir.mkdir(parents=True, exist_ok=True)
+
+    success_iter = iter(success_times) if success_times is not None else None
+    ramp = 10.0
+    for seed, outcome in zip(seeds, outcomes):
+        if outcome == "success":
+            if success_iter is not None:
+                time_value = next(success_iter)
+            else:
+                time_value = ramp
+                ramp += 5.0
+            record = _make_record(
+                "success",
+                time_to_goal=time_value,
+                wallclock_per_step=wallclock_per_step,
+            )
+        else:
+            record = _make_record(outcome, wallclock_per_step=wallclock_per_step)
+        (label_dir / f"{seed}.json").write_text(
+            json.dumps(record, sort_keys=True), encoding="utf-8"
+        )
+
+    if malformed_seed is not None:
+        (label_dir / f"{malformed_seed}.json").write_text(
+            "{ this is not valid json ", encoding="utf-8"
+        )
+
+    if write_manifest and derived_seeds is not None:
+        manifest = {
+            "master_seed": 20260605,
+            "num_seeds": len(derived_seeds),
+            "derived_seeds": list(derived_seeds),
+        }
+        (label_dir / MANIFEST_NAME).write_text(
+            json.dumps(manifest, sort_keys=True), encoding="utf-8"
+        )
+
+    if decoy_files:
+        (label_dir / "notes.txt").write_text("scratch notes, not an episode\n", encoding="utf-8")
+
+
+def _write_wallclock_subtree(
+    *,
+    results_root: Path,
+    world_stem: str,
+    label: str,
+    seeds: list[int],
+    wallclock_per_step: float,
+) -> None:
+    """Write the B3 `__wallclock__` subtree at the EXACT path the loader reads.
+
+    Path: `<results_root>/__wallclock__/<world_stem>/<label>/<seed>.json`. Each
+    record is a success with the given sentinel `wallclock_per_step` so TC-P9 can
+    prove the loader sources B3's wallclock from this subtree, not the bulk dir.
+    """
+    subtree_dir = results_root / WALLCLOCK_SUBTREE / world_stem / label
+    subtree_dir.mkdir(parents=True, exist_ok=True)
+    for index, seed in enumerate(seeds):
+        record = _make_record(
+            "success",
+            time_to_goal=10.0 + index,
+            wallclock_per_step=wallclock_per_step,
+        )
+        (subtree_dir / f"{seed}.json").write_text(
+            json.dumps(record, sort_keys=True), encoding="utf-8"
+        )
+
+
+def _build_full_fixture(
+    results_root: Path,
+    world_stem: str,
+    *,
+    seeds: list[int],
+    replan_k: int = DEFAULT_REPLAN_K,
+) -> None:
+    """Write an 11-label fixture covering every CANONICAL algorithm.
+
+    Used by the chart-smoke and alignment TCs. Deliberately includes the two edge
+    cases the charts must survive: a 0-success algorithm (every seed crashes) and
+    a <50-seed algorithm (only a 12-seed prefix present). Every other algorithm
+    gets a mix of success / crash / timeout / planner_error so the stacked bars,
+    boxes, and heatmap all have content. `derived_seeds` is the full `seeds` list
+    so every row aligns to the same column order.
+    """
+    # Import the label deriver lazily (mirrors load_world_results). This pulls
+    # planners; the selfcheck is allowed to do so once it is actually running.
+    from planners import algorithm_label
+
+    n_seeds = len(seeds)
+    for index, (name, default_k, _family, _display) in enumerate(CANONICAL):
+        effective_k = replan_k if default_k is not None else None
+        label = algorithm_label(name, effective_k)
+
+        if name == "dwa":
+            # 0-success algorithm: every present seed crashes (the experimental
+            # signal the charts must render without dropping the algorithm).
+            outcomes = ["crash"] * n_seeds
+            algo_seeds = list(seeds)
+            derived = list(seeds)
+        elif name == "apf":
+            # <50-seed algorithm: only a 12-seed prefix is present on disk. Its
+            # manifest still carries the full derived_seeds stream.
+            short = min(12, n_seeds)
+            algo_seeds = list(seeds[:short])
+            outcomes = _outcomes_for_algo(
+                n_success=max(short - 3, 0),
+                n_crash=min(2, short),
+                n_timeout=min(1, max(short - 2, 0)),
+            )
+            # Pad/truncate so outcomes lines up with algo_seeds exactly.
+            outcomes = (outcomes + ["crash"] * short)[:short]
+            derived = list(seeds)
+        else:
+            # A varied mix: most succeed, a couple fail across the three failure
+            # buckets, so every chart layer has data. Rotate the failing seeds by
+            # the algorithm index so the heatmap columns are not all identical.
+            outcomes = ["success"] * n_seeds
+            algo_seeds = list(seeds)
+            if n_seeds >= 3:
+                outcomes[(index) % n_seeds] = "crash"
+                outcomes[(index + 1) % n_seeds] = "timeout"
+                outcomes[(index + 2) % n_seeds] = "planner_error"
+            derived = list(seeds)
+
+        _write_algo_tree(
+            results_root=results_root,
+            world_stem=world_stem,
+            label=label,
+            seeds=algo_seeds,
+            outcomes=outcomes,
+            derived_seeds=derived,
+        )
+
+
+# --- The test cases (TC-P1 .. TC-P10) ---------------------------------------
+#
+# Each returns a short detail string on success and raises AssertionError (with a
+# message) on failure. `_run_selfcheck_suite` turns that into the PASS/FAIL line.
+
+
+def _tc_p1_classify_precedence(_tmp: Path) -> str:
+    """TC-P1: classify_outcome precedence + the defensive all-false branch."""
+    assert classify_outcome(_make_record("success", time_to_goal=12.0)) == "success", \
+        "a clean success record must classify success"
+    assert classify_outcome(_make_record("crash")) == "crash", "crash flag must classify crash"
+    assert classify_outcome(_make_record("timeout")) == "timeout", "timeout flag must classify timeout"
+    assert classify_outcome(_make_record("planner_error")) == "planner_error", \
+        "planner_error must classify planner_error"
+
+    # planner_error set AND crashed=True -> planner_error wins (precedence).
+    both = _make_record("crash")
+    both["planner_error"] = "boom"
+    assert classify_outcome(both) == "planner_error", \
+        "planner_error must take precedence over crashed"
+
+    # planner_error set AND time_to_goal non-null -> still planner_error.
+    err_with_time = _make_record("success", time_to_goal=5.0)
+    err_with_time["planner_error"] = "boom"
+    assert classify_outcome(err_with_time) == "planner_error", \
+        "planner_error must take precedence over a non-null time_to_goal"
+
+    # All flags false / null and no time -> defensive planner_error fallthrough.
+    blank = {
+        "time_to_goal": None,
+        "crashed": False,
+        "timed_out": False,
+        "path_length": 0.0,
+        "mean_speed": 0.0,
+        "wallclock_per_step": 0.0,
+        "planner_error": None,
+    }
+    assert classify_outcome(blank) == "planner_error", \
+        "an all-false/null record must hit the defensive planner_error branch"
+    # An empty dict (every .get returns None/falsey) also takes the defensive branch.
+    assert classify_outcome({}) == "planner_error", \
+        "an empty record must hit the defensive planner_error branch"
+    return "precedence + defensive branch correct"
+
+
+def _tc_p2_loader_over_tree(tmp: Path) -> str:
+    """TC-P2: loader reads numeric stems, skips _manifest.json + notes.txt, counts a short dir."""
+    from planners import algorithm_label
+
+    results_root = tmp / "tc_p2"
+    world_stem = "w"
+    seeds = [101, 202, 303]
+    # a_star_once: 3 present episodes + decoy files + a manifest.
+    _write_algo_tree(
+        results_root=results_root,
+        world_stem=world_stem,
+        label=algorithm_label("a_star_once", None),
+        seeds=seeds,
+        outcomes=["success", "crash", "timeout"],
+        derived_seeds=seeds,
+        success_times=[10.0],
+        decoy_files=True,
+    )
+
+    results = load_world_results(str(results_root), world_stem, replan_k=DEFAULT_REPLAN_K)
+    by_label = {summary.label: summary for summary in results.summaries}
+    a_star = by_label[algorithm_label("a_star_once", None)]
+
+    assert a_star.n_present == 3, f"expected 3 episode files, counted {a_star.n_present}"
+    # The decoy notes.txt and the _manifest.json must not have been counted.
+    assert a_star.n_success == 1 and a_star.n_crash == 1 and a_star.n_timeout == 1, \
+        "the 3 episodes must classify as one success/crash/timeout each (decoys skipped)"
+    # The label dir physically holds notes.txt + _manifest.json beside the 3 JSONs.
+    label_dir = results_root / world_stem / algorithm_label("a_star_once", None)
+    assert (label_dir / "notes.txt").is_file(), "decoy notes.txt should have been written"
+    assert (label_dir / MANIFEST_NAME).is_file(), "manifest should have been written"
+    # Manifest seed order picked up.
+    assert results.manifest_seed_order is True, "seed order must come from the manifest"
+    assert results.seed_order == tuple(seeds), "seed order must equal derived_seeds"
+    return "n_present=3 over numeric stems; decoys + manifest skipped"
+
+
+def _tc_p3_summary_math(tmp: Path) -> str:
+    """TC-P3: failure_rate / median / mean / n_success on a known 3-success + crash + timeout set."""
+    from planners import algorithm_label
+
+    results_root = tmp / "tc_p3"
+    world_stem = "w"
+    seeds = [1, 2, 3, 4, 5]
+    outcomes = ["success", "success", "success", "crash", "timeout"]
+    _write_algo_tree(
+        results_root=results_root,
+        world_stem=world_stem,
+        label=algorithm_label("a_star_once", None),
+        seeds=seeds,
+        outcomes=outcomes,
+        derived_seeds=seeds,
+        success_times=[10.0, 20.0, 60.0],
+    )
+
+    results = load_world_results(str(results_root), world_stem, replan_k=DEFAULT_REPLAN_K)
+    by_label = {summary.label: summary for summary in results.summaries}
+    summary = by_label[algorithm_label("a_star_once", None)]
+
+    assert summary.n_present == 5, f"n_present should be 5, got {summary.n_present}"
+    assert summary.n_success == 3, f"n_success should be 3, got {summary.n_success}"
+    assert abs(summary.failure_rate - 0.4) < 1e-9, \
+        f"failure_rate should be 2/5=0.4, got {summary.failure_rate}"
+    assert abs(summary.median_time - 20.0) < 1e-9, \
+        f"median_time should be 20, got {summary.median_time}"
+    assert abs(summary.mean_time - 30.0) < 1e-9, \
+        f"mean_time should be 30, got {summary.mean_time}"
+    return "failure_rate=0.4, median=20, mean=30, n_success=3"
+
+
+def _tc_p4_partial_missing(tmp: Path) -> str:
+    """TC-P4: a missing label dir is present in summaries with n_present 0; nothing raises."""
+    from planners import algorithm_label
+
+    results_root = tmp / "tc_p4"
+    world_stem = "w"
+    seeds = [7, 8, 9]
+    # Only write a_star_once; every other canonical label dir is absent on disk.
+    _write_algo_tree(
+        results_root=results_root,
+        world_stem=world_stem,
+        label=algorithm_label("a_star_once", None),
+        seeds=seeds,
+        outcomes=["success", "success", "crash"],
+        derived_seeds=seeds,
+        success_times=[12.0, 18.0],
+    )
+
+    # Must NOT raise even though 10 of 11 label dirs are missing.
+    results = load_world_results(str(results_root), world_stem, replan_k=DEFAULT_REPLAN_K)
+
+    # Every canonical algorithm still appears in the summaries (count-charts need them).
+    assert len(results.summaries) == len(CANONICAL), \
+        f"all {len(CANONICAL)} canonical algos must appear, got {len(results.summaries)}"
+    by_label = {summary.label: summary for summary in results.summaries}
+    # A missing algorithm (dijkstra_once dir was never written) reports n_present 0.
+    missing = by_label[algorithm_label("dijkstra_once", None)]
+    assert missing.n_present == 0, \
+        f"a missing label dir must report n_present 0, got {missing.n_present}"
+    # And its derived stats are the NaN sentinels, not a crash.
+    assert missing.failure_rate != missing.failure_rate, "missing algo failure_rate must be NaN"
+    assert missing.median_time != missing.median_time, "missing algo median_time must be NaN"
+    # The present one is intact.
+    present = by_label[algorithm_label("a_star_once", None)]
+    assert present.n_present == 3 and present.n_success == 2, \
+        "the present algorithm must still load correctly alongside missing ones"
+    return "missing dirs present with n_present 0; no exception in the load path"
+
+
+def _tc_p5_chart_smoke(tmp: Path) -> str:
+    """TC-P5: render all 7 charts from an 11-label fixture; each PNG must be non-empty."""
+    plt = ensure_matplotlib()
+
+    results_root = tmp / "tc_p5"
+    world_stem = "w"
+    seeds = list(range(1000, 1015))  # 15 seeds
+    _build_full_fixture(results_root, world_stem, seeds=seeds)
+
+    results = load_world_results(str(results_root), world_stem, replan_k=DEFAULT_REPLAN_K)
+    # Sanity: the fixture really does contain a 0-success and a short algo.
+    by_label = {s.label: s for s in results.summaries}
+    from planners import algorithm_label
+    dwa = by_label[algorithm_label("dwa", None)]
+    apf = by_label[algorithm_label("apf", None)]
+    assert dwa.n_success == 0, "fixture must include a 0-success algorithm (dwa)"
+    assert apf.n_present < len(seeds), "fixture must include a <full-seed algorithm (apf)"
+
+    out_dir = tmp / "tc_p5_out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for key in CHART_KEYS:
+        render = CHART_DISPATCH[key]
+        png_path = render(results, plt, out_dir)
+        assert png_path.is_file(), f"{key}: chart did not write {png_path}"
+        size = png_path.stat().st_size
+        assert size > 0, f"{key}: chart PNG {png_path} is empty ({size} bytes)"
+    return f"all {len(CHART_KEYS)} charts rendered non-empty PNGs"
+
+
+def _tc_p6_b1_alignment(tmp: Path) -> str:
+    """TC-P6: B1 matrix is 11 rows x len(seed_order) cols; every row shares the seed->col index."""
+    import numpy as np
+
+    results_root = tmp / "tc_p6"
+    world_stem = "w"
+    seeds = list(range(2000, 2012))  # 12 seeds
+    _build_full_fixture(results_root, world_stem, seeds=seeds)
+
+    results = load_world_results(str(results_root), world_stem, replan_k=DEFAULT_REPLAN_K)
+
+    # The seed-column order is the manifest stream.
+    assert results.manifest_seed_order is True, "seed order must come from the manifest"
+    seed_order = results.seed_order
+    n_rows = len(results.summaries)
+    n_cols = len(seed_order)
+    assert n_rows == len(CANONICAL), f"expected {len(CANONICAL)} rows, got {n_rows}"
+    assert n_cols == len(seeds), f"expected {len(seeds)} columns, got {n_cols}"
+
+    # Reconstruct B1's shared seed->column map exactly as _chart_b1 does.
+    col_of_seed: dict[int, int] = {}
+    for col, seed in enumerate(seed_order):
+        if seed not in col_of_seed:
+            col_of_seed[seed] = col
+
+    # Build the same categorical/continuous layers B1 builds, and assert that for
+    # every algorithm row, each per_seed entry lands at the SAME column index that
+    # the shared seed_order assigns — i.e. the alignment is row-independent.
+    failure_cell_seen = False
+    for row, summary in enumerate(results.summaries):
+        for seed, outcome in summary.per_seed.items():
+            col = col_of_seed.get(seed)
+            assert col is not None, f"seed {seed} from row {row} missing from the shared column order"
+            # The column index must be identical to what the manifest order dictates,
+            # regardless of which algorithm row we are on.
+            assert seed_order[col] == seed, \
+                f"row {row} seed {seed} maps to column {col} which holds {seed_order[col]}"
+            if outcome in _B1_FAILURE_OUTCOMES:
+                # A failure cell carries a concrete categorical color from OUTCOME_COLORS.
+                color = OUTCOME_COLORS[outcome]
+                assert isinstance(color, str) and color.startswith("#"), \
+                    f"failure cell for {outcome} must map to a categorical hex color"
+                failure_cell_seen = True
+
+    assert failure_cell_seen, "the fixture must contain at least one failure cell for B1"
+
+    # Cross-check by reconstructing the success matrix shape the way B1 does.
+    success_matrix = np.full((n_rows, max(n_cols, 1)), np.nan, dtype=float)
+    for row, summary in enumerate(results.summaries):
+        seed_times = _success_times_by_seed(summary)
+        for seed, outcome in summary.per_seed.items():
+            col = col_of_seed[seed]
+            if outcome == "success":
+                time_value = seed_times.get(seed)
+                if time_value is not None:
+                    success_matrix[row, col] = time_value
+    assert success_matrix.shape == (n_rows, n_cols), \
+        f"B1 matrix shape {success_matrix.shape} != ({n_rows}, {n_cols})"
+    return f"B1 matrix {n_rows}x{n_cols}; rows share the manifest seed->column index"
+
+
+def _tc_p7_malformed_and_no_data(tmp: Path) -> str:
+    """TC-P7: a malformed JSON is skipped with a warning; a no-data world exits non-zero."""
+    from planners import algorithm_label
+
+    # Part A: a malformed JSON file in an otherwise-populated dir is skipped, not raised.
+    results_root = tmp / "tc_p7a"
+    world_stem = "w"
+    seeds = [11, 22, 33]
+    _write_algo_tree(
+        results_root=results_root,
+        world_stem=world_stem,
+        label=algorithm_label("a_star_once", None),
+        seeds=seeds,
+        outcomes=["success", "success", "crash"],
+        derived_seeds=seeds,
+        success_times=[10.0, 20.0],
+        malformed_seed=44,  # writes 44.json with invalid bytes
+    )
+    # Must not raise; the malformed file is skipped, the 3 valid ones load.
+    results = load_world_results(str(results_root), world_stem, replan_k=DEFAULT_REPLAN_K)
+    by_label = {s.label: s for s in results.summaries}
+    a_star = by_label[algorithm_label("a_star_once", None)]
+    assert a_star.n_present == 3, \
+        f"malformed 44.json must be skipped, expected 3 present, got {a_star.n_present}"
+
+    # Part B: a world stem with zero readable episode files must exit non-zero with
+    # the "nothing to plot" message, via main()'s code path.
+    empty_root = tmp / "tc_p7b_empty"
+    empty_root.mkdir(parents=True, exist_ok=True)
+    try:
+        code = main([
+            "--world", "arena/arena_v1.yaml",      # only its stem ("arena_v1") matters
+            "--results-dir", str(empty_root),
+            "--charts", "a1",
+        ])
+    except SystemExit as exc:
+        code = exc.code
+    assert code is not None and code != 0, \
+        f"a no-data world must exit non-zero, got {code!r}"
+    return "malformed JSON skipped; no-data world exits non-zero"
+
+
+def _tc_p8_matplotlib_guard(_tmp: Path) -> str:
+    """TC-P8: ensure_matplotlib() with find_spec patched to None exits non-zero + prints the hint."""
+    import importlib.util
+    import io
+    import contextlib
+
+    real_find_spec = importlib.util.find_spec
+
+    def fake_find_spec(name, *args, **kwargs):
+        # Narrow: only "matplotlib" disappears; every other name resolves for real.
+        if name == "matplotlib":
+            return None
+        return real_find_spec(name, *args, **kwargs)
+
+    stderr_capture = io.StringIO()
+    importlib.util.find_spec = fake_find_spec
+    try:
+        with contextlib.redirect_stderr(stderr_capture):
+            try:
+                ensure_matplotlib()
+            except SystemExit as exc:
+                code = exc.code
+            else:
+                raise AssertionError("ensure_matplotlib must raise SystemExit when matplotlib is absent")
+    finally:
+        importlib.util.find_spec = real_find_spec
+
+    assert code is not None and code != 0, f"the guard must exit non-zero, got {code!r}"
+    message = stderr_capture.getvalue()
+    assert "pip install -r requirements.txt" in message, \
+        f"the guard must print the pip hint, stderr was: {message!r}"
+    return "find_spec=None -> SystemExit non-zero + pip hint printed"
+
+
+def _tc_p9_wallclock_source(tmp: Path) -> str:
+    """TC-P9: B3 sources wallclock from the __wallclock__ subtree, then falls back when it is gone."""
+    from planners import algorithm_label
+
+    results_root = tmp / "tc_p9"
+    world_stem = "w"
+    seeds = [1, 2, 3]
+    label = algorithm_label("a_star_once", None)
+
+    # Bulk dir with a DIFFERENT sentinel wallclock (0.001) so we can prove B3 does
+    # NOT read it when the subtree exists.
+    _write_algo_tree(
+        results_root=results_root,
+        world_stem=world_stem,
+        label=label,
+        seeds=seeds,
+        outcomes=["success", "success", "success"],
+        derived_seeds=seeds,
+        success_times=[10.0, 20.0, 30.0],
+        wallclock_per_step=0.001,
+    )
+    # The __wallclock__ subtree with the sentinel B3 must surface (0.999).
+    _write_wallclock_subtree(
+        results_root=results_root,
+        world_stem=world_stem,
+        label=label,
+        seeds=seeds,
+        wallclock_per_step=0.999,
+    )
+
+    results = load_world_results(str(results_root), world_stem, replan_k=DEFAULT_REPLAN_K)
+    summary = {s.label: s for s in results.summaries}[label]
+    assert summary.wallclock_from_subtree is True, \
+        "wallclock_from_subtree must be True when the subtree exists"
+    assert len(summary.wallclocks) == len(seeds), \
+        f"expected {len(seeds)} subtree wallclock samples, got {len(summary.wallclocks)}"
+    assert all(abs(value - 0.999) < 1e-9 for value in summary.wallclocks), \
+        f"B3 wallclock must reflect the subtree sentinel 0.999, got {summary.wallclocks}"
+
+    # Now delete the subtree and reload: the loader must fall back (empty + False).
+    import shutil
+    shutil.rmtree(results_root / WALLCLOCK_SUBTREE)
+    results2 = load_world_results(str(results_root), world_stem, replan_k=DEFAULT_REPLAN_K)
+    summary2 = {s.label: s for s in results2.summaries}[label]
+    assert summary2.wallclock_from_subtree is False, \
+        "wallclock_from_subtree must be False after the subtree is removed"
+    assert summary2.wallclocks == (), \
+        f"fallback must leave wallclocks empty, got {summary2.wallclocks}"
+
+    # B3 must footnote the caveat in the fallback case. The footnote text is built
+    # from `any(... wallclock_from_subtree)`; with all False, it is the bulk caveat.
+    any_subtree = any(s.wallclock_from_subtree for s in results2.summaries)
+    assert any_subtree is False, "no algorithm should claim the subtree after deletion"
+    return "subtree sentinel 0.999 used; fallback to empty + caveat after removal"
+
+
+def _tc_p10_run_all_canonical(_tmp: Path) -> str:
+    """TC-P10: run_all.canonical_planner_set + build_experiment_cmd derivation (pure, no subprocess)."""
+    from runners.run_all import canonical_planner_set, build_experiment_cmd
+
+    planners = canonical_planner_set()
+    assert len(planners) == 11, f"canonical_planner_set must return 11 tuples, got {len(planners)}"
+
+    replan_families = {"a_star_replan", "dijkstra_replan", "rrt_replan", "rrt_star_replan"}
+    seen_replan = set()
+    for algorithm, replan_k, label in planners:
+        if algorithm in replan_families:
+            seen_replan.add(algorithm)
+            assert replan_k == 5, f"{algorithm} must carry replan_k=5, got {replan_k}"
+            assert label.endswith("_k5"), f"{algorithm} label must end _k5, got {label!r}"
+        else:
+            assert replan_k is None, f"{algorithm} must carry replan_k=None, got {replan_k}"
+            assert not label.endswith("_k5"), f"{algorithm} label must not end _k5, got {label!r}"
+    assert seen_replan == replan_families, \
+        f"all 4 replan families must appear, missing {replan_families - seen_replan}"
+
+    # build_experiment_cmd: a replan family includes --replan-k 5; a non-replan omits it.
+    replan_cmd = build_experiment_cmd(
+        "a_star_replan", 5, "arena/arena_v1.yaml", "results",
+        master_seed=20260605, num_seeds=50, jobs=1, traffic=True, resume=False,
+    )
+    assert "--replan-k" in replan_cmd, "a replan family's command must include --replan-k"
+    k_index = replan_cmd.index("--replan-k")
+    assert replan_cmd[k_index + 1] == "5", \
+        f"--replan-k value must be 5, got {replan_cmd[k_index + 1]!r}"
+
+    once_cmd = build_experiment_cmd(
+        "a_star_once", None, "arena/arena_v1.yaml", "results",
+        master_seed=20260605, num_seeds=50, jobs=1, traffic=True, resume=False,
+    )
+    assert "--replan-k" not in once_cmd, "a non-replan family's command must omit --replan-k"
+    return "11 tuples; 4 replan families k=5/_k5; command builder gates --replan-k"
+
+
+# Ordered registry of the 10 test cases. Each entry is (id, callable).
+_SELFCHECK_CASES = (
+    ("TC-P1", _tc_p1_classify_precedence),
+    ("TC-P2", _tc_p2_loader_over_tree),
+    ("TC-P3", _tc_p3_summary_math),
+    ("TC-P4", _tc_p4_partial_missing),
+    ("TC-P5", _tc_p5_chart_smoke),
+    ("TC-P6", _tc_p6_b1_alignment),
+    ("TC-P7", _tc_p7_malformed_and_no_data),
+    ("TC-P8", _tc_p8_matplotlib_guard),
+    ("TC-P9", _tc_p9_wallclock_source),
+    ("TC-P10", _tc_p10_run_all_canonical),
+)
+
 
 def run_selfcheck() -> int:
-    """Run the plotter's self-check suite (TC-P*). Placeholder until T5."""
-    raise SystemExit("selfcheck not yet implemented")
+    """Run the plotter's self-check suite (TC-P1..TC-P10). Return 0 if all pass, else 1.
+
+    Builds every fixture inside a single TemporaryDirectory (each TC namespaces its
+    own subdir), runs each TC in isolation so one failure never aborts the rest,
+    prints a per-TC PASS/FAIL line, and ends with an "N/10 passed" summary. No
+    irsim, no real episodes — synthetic JSON trees only. Charts are rendered
+    through the real chart functions under the headless Agg backend.
+    """
+    import tempfile
+
+    n_passed = 0
+    n_total = len(_SELFCHECK_CASES)
+
+    with tempfile.TemporaryDirectory(prefix="plot_selfcheck_") as tmp_name:
+        tmp = Path(tmp_name)
+        for tc_id, tc_func in _SELFCHECK_CASES:
+            try:
+                detail = tc_func(tmp)
+            except Exception as exc:  # noqa: BLE001 — one TC must not abort the suite
+                # Surface the failure reason (assertion message or unexpected error)
+                # on the TC's line rather than crashing the whole run.
+                print(f"{tc_id}: FAIL - {type(exc).__name__}: {exc}")
+            else:
+                n_passed += 1
+                print(f"{tc_id}: PASS - {detail}")
+
+    print(f"selfcheck: {n_passed}/{n_total} passed")
+    return 0 if n_passed == n_total else 1
 
 
 # --- CLI --------------------------------------------------------------------
@@ -1467,7 +2166,7 @@ def run_selfcheck() -> int:
 class PlotArgs:
     """Parsed CLI arguments — frozen so accidental mutation is impossible."""
 
-    world: str
+    world: str | None
     results_dir: str
     replan_k: int
     charts: tuple[str, ...]
@@ -1502,8 +2201,10 @@ def _parse_args(argv: list[str] | None) -> PlotArgs:
     )
     parser.add_argument(
         "--world",
-        required=True,
-        help="Path to the world YAML (e.g. arena/arena_v1.yaml); only its stem is used.",
+        required=False,
+        default=None,
+        help="Path to the world YAML (e.g. arena/arena_v1.yaml); only its stem is used. "
+        "Required unless --selfcheck is given.",
     )
     parser.add_argument(
         "--results-dir",
@@ -1560,8 +2261,20 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
     if args.selfcheck:
-        # Placeholder until T5; run_selfcheck raises SystemExit with the message.
+        # Selfcheck ignores --world entirely; run it before any --world
+        # validation so the documented `python -m runners.plot --selfcheck`
+        # command (no --world) works.
         return run_selfcheck()
+
+    # --world is only required for the normal plotting path. Validate it here
+    # (after the selfcheck gate) rather than via argparse required=True, and
+    # mirror the repo's other up-front validation-failure exits (exit code 2).
+    if args.world is None:
+        print(
+            "error: --world is required unless --selfcheck is given",
+            file=sys.stderr,
+        )
+        return 2
 
     world_stem = Path(args.world).stem
     out_dir = _resolve_out_dir(args, world_stem)
