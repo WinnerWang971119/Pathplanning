@@ -857,7 +857,7 @@ def _chart_a1(results: WorldResults, plt, out_dir: Path) -> Path:
             label="median time",
         ),
     ]
-    ax.legend(
+    centroid_legend = ax.legend(
         handles=shape_handles,
         title="centroid",
         loc="lower left",
@@ -869,7 +869,15 @@ def _chart_a1(results: WorldResults, plt, out_dir: Path) -> Path:
 
     fig.tight_layout()
     out_path = out_dir / "a1_scatter.png"
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    # Both legends sit OUTSIDE the axes (bbox_to_anchor), and bbox_inches="tight"
+    # alone does not reliably include out-of-axes artists — pass them explicitly
+    # so the longest legend entries are not clipped at the right edge.
+    fig.savefig(
+        out_path,
+        dpi=150,
+        bbox_inches="tight",
+        bbox_extra_artists=(algo_legend, centroid_legend),
+    )
     plt.close(fig)
     return out_path
 
@@ -942,11 +950,13 @@ def _chart_a3(results: WorldResults, plt, out_dir: Path) -> Path:
     ax.set_title(f"A3 - outcome breakdown per algorithm (expected {DEFAULT_EXPECTED_SEEDS} seeds)")
     ax.set_axisbelow(True)
     ax.grid(True, axis="y", linestyle=":", alpha=0.4)
-    ax.legend(title="outcome", loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=9, title_fontsize=9)
+    outcome_legend = ax.legend(title="outcome", loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=9, title_fontsize=9)
 
     fig.tight_layout()
     out_path = out_dir / "a3_failure_bars.png"
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    # The outcome legend sits OUTSIDE the axes; pass it to savefig so the tight
+    # bbox includes it (bbox_inches="tight" alone may clip out-of-axes artists).
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", bbox_extra_artists=(outcome_legend,))
     plt.close(fig)
     return out_path
 
@@ -1219,7 +1229,7 @@ def _chart_b1(results: WorldResults, plt, out_dir: Path) -> Path:
             label="absent (no entry)",
         )
     )
-    ax.legend(
+    failure_legend = ax.legend(
         handles=failure_handles,
         title="failure / absent",
         loc="upper left",
@@ -1231,7 +1241,9 @@ def _chart_b1(results: WorldResults, plt, out_dir: Path) -> Path:
 
     fig.tight_layout()
     out_path = out_dir / "b1_seed_heatmap.png"
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    # The failure/absent legend sits OUTSIDE the axes; pass it to savefig so the
+    # tight bbox includes it (bbox_inches="tight" alone may clip out-of-axes artists).
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", bbox_extra_artists=(failure_legend,))
     plt.close(fig)
     return out_path
 
