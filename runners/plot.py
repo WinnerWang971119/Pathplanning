@@ -483,6 +483,49 @@ def write_summary_csv(summaries: tuple[AlgoSummary, ...] | list[AlgoSummary], ou
             )
 
 
+# --- Chart helpers (shared by the chart functions) --------------------------
+
+# Fixed colors for the four outcome buckets, used by the A3 stacked-bar chart
+# (and any later chart that colors by outcome). Keys match OUTCOMES exactly.
+OUTCOME_COLORS = {
+    "success": "#2ca02c",        # green
+    "crash": "#d62728",          # red
+    "timeout": "#ff7f0e",        # orange
+    "planner_error": "#7f7f7f",  # grey
+}
+
+# Human-readable legend labels for the outcome buckets (A3 legend).
+OUTCOME_DISPLAY = {
+    "success": "success",
+    "crash": "crash",
+    "timeout": "timeout",
+    "planner_error": "planner error",
+}
+
+# Marker shapes for the A1 centroid markers (one shape per statistic).
+A1_MEAN_MARKER = "*"             # star = mean time
+A1_MEDIAN_MARKER = "D"           # diamond = median time
+
+
+def _algorithm_color_map(summaries, plt) -> dict[str, tuple]:
+    """Map each algorithm's results label -> a stable RGBA color.
+
+    Single source of truth for per-algorithm coloring across the A-charts: the
+    same label always gets the same color regardless of which subset of
+    algorithms a chart draws. Colors are sampled from matplotlib's `tab20`
+    qualitative colormap in CANONICAL order (the order the loader produced
+    `summaries`), which keeps the 11 algorithms visually distinct and groups
+    neighbours (the families are listed contiguously in CANONICAL).
+    """
+    cmap = plt.get_cmap("tab20")
+    color_map: dict[str, tuple] = {}
+    for index, summary in enumerate(summaries):
+        # tab20 has 20 discrete entries; modulo keeps it safe if the canonical
+        # set ever grows past 20.
+        color_map[summary.label] = cmap(index % cmap.N)
+    return color_map
+
+
 # --- Chart stubs (filled by T2/T3) ------------------------------------------
 
 # Each chart function takes the loaded WorldResults, the pyplot module, and the
@@ -491,18 +534,359 @@ def write_summary_csv(summaries: tuple[AlgoSummary, ...] | list[AlgoSummary], ou
 # without touching the registry or main().
 
 def _chart_a1(results: WorldResults, plt, out_dir: Path) -> Path:
-    """A1 — (T2) success/failure outcome bar chart per algorithm."""
-    raise NotImplementedError("chart a1 is implemented in T2")
+    """A1 — headline time-to-goal vs failure-rate scatter (AC4 / the Mission deliverable).
+
+    X = successful per-seed time-to-goal (sim seconds), Y = the algorithm's
+    failure_rate. Each algorithm's successes are scattered as dots at its
+    failure_rate row (one color per algorithm), plus two larger edge-outlined
+    centroid markers in the same color: a star at the MEAN success time and a
+    diamond at the MEDIAN. A 0-success algorithm has no dots and NaN mean/median;
+    it is represented by an annotation at its failure_rate row and never raises.
+    "Down-left wins" (low time, low failure).
+    """
+    color_map = _algorithm_color_map(results.summaries, plt)
+
+    fig, ax = plt.subplots(figsize=(11, 7))
+
+    # A small, deterministic vertical jitter (no RNG) so dots that share a Y row
+    # do not perfectly overlap; scaled tiny relative to the 0..1 failure axis.
+    jitter_span = 0.012
+
+    x_values_seen: list[float] = []
+    for index, summary in enumerate(results.summaries):
+        color = color_map[summary.label]
+        failure_rate = summary.failure_rate
+        # An all-empty algorithm (no episodes present) has a NaN failure_rate.
+        # Pin it to the top row (failure_rate == 1.0) for the annotation so it is
+        # still represented without polluting the numeric axis.
+        row_y = failure_rate if failure_rate == failure_rate else 1.0  # NaN check
+
+        if summary.times:
+            n_times = len(summary.times)
+            for dot_index, time_value in enumerate(summary.times):
+                # Deterministic triangle-wave jitter in [-jitter_span, jitter_span].
+                if n_times > 1:
+                    frac = dot_index / (n_times - 1)
+                else:
+                    frac = 0.5
+                jitter = (2.0 * frac - 1.0) * jitter_span
+                ax.scatter(
+                    time_value,
+                    row_y + jitter,
+                    color=color,
+                    alpha=0.45,
+                    s=28,
+                    edgecolors="none",
+                    zorder=2,
+                )
+                x_values_seen.append(time_value)
+
+            # Centroid markers: mean (star) and median (diamond).
+            ax.scatter(
+                summary.mean_time,
+                row_y,
+                color=color,
+                marker=A1_MEAN_MARKER,
+                s=320,
+                edgecolors="black",
+                linewidths=1.1,
+                zorder=4,
+            )
+            ax.scatter(
+                summary.median_time,
+                row_y,
+                color=color,
+                marker=A1_MEDIAN_MARKER,
+                s=150,
+                edgecolors="black",
+                linewidths=1.1,
+                zorder=4,
+            )
+            x_values_seen.append(summary.mean_time)
+            x_values_seen.append(summary.median_time)
+        else:
+            # Zero successes: no dots, no finite centroid. Represent the algorithm
+            # with an annotation at its failure_rate row, anchored to the right
+            # edge of the axes so it is always visible.
+            ax.annotate(
+                f"{summary.display}: 0/{summary.n_present} success",
+                xy=(1.0, row_y),
+                xycoords=("axes fraction", "data"),
+                xytext=(-6, 0),
+                textcoords="offset points",
+                ha="right",
+                va="center",
+                fontsize=8,
+                color=color,
+                fontweight="bold",
+                zorder=5,
+            )
+
+    ax.set_xlabel("time to goal (sim seconds)")
+    ax.set_ylabel("failure rate (0 = always solves, 1 = always fails)")
+    ax.set_title("A1 - time-to-goal vs failure rate (down-left wins)")
+    ax.set_ylim(-0.05, 1.08)
+    if x_values_seen:
+        x_lo = min(x_values_seen)
+        x_hi = max(x_values_seen)
+        pad = max(2.0, 0.05 * (x_hi - x_lo))
+        ax.set_xlim(x_lo - pad, x_hi + pad)
+    ax.grid(True, linestyle=":", alpha=0.4, zorder=0)
+
+    # "Down-left wins" guidance annotation in the lower-left corner.
+    ax.annotate(
+        "down-left wins\n(fast + reliable)",
+        xy=(0.02, 0.04),
+        xycoords="axes fraction",
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        style="italic",
+        color="#333333",
+        bbox=dict(boxstyle="round,pad=0.3", fc="#f5f5f5", ec="#999999", alpha=0.85),
+    )
+
+    # Side legend: color -> algorithm display name, placed outside the axes.
+    algo_handles = [
+        plt.Line2D(
+            [0], [0],
+            marker="o",
+            linestyle="none",
+            markerfacecolor=color_map[summary.label],
+            markeredgecolor="none",
+            markersize=8,
+            label=summary.display,
+        )
+        for summary in results.summaries
+    ]
+    algo_legend = ax.legend(
+        handles=algo_handles,
+        title="algorithm",
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        fontsize=8,
+        title_fontsize=9,
+        borderaxespad=0.0,
+    )
+    ax.add_artist(algo_legend)
+
+    # Shape legend: explains the mean vs median centroid markers.
+    shape_handles = [
+        plt.Line2D(
+            [0], [0],
+            marker=A1_MEAN_MARKER,
+            linestyle="none",
+            markerfacecolor="#cccccc",
+            markeredgecolor="black",
+            markersize=13,
+            label="mean time",
+        ),
+        plt.Line2D(
+            [0], [0],
+            marker=A1_MEDIAN_MARKER,
+            linestyle="none",
+            markerfacecolor="#cccccc",
+            markeredgecolor="black",
+            markersize=9,
+            label="median time",
+        ),
+    ]
+    ax.legend(
+        handles=shape_handles,
+        title="centroid",
+        loc="lower left",
+        bbox_to_anchor=(1.02, 0.0),
+        fontsize=8,
+        title_fontsize=9,
+        borderaxespad=0.0,
+    )
+
+    fig.tight_layout()
+    out_path = out_dir / "a1_scatter.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
 
 
 def _chart_a3(results: WorldResults, plt, out_dir: Path) -> Path:
-    """A3 — (T2) time-to-goal distribution per algorithm."""
-    raise NotImplementedError("chart a3 is implemented in T2")
+    """A3 — per-algorithm failure-breakdown stacked bars (AC5).
+
+    One stacked bar per algorithm (CANONICAL order). Segments are the COUNTS of
+    success / crash / timeout / planner_error, summing to n_present, with fixed
+    per-outcome colors and an outcome legend. An algorithm whose n_present
+    differs from the expected 50 (partial data) is annotated above its bar.
+    """
+    summaries = results.summaries
+    n_algos = len(summaries)
+    x_positions = list(range(n_algos))
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    # Per-outcome count series, one list aligned to x_positions.
+    counts_by_outcome = {
+        "success": [s.n_success for s in summaries],
+        "crash": [s.n_crash for s in summaries],
+        "timeout": [s.n_timeout for s in summaries],
+        "planner_error": [s.n_planner_error for s in summaries],
+    }
+
+    # Running bottom for the stack, accumulated outcome by outcome.
+    bottoms = [0.0] * n_algos
+    for outcome in OUTCOMES:
+        heights = counts_by_outcome[outcome]
+        ax.bar(
+            x_positions,
+            heights,
+            bottom=bottoms,
+            color=OUTCOME_COLORS[outcome],
+            label=OUTCOME_DISPLAY[outcome],
+            edgecolor="white",
+            linewidth=0.4,
+            zorder=2,
+        )
+        bottoms = [base + height for base, height in zip(bottoms, heights)]
+
+    # Annotate any algorithm whose present-count differs from the expected 50.
+    for x_pos, summary in zip(x_positions, summaries):
+        if summary.n_present != DEFAULT_EXPECTED_SEEDS:
+            ax.annotate(
+                f"n={summary.n_present}",
+                xy=(x_pos, summary.n_present),
+                xytext=(0, 4),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="#333333",
+                fontweight="bold",
+                zorder=3,
+            )
+
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(
+        [summary.display for summary in summaries],
+        rotation=45,
+        ha="right",
+        fontsize=9,
+    )
+    ax.set_ylabel("episode count")
+    ax.set_title(f"A3 - outcome breakdown per algorithm (expected {DEFAULT_EXPECTED_SEEDS} seeds)")
+    ax.set_axisbelow(True)
+    ax.grid(True, axis="y", linestyle=":", alpha=0.4)
+    ax.legend(title="outcome", loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=9, title_fontsize=9)
+
+    fig.tight_layout()
+    out_path = out_dir / "a3_failure_bars.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
 
 
 def _chart_a4(results: WorldResults, plt, out_dir: Path) -> Path:
-    """A4 — (T2) path-length-vs-ideal distribution per algorithm."""
-    raise NotImplementedError("chart a4 is implemented in T2")
+    """A4 — time-to-goal box/violin per algorithm (AC6).
+
+    One box per algorithm showing the distribution of its SUCCESSFUL times,
+    sorted by median success time ascending. An algorithm with 0 successes is
+    placed last and annotated "no success"; one with a single success cannot form
+    a box, so its lone point is scattered and annotated rather than boxed. Never
+    raises on the degenerate cases.
+    """
+    color_map = _algorithm_color_map(results.summaries, plt)
+
+    # Order: algorithms WITH >=1 success first, by ascending median time; the
+    # zero-success algorithms go last in CANONICAL order. NaN medians (no
+    # success) sort last via the (has_success, median) key.
+    def _sort_key(summary):
+        has_success = summary.n_success > 0
+        # For no-success rows median_time is NaN; give them +inf so they trail.
+        median = summary.median_time if has_success else float("inf")
+        return (0 if has_success else 1, median)
+
+    ordered = sorted(results.summaries, key=_sort_key)
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    positions = list(range(1, len(ordered) + 1))
+    box_data: list[list[float]] = []
+    box_positions: list[int] = []
+
+    for position, summary in zip(positions, ordered):
+        times = summary.times
+        color = color_map[summary.label]
+        if len(times) >= 2:
+            box_data.append(list(times))
+            box_positions.append(position)
+        elif len(times) == 1:
+            # Single success: a box is undefined, so plot the lone point and label it.
+            ax.scatter(
+                [position],
+                [times[0]],
+                color=color,
+                s=40,
+                edgecolors="black",
+                linewidths=0.8,
+                zorder=4,
+            )
+            ax.annotate(
+                "n=1",
+                xy=(position, times[0]),
+                xytext=(0, 6),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color=color,
+                zorder=5,
+            )
+        else:
+            # Zero successes: nothing to plot; annotate at the bottom of the axes.
+            ax.annotate(
+                "no success",
+                xy=(position, 0.02),
+                xycoords=("data", "axes fraction"),
+                ha="center",
+                va="bottom",
+                rotation=90,
+                fontsize=8,
+                color="#999999",
+                fontweight="bold",
+                zorder=5,
+            )
+
+    if box_data:
+        boxes = ax.boxplot(
+            box_data,
+            positions=box_positions,
+            widths=0.6,
+            patch_artist=True,
+            showfliers=True,
+            flierprops=dict(marker="o", markersize=3, markerfacecolor="#555555", markeredgecolor="none", alpha=0.5),
+            medianprops=dict(color="black", linewidth=1.4),
+        )
+        # Tint each box with its algorithm color (box_positions aligns to the
+        # subset of `ordered` that produced a box, in the same iteration order).
+        boxed_summaries = [summary for summary in ordered if len(summary.times) >= 2]
+        for patch, summary in zip(boxes["boxes"], boxed_summaries):
+            patch.set_facecolor(color_map[summary.label])
+            patch.set_alpha(0.6)
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels(
+        [summary.display for summary in ordered],
+        rotation=45,
+        ha="right",
+        fontsize=9,
+    )
+    ax.set_ylabel("time to goal (sim seconds)")
+    ax.set_title("A4 - time-to-goal distribution per algorithm (sorted by median, fastest left)")
+    ax.set_axisbelow(True)
+    ax.grid(True, axis="y", linestyle=":", alpha=0.4)
+
+    fig.tight_layout()
+    out_path = out_dir / "a4_time_box.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
 
 
 def _chart_b1(results: WorldResults, plt, out_dir: Path) -> Path:
