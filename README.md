@@ -124,13 +124,13 @@ population of straight-line crossing traffic.
 # Visible smoke loop — drive the world and watch the render window
 python arena/arena.py arena/arena_v1.yaml --render
 
-# Headless verification suite (38 checks, TC1–TC37; ~30 min)
+# Headless verification suite (47 checks, TC1–TC46; ~50 min)
 python arena/arena.py arena/arena_v1.yaml --check
 ```
 
 `--check` is the health gate for the whole harness. It covers the Arena API,
 the episode runner, the traffic substrate, the batch runner, and the planner
-family end-to-end. All 38 PASS means the harness is healthy. (With neither flag,
+family end-to-end. All 47 PASS means the harness is healthy. (With neither flag,
 it defaults to `--check`.)
 
 | Flag | Default | Meaning |
@@ -138,7 +138,7 @@ it defaults to `--check`.)
 | `yaml_path` (positional) | required | World YAML, e.g. `arena/arena_v1.yaml`. |
 | `--seed N` | 42 | Master seed for the smoke/check run. |
 | `--render` | off | Interactive smoke loop in a visible window. |
-| `--check` | (default) | Run the headless TC1–TC37 verification suite. |
+| `--check` | (default) | Run the headless TC1–TC46 verification suite. |
 
 ### 2. `run_episode` — one planner, one seed
 
@@ -229,6 +229,14 @@ state with a sentinel `action=[0.0, 0.0]`.
 `derived_seeds`, per-episode `{seed, exit_code, status}` in derivation order,
 and a best-effort `git_sha`. No timestamps, so it is byte-reproducible.
 
+`runners/run_all.py` runs all 11 canonical planners against the canonical seed
+stream in one shot (a parallel bulk pass into `results/<world_stem>/<label>/`,
+then a serial wallclock mini-pass into `results/__wallclock__/<world_stem>/<label>/`
+for a clean per-step wall-clock). `runners/plot.py` is the read-only plotter: it
+reads those JSONs and writes a `summary.csv` plus the seven comparison charts as
+PNGs into `results/<world_stem>/plots/` (gitignored). See "The Phase 5 plotter and
+batch driver" in `CLAUDE.md`.
+
 ---
 
 ## Determinism
@@ -306,8 +314,8 @@ Following the phase plan in `Mission.md`:
 | 1 — Harness sanity check | done | `runners/run_episode.py` + metrics/trace |
 | 2 — Dynamic obstacles | done | `arena/dynamic.py` crossing traffic |
 | 3 — Reproducibility | done | `runners/run_experiment.py` + manifest |
-| 4 — Metrics | pending | per-algorithm aggregation |
-| 5 — Scatter plot | pending | `results/plot.py` |
+| 4 — Metrics | done | per-algorithm aggregation (lands in the plotter's loader) |
+| 5 — Scatter plot | done | `runners/plot.py` + `runners/run_all.py` |
 | 6 — Algorithms | in progress | `planners/` (Controller interface + grid family A*/Dijkstra once+replan + D* Lite landed; reactive DWA/APF, sampling RRT/RRT*, and the 6b K-sweep remain) |
 | 7 — The actual question | pending | the insight the plot produces |
 

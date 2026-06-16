@@ -2231,6 +2231,183 @@ def tc37(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own in
             )
 
 
+def tc46(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure in-process; drives the controller directly
+    """D* Lite deferred settle: no per-tick settle, on-demand settle == fresh A*.
+
+    Drives `DStarLiteController` directly against the real world YAML (no irsim, no
+    subprocess) with a counting spy wrapped around `compute_shortest_path`:
+
+    - Phase A: committed clear ticks (all-NaN lidar) must NOT settle (spy == 0).
+    - Phase B: lidar changes that land BEHIND the robot run the per-tick
+      bookkeeping (self._cells diverges from the static grid) yet still must NOT
+      settle (the deferral is real, not just "nothing changed").
+    - Phase C: a return ON the robot->target-waypoint segment forces a settle
+      (spy >= 1).
+    - Oracle: after the forced settle the incrementally repaired path matches a
+      fresh A* on the same folded grid (the binding batched-update correctness
+      proof).
+
+    Reaching into controller._search/._cells/._follower privates matches the
+    established TC31/TC32 pattern.
+    """
+    _ensure_repo_root_on_path()
+    from manual_astar import (  # type: ignore[import-not-found]
+        OccupancyGrid,
+        astar_search,
+        world_to_grid,
+    )
+    from manual_astar import load_world as _load_world  # type: ignore[import-not-found]
+    from planners._grid import (  # type: ignore[import-not-found]
+        lidar_to_occupancy,
+        load_lidar_geometry,
+    )
+    from planners.d_star_lite import DStarLiteController  # type: ignore[import-not-found]
+
+    # --- Build the controller and plan at t=0 from an all-NaN fold (==static). ---
+    world = _load_world(yaml_path)
+    start_x, start_y = float(world.start[0]), float(world.start[1])
+    raw = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8"))
+    theta = float(raw["robot"]["state"][2]) if len(raw["robot"]["state"]) > 2 else 0.0
+
+    geom = load_lidar_geometry(yaml_path)
+    range_max = float(raw["robot"]["sensors"][0].get("range_max", 5.0))
+    bearings = np.linspace(geom.angle_min, geom.angle_max, geom.number)
+
+    state0 = np.array([start_x, start_y, theta], dtype=np.float64)
+    nan_lidar = np.full((geom.number,), np.nan, dtype=np.float64)
+
+    controller = DStarLiteController()
+    controller.reset(yaml_path, (), nan_lidar, state0)
+
+    # --- Counting spy over compute_shortest_path (closure over the bound method). ---
+    real_csp = controller._search.compute_shortest_path
+    spy = {"count": 0}
+
+    def _counting_csp() -> None:
+        spy["count"] += 1
+        real_csp()
+
+    controller._search.compute_shortest_path = _counting_csp  # type: ignore[method-assign]
+
+    static_cells = controller._grid.cells
+
+    def _make_directed_lidar(world_angle: float, beam_range: float) -> np.ndarray:
+        """A lidar scan with the 3 beams closest to `world_angle` set to `beam_range`."""
+        target_bearing = world_angle - theta
+        # Wrap to [-pi, pi) so the nearest-beam search is correct.
+        target_bearing = (target_bearing + np.pi) % (2.0 * np.pi) - np.pi
+        wrapped = (bearings + np.pi) % (2.0 * np.pi) - np.pi
+        diffs = np.abs((wrapped - target_bearing + np.pi) % (2.0 * np.pi) - np.pi)
+        center = int(np.argmin(diffs))
+        scan = np.full((geom.number,), np.nan, dtype=np.float64)
+        for offset in (-1, 0, 1):
+            scan[(center + offset) % geom.number] = beam_range
+        return scan
+
+    # --- Phase A: committed clear ticks must NOT settle. ---
+    for _ in range(5):
+        action = controller.act(state0, nan_lidar)
+        assert action.shape == (2, 1), (
+            f"TC46: act() must return a (2,1) action, got shape {action.shape}"
+        )
+    assert spy["count"] == 0, (
+        f"TC46 Phase A: clear committed ticks must NOT settle; "
+        f"compute_shortest_path fired {spy['count']} times"
+    )
+
+    # --- Phase B: changes BEHIND the robot — bookkeeping runs, settle does not. ---
+    # The current target waypoint sits ahead (toward the goal); fire beams in the
+    # opposite (backward) world direction so the fold flips cells off the robot's
+    # committed segment. The backward range is clamped so the hit (plus its
+    # inflation disk) stays inside the grid even from this corner start, since a
+    # too-long beam would land off-grid and mark nothing.
+    target = controller._follower.current_waypoint(state0[:2])
+    forward_angle = float(np.arctan2(target[1] - start_y, target[0] - start_x))
+    backward_angle = forward_angle + np.pi
+    grid = controller._grid
+    offset_x, offset_y = float(grid.offset[0]), float(grid.offset[1])
+    world_w = grid.shape[1] * grid.resolution
+    world_h = grid.shape[0] * grid.resolution
+    margin = controller._inflation + 2.0 * grid.resolution
+    cos_b, sin_b = float(np.cos(backward_angle)), float(np.sin(backward_angle))
+    # Largest range r such that (start + r*dir) stays `margin` inside every wall.
+    max_back = range_max - 0.5
+    for component, lo, hi, origin in (
+        (cos_b, offset_x + margin, offset_x + world_w - margin, start_x),
+        (sin_b, offset_y + margin, offset_y + world_h - margin, start_y),
+    ):
+        if component > 1e-9:
+            max_back = min(max_back, (hi - origin) / component)
+        elif component < -1e-9:
+            max_back = min(max_back, (lo - origin) / component)
+    back_range = float(np.clip(min(2.5, max_back), 0.5, range_max - 0.5))
+    back_lidar = _make_directed_lidar(backward_angle, back_range)
+
+    # Sanity: the chosen behind-the-robot scan must actually flip cells (else the
+    # "deferral is real" assertion below would pass vacuously).
+    back_fold = lidar_to_occupancy(
+        static_cells, grid, state0, back_lidar, geom, controller._inflation
+    )
+    assert not np.array_equal(back_fold, static_cells), (
+        f"TC46 setup: the backward scan at range {back_range} marked no cells; "
+        f"adjust the geometry"
+    )
+
+    for _ in range(2):
+        controller.act(state0, back_lidar)
+    assert spy["count"] == 0, (
+        f"TC46 Phase B: a behind-the-robot change must NOT settle; "
+        f"compute_shortest_path fired {spy['count']} times"
+    )
+    assert not np.array_equal(controller._cells, static_cells), (
+        "TC46 Phase B: the per-tick bookkeeping must have flipped cells in "
+        "controller._cells (deferral is real, not 'nothing changed')"
+    )
+
+    # --- Phase C: a return ON the committed segment forces the settle. ---
+    # Hit between the robot's own inflation boundary and the current target
+    # waypoint, along the robot->target direction. The inflation disk
+    # (robot_radius + SAFETY_MARGIN) is wide enough that the marked cells straddle
+    # the segment's line-of-sight check, yet placing the hit beyond the inflation
+    # radius keeps the robot's own cell free (so a finite detour to the goal still
+    # exists — the oracle below requires it). Deriving the range from the live
+    # segment length keeps the hit on-segment regardless of the first leg length.
+    seg_len = float(np.linalg.norm(target - state0[:2]))
+    inflation = controller._inflation
+    assert seg_len > inflation, (
+        f"TC46 setup: committed segment {seg_len:.3f} m is shorter than the "
+        f"inflation radius {inflation:.3f} m; cannot block it without sealing "
+        f"the robot cell"
+    )
+    fwd_range = 0.5 * (inflation + seg_len)
+    fwd_lidar = _make_directed_lidar(forward_angle, fwd_range)
+    controller.act(state0, fwd_lidar)
+    assert spy["count"] >= 1, (
+        f"TC46 Phase C: a return on the committed segment must force a settle; "
+        f"compute_shortest_path fired {spy['count']} times (expected >= 1)"
+    )
+
+    # --- Oracle: the deferred-batch settle reaches the same optimum a fresh A* does. ---
+    inc_path = controller._search.extract_path()
+    inc_cost = _octile_path_cost(inc_path)
+
+    oracle_grid = OccupancyGrid(
+        cells=controller._cells.copy(),
+        resolution=controller._grid.resolution,
+        offset=controller._grid.offset,
+    )
+    cur_cell = world_to_grid(state0[:2], controller._grid)
+    goal_cell = world_to_grid(controller._goal_xy, controller._grid)
+    oracle_path = astar_search(oracle_grid, cur_cell, goal_cell)
+    oracle_cost = _octile_path_cost(oracle_path)
+
+    assert abs(inc_cost - oracle_cost) < 1e-9, (
+        f"TC46: deferred-batch incremental cost {inc_cost} != fresh-A* oracle cost "
+        f"{oracle_cost}; a batch of update_cells + one settle diverged from "
+        f"from-scratch"
+    )
+
+
 # ---------------------------------------------------------------------------
 # TC38..TC45 — the reactive (DWA / APF) + sampling (RRT / RRT*) families plus
 # the commitment-horizon fix proof. TC38/TC39 are traffic-ON reactive drives;
@@ -2792,6 +2969,7 @@ def _run_checks(yaml_path: str, seed: int) -> int:
         ("TC35: D* Lite optimal static path (== A* cost) + reaches goal", tc35),
         ("TC36: D* Lite incremental == from-scratch (binding block)", tc36),
         ("TC37: d_star_lite registered + rejects --replan-k + traffic e2e", tc37),
+        ("TC46: D* Lite deferred settle — no per-tick settle, on-demand == fresh A*", tc46),
         ("TC38: dwa traffic-on drive via runner + 8-key trace", tc38),
         ("TC39: apf traffic-on drive via runner + 8-key trace", tc39),
         ("TC40: rrt_once --no-traffic reaches goal + trace determinism", tc40),
@@ -2842,7 +3020,7 @@ def _parse_args() -> argparse.Namespace:
     group.add_argument(
         "--check",
         action="store_true",
-        help="Run TC1-TC45 headless (46 cases, incl. Phase 2 traffic + Phase 3 batch runner + replanning + D* Lite + reactive (DWA/APF) + sampling (RRT/RRT*) families)",
+        help="Run TC1-TC46 headless (47 cases, incl. Phase 2 traffic + Phase 3 batch runner + replanning + D* Lite (incl. deferred-settle) + reactive (DWA/APF) + sampling (RRT/RRT*) families)",
     )
     return parser.parse_args()
 
