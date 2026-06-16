@@ -30,10 +30,16 @@ pathplanning/
 │   ├── _grid.py            #   shared grid substrate + lidar fold + ALGORITHMS registry
 │   ├── a_star.py           #   a_star_once / a_star_replan
 │   ├── dijkstra.py         #   dijkstra_once / dijkstra_replan (A* with a zero heuristic)
-│   └── d_star_lite.py      #   d_star_lite (incremental; rejects --replan-k)
-├── runners/                # experiment harness (Phase 1 + 3)
+│   ├── d_star_lite.py      #   d_star_lite (incremental; rejects --replan-k)
+│   ├── dwa.py              #   dwa (Dynamic Window Approach; reactive, no global plan)
+│   ├── apf.py              #   apf (artificial potential fields; reactive)
+│   ├── rrt.py              #   rrt_once / rrt_replan (+ shared scalar line-of-sight helper)
+│   └── rrt_star.py         #   rrt_star_once / rrt_star_replan (choose-parent + rewire)
+├── runners/                # experiment harness (Phase 1 + 3 + 5)
 │   ├── run_episode.py      #   one planner × one seed × one world → metrics + trace
-│   └── run_experiment.py   #   one planner × the canonical 50 seeds → batch + manifest
+│   ├── run_experiment.py   #   one planner × the canonical 50 seeds → batch + manifest
+│   ├── run_all.py          #   every planner × the canonical 50 seeds (bulk + wallclock passes)
+│   └── plot.py             #   read-only plotter → summary.csv + 7 comparison charts
 ├── results/                # generated metrics/traces (gitignored except .gitkeep)
 ├── docs/plans/             # per-phase implementation plans
 ├── manual.py               # standalone demo: naive go-to-goal
@@ -43,7 +49,7 @@ pathplanning/
 ├── *.yaml                  # demo worlds (robot_world, obstacle, obstacle_harder)
 ├── tests/                  # A* edge-case world fixtures (inputs, not pytest files)
 ├── Mission.md              # the research plan (phases 0–7)
-└── requirements.txt        # irsim, numpy, pyyaml
+└── requirements.txt        # irsim, numpy, pyyaml, matplotlib
 ```
 
 The single-file demos (`test.py`, `manual*.py`) are self-contained and don't
@@ -64,7 +70,8 @@ Windows + PowerShell. A `.venv/` is already provisioned at the repo root.
 pip install -r requirements.txt
 ```
 
-Dependencies: `irsim`, `numpy`, `pyyaml`. There is no separate build step.
+Dependencies: `irsim`, `numpy`, `pyyaml`, `matplotlib` (the plotter). There is
+no separate build step.
 
 ---
 
@@ -82,7 +89,11 @@ python -m runners.run_episode --algorithm a_star_once --seed 42 --world arena/ar
 # 3. Run A* against all 50 canonical seeds
 python -m runners.run_experiment --algorithm a_star_once --world arena/arena_v1.yaml
 
-# Results land under results/arena_v1/a_star_once/
+# 4. Run EVERY planner against all 50 seeds, then render the comparison charts
+python -m runners.run_all --world arena/arena_v1.yaml
+python -m runners.plot --world arena/arena_v1.yaml
+
+# Per-seed results land under results/arena_v1/<label>/; charts in results/arena_v1/plots/
 ```
 
 ---
@@ -124,13 +135,13 @@ population of straight-line crossing traffic.
 # Visible smoke loop — drive the world and watch the render window
 python arena/arena.py arena/arena_v1.yaml --render
 
-# Headless verification suite (47 checks, TC1–TC46; ~50 min)
+# Headless verification suite (48 checks, TC1–TC47; ~50 min)
 python arena/arena.py arena/arena_v1.yaml --check
 ```
 
 `--check` is the health gate for the whole harness. It covers the Arena API,
-the episode runner, the traffic substrate, the batch runner, and the planner
-family end-to-end. All 47 PASS means the harness is healthy. (With neither flag,
+the episode runner, the traffic substrate, the batch runner, and every planner
+family end-to-end. All 48 PASS means the harness is healthy. (With neither flag,
 it defaults to `--check`.)
 
 | Flag | Default | Meaning |
@@ -138,7 +149,7 @@ it defaults to `--check`.)
 | `yaml_path` (positional) | required | World YAML, e.g. `arena/arena_v1.yaml`. |
 | `--seed N` | 42 | Master seed for the smoke/check run. |
 | `--render` | off | Interactive smoke loop in a visible window. |
-| `--check` | (default) | Run the headless TC1–TC46 verification suite. |
+| `--check` | (default) | Run the headless TC1–TC47 verification suite. |
 
 ### 2. `run_episode` — one planner, one seed
 
@@ -190,6 +201,59 @@ Result bytes are identical at any `--jobs` value; only `wallclock_per_step`
 (a Mission.md "freebie" metric) is perturbed by contention. Produce headline
 wall-clock numbers with `--jobs 1`.
 
+### 4. `run_all` + `plot` — every planner, the canonical 50 seeds, then chart it
+
+This is the end-to-end study. `runners/run_all.py` shells out to `run_experiment`
+once per planner so all 11 canonical planners face the same 50 traffic streams,
+then `runners/plot.py` reads the resulting JSONs and renders the comparison charts.
+
+```powershell
+# Run all 11 planners × 50 seeds (parallelize the bulk pass with --jobs)
+python -m runners.run_all --world arena/arena_v1.yaml --jobs 4
+
+# Render summary.csv + the 7 comparison charts from those results
+python -m runners.plot --world arena/arena_v1.yaml
+```
+
+`run_all` does two passes: a bulk pass (every planner over `--num-seeds` at
+`--jobs`) into `results/<world_stem>/<label>/`, then a short serial wallclock
+mini-pass (`--jobs 1`, `--wallclock-seeds` seeds) into
+`results/__wallclock__/<world_stem>/<label>/` for a clean, uncontended
+`wallclock_per_step`. Replan families are run at the canonical `--replan-k 5`.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--world PATH` | required | World YAML; all 11 planners run against it. |
+| `--master-seed N` | 20260605 | Master seed the episode seeds derive from. |
+| `--num-seeds N` | 50 | Seeds per planner in the bulk pass. |
+| `--jobs N` | 1 | Bulk-pass concurrency (the wallclock pass is always serial). |
+| `--wallclock-seeds N` | 5 | Seeds per planner in the serial wallclock pass. |
+| `--results-dir DIR` | `results` | Output root. |
+| `--resume` | off | Skip seeds whose `<seed>.json` already exists (per pass). |
+| `--traffic` / `--no-traffic` | traffic on | Forwarded to every episode. |
+
+`run_all` exits non-zero if any planner's batch had a runner failure (e.g. a
+seed killed at its per-episode wall), continuing past it and listing failures
+at the end.
+
+`runners/plot.py` is read-only — it never touches irsim or a sim, just the
+result JSONs. It writes a `summary.csv` and seven PNGs into
+`results/<world_stem>/plots/` (gitignored, override with `--out-dir`): the
+headline time-vs-failure scatter (A1), a failure breakdown (A3), a time box
+plot (A4), a seed-difficulty heatmap (B1), a path-length box (B2), a compute-cost
+bar (B3), and the family-contrast panels (B4). `--charts a1,b1` renders a subset;
+`python -m runners.plot --selfcheck` runs its synthetic-fixture test suite
+(no irsim, no real episodes).
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--world PATH` | required* | World YAML whose results to plot (*optional with `--selfcheck`). |
+| `--results-dir DIR` | `results` | Where to read the result JSONs from. |
+| `--replan-k N` | 5 | Cadence used to build the `_replan` labels it looks for. |
+| `--charts LIST` | all | Comma-separated subset of `a1,a3,a4,b1,b2,b3,b4`. |
+| `--out-dir DIR` | `results/<stem>/plots/` | Override the chart output directory. |
+| `--selfcheck` | off | Run the TC-P self-check suite instead of plotting. |
+
 ---
 
 ## Results layout
@@ -229,13 +293,11 @@ state with a sentinel `action=[0.0, 0.0]`.
 `derived_seeds`, per-episode `{seed, exit_code, status}` in derivation order,
 and a best-effort `git_sha`. No timestamps, so it is byte-reproducible.
 
-`runners/run_all.py` runs all 11 canonical planners against the canonical seed
-stream in one shot (a parallel bulk pass into `results/<world_stem>/<label>/`,
-then a serial wallclock mini-pass into `results/__wallclock__/<world_stem>/<label>/`
-for a clean per-step wall-clock). `runners/plot.py` is the read-only plotter: it
-reads those JSONs and writes a `summary.csv` plus the seven comparison charts as
-PNGs into `results/<world_stem>/plots/` (gitignored). See "The Phase 5 plotter and
-batch driver" in `CLAUDE.md`.
+To produce every planner's results in one shot and chart them, use
+`runners/run_all.py` then `runners/plot.py` (see "`run_all` + `plot`" above, and
+"The Phase 5 plotter and batch driver" in `CLAUDE.md`). The wallclock mini-pass
+lands under `results/__wallclock__/<world_stem>/<label>/`, a sibling of the bulk
+`<world_stem>` tree.
 
 ---
 
@@ -279,12 +341,19 @@ calls `reset()` once, then `act()` until the Arena reports done.
 Register the class by self-registering into the `ALGORITHMS` registry: the
 controller module calls `register(name, cls)` from `planners/_grid.py` at import
 (see `a_star.py`), and importing the `planners` package populates the registry.
-The runner builds the instance via `build_controller`. Five planners ship today:
-`a_star_once`, `a_star_replan`, `dijkstra_once`, `dijkstra_replan`, and
-`d_star_lite`. The `_replan` families take a required `--replan-k`; `d_star_lite`
-is the incremental planner (no `_once`/`_replan` split, and it rejects
-`--replan-k`). Mission.md Phase 6 still expects the reactive (DWA, APF) and
-sampling (RRT, RRT*) families.
+The runner builds the instance via `build_controller`. Eleven planners ship today:
+
+- **Grid** — `a_star_once`, `a_star_replan`, `dijkstra_once`, `dijkstra_replan`
+  (Dijkstra is A* with a zero heuristic).
+- **Incremental** — `d_star_lite` (no `_once`/`_replan` split; rejects `--replan-k`).
+- **Reactive** — `dwa` (Dynamic Window Approach), `apf` (artificial potential
+  fields). No global plan; velocity output only.
+- **Sampling** — `rrt_once`, `rrt_replan`, `rrt_star_once`, `rrt_star_replan`
+  (RRT* adds choose-parent + rewire).
+
+The `_replan` families (`a_star_replan`, `dijkstra_replan`, `rrt_replan`,
+`rrt_star_replan`) take a required `--replan-k`; every other planner rejects it.
+Mission.md Phase 6 is complete bar the deferred 6b K-sweep.
 
 ---
 
@@ -316,7 +385,7 @@ Following the phase plan in `Mission.md`:
 | 3 — Reproducibility | done | `runners/run_experiment.py` + manifest |
 | 4 — Metrics | done | per-algorithm aggregation (lands in the plotter's loader) |
 | 5 — Scatter plot | done | `runners/plot.py` + `runners/run_all.py` |
-| 6 — Algorithms | in progress | `planners/` (Controller interface + grid family A*/Dijkstra once+replan + D* Lite landed; reactive DWA/APF, sampling RRT/RRT*, and the 6b K-sweep remain) |
+| 6 — Algorithms | done* | `planners/` — all 11 controllers landed (grid A*/Dijkstra once+replan, D* Lite, reactive DWA/APF, sampling RRT/RRT* once+replan); *only the 6b K-sweep is deferred |
 | 7 — The actual question | pending | the insight the plot produces |
 
 Phase-by-phase implementation notes live in `docs/plans/`. Per-phase
