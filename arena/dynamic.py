@@ -90,7 +90,16 @@ class TrafficSpawner:
         arena_w: float,
         arena_h: float,
         static_obstacles: Sequence[Any],
+        *,
+        speed_min_factor: float = SPEED_MIN_FACTOR,
+        speed_max_factor: float = SPEED_MAX_FACTOR,
     ) -> None:
+        if not (0.0 < speed_min_factor <= speed_max_factor):
+            raise ValueError(
+                "TrafficSpawner speed factors must satisfy 0 < min <= max, got "
+                f"speed_min_factor={speed_min_factor}, "
+                f"speed_max_factor={speed_max_factor}"
+            )
         self._env = env
         self._robot = robot
         self._traffic_rng = traffic_rng
@@ -99,6 +108,8 @@ class TrafficSpawner:
         self._arena_w = float(arena_w)
         self._arena_h = float(arena_h)
         self._static_obstacles = list(static_obstacles)
+        self._speed_min_factor = float(speed_min_factor)
+        self._speed_max_factor = float(speed_max_factor)
 
         robot_state = self._robot.state
         self._robot_start_xy = np.array(
@@ -300,7 +311,9 @@ class TrafficSpawner:
             x, y, heading_lo, heading_hi = self._perimeter_sample(t)
             heading = float(self._traffic_rng.uniform(heading_lo, heading_hi))
             speed = float(
-                self._traffic_rng.uniform(SPEED_MIN_FACTOR, SPEED_MAX_FACTOR)
+                self._traffic_rng.uniform(
+                    self._speed_min_factor, self._speed_max_factor
+                )
                 * self._robot_top_speed
             )
 
