@@ -69,7 +69,7 @@ When adding a new world, copy an existing one as the template — irsim is stric
 **Smoke and verification:**
 ```powershell
 .venv\Scripts\Activate.ps1
-python arena/arena.py arena/arena_v1.yaml --check     # 48 PASS = harness healthy (TC1-TC47; estimate ~50 min, dominated by the full-episode traffic-on and --no-traffic solve subprocess TCs)
+python arena/arena.py arena/arena_v1.yaml --check     # 55 PASS = harness healthy (TC1-TC52 + TC-CLI/TC-FWD; estimate ~50 min, dominated by the full-episode traffic-on and --no-traffic solve subprocess TCs)
 python arena/arena.py arena/arena_v1.yaml --render    # visible smoke loop (use to eyeball YAML)
 ```
 
@@ -256,6 +256,27 @@ Phase 5 turns the per-episode result JSONs into the cross-algorithm comparison M
 Replan families are forwarded `--replan-k 5` (the canonical `REPLAN_K`); `_CANONICAL_ORDER` is asserted against `ALGORITHMS` at import so a registry drift fails loud. The driver exits non-zero if any planner's batch had a runner failure (e.g. a wallclock-killed DNF seed makes its child exit non-zero), continuing past it and listing the failures at the end.
 
 **The `results/__wallclock__/<world_stem>/<label>/` subtree** is a sibling of `<world_stem>` at the results root (NOT under the bulk world dir). It holds only the short serial wallclock pass, and `runners/plot.py`'s B3 reads `wallclock_per_step` from there; when it is absent B3 falls back to the bulk dir's wallclock with an on-figure `--jobs`-sensitivity caveat.
+
+## The obstacle-speed-cap sweep (issue #11)
+
+The dynamic-obstacle speed band is now a swept parameter, so the harness can measure how the obstacle-speed cap drives failure rate and time-to-goal per algorithm (the issue #11 question: does D* Lite's crash rate floor to zero once no obstacle can outrun the robot?). The plumbing is additive and default-preserving. The full 50-seed run and its verdict are the user's to launch; see `docs/plans/2026-06-23-obstacle-speed-sweep.findings.md` for how to run and read it.
+
+**The `--speed-regime` knob:** `runners/run_episode.py` and `runners/run_experiment.py` take `--speed-regime {slow,matched,current,fast}` (default `current` = the Mission baseline), with raw `--speed-min-factor` / `--speed-max-factor` overrides for off-menu single runs. The override pair is mutually exclusive with `--speed-regime` and is both-or-neither; a bad or conflicting flag (lone min/max, unknown regime, non-positive min, max < min, regime + override) is rejected at parse time with exit 2, before any Arena is built. The four regimes are factors of robot top speed: `slow` 0.3–0.7, `matched` 0.3–1.0, `current` 0.3–1.5, `fast` 0.5–2.0. The band table, the resolver, and the shared CLI helpers (`SPEED_REGIMES`, `SPEED_REGIME_CAP`, `resolve_speed_factors`, `add_speed_args`, `resolve_speed_args`) live in the new stdlib-only `arena/speed_regimes.py` — irsim-free and matplotlib-free, so the headless plotter and its `--selfcheck` can import it.
+
+**Determinism preserved:** `--speed-regime current` (and the default) is byte-identical to the prior baseline. The speed draw stays the 3rd `traffic_rng` draw with the same `uniform(lo, hi)` call (only the bounds become parameters), so TC17–TC24 are unchanged. `run_experiment`'s `_manifest.json` now records `speed_regime` / `speed_min_factor` / `speed_max_factor` as write-only provenance.
+
+**The sweep driver** `runners/run_speed_sweep.py` (`python -m runners.run_speed_sweep --world arena/arena_v1.yaml --algorithms focus|all`, default `focus`): runs the canonical seeds across all 4 regimes for the selected planner set, shelling `run_experiment` once per (regime, planner) into a per-regime subtree `results/speed_<regime>/<world_stem>/<label>/` (the `__wallclock__`-style sibling convention). `focus` = `a_star_once, d_star_lite, dwa, apf`; `all` = the 11 canonical planners (imports `run_all.canonical_planner_set()`). Flags `--master-seed` / `--num-seeds` / `--jobs` / `--resume` / `--traffic` | `--no-traffic` (traffic ON by default). Mirrors `run_all`'s failure policy: continues past a child runner failure and exits non-zero if any (regime, planner) failed.
+
+**The sweep plotter** `runners/plot_speed_sweep.py` (headless, read-only; `python -m runners.plot_speed_sweep --world arena/arena_v1.yaml --algorithms focus|all`): reads the four `results/speed_<regime>/` subtrees via `plot.load_world_results` and writes `failure_rate_vs_cap.png`, `median_time_vs_cap.png`, and `speed_sweep_summary.csv` to `results/<world_stem>/speed_sweep_plots/` (x-axis = the max-cap factor 0.7/1.0/1.5/2.0, one line per present algorithm). Colors come from `plot.CANONICAL` built first then filtered to present planners, so a line keeps the same color across regimes. `python -m runners.plot_speed_sweep --selfcheck` runs 7 synthetic-fixture cases (no irsim, no real episodes) and exits 0 only if all pass; `--world` is optional when `--selfcheck` is given.
+
+**TC48–TC52, TC-CLI, TC-FWD** (added to `python arena/arena.py arena/arena_v1.yaml --check`, growing it from 48 to 55 cases):
+- TC48: regime table + resolver — `SPEED_REGIMES` is the exact 4 bands, `resolve_speed_factors("current",None,None)==(0.3,1.5)` and equals the spawner constants, both overrides return them, an unknown regime raises.
+- TC49: spawner bound validation — `speed_min_factor<=0` and `speed_max_factor<speed_min_factor` each raise `ValueError`; `min==max` is allowed.
+- TC50: baseline determinism preservation + draw-count guard — `Arena(traffic=True)` vs explicit `(0.3,1.5)` give byte-identical `dynamic_obstacles_sha256`, `--speed-regime current` trace == no-flag trace, `--speed-regime fast` differs, and the per-spawn `traffic_rng` draw count is asserted unchanged (3 per attempt).
+- TC51: band wired + controlled-experiment property — at one seed two regimes' initial `initialize()` snapshots give identical spawn `(x,y)` and identical velocity direction per obstacle id, with only speeds scaled by the band (initial snapshot only; refills diverge once an obstacle despawns).
+- TC52: non-baseline determinism across a despawn/refill — two same-seed `Arena(traffic=True, speed_min_factor=0.5, speed_max_factor=2.0)` runs give identical sha256 sequences over enough ticks to force a refill.
+- TC-CLI: speed-flag CLI rejection — subprocess `run_episode` with regime+override / lone min / lone max / unknown regime / non-positive min / max < min each exits 2 and writes no `<seed>.json`.
+- TC-FWD: `run_experiment` flag forwarding — the pure child-command builder emits `--speed-regime <regime>` (or the float overrides) in the child argv and the manifest carries the three provenance fields.
 
 ## Conventions worth preserving
 

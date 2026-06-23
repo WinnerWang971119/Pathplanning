@@ -124,13 +124,13 @@ population of straight-line crossing traffic.
 # Visible smoke loop — drive the world and watch the render window
 python arena/arena.py arena/arena_v1.yaml --render
 
-# Headless verification suite (47 checks, TC1–TC46; ~50 min)
+# Headless verification suite (55 checks, TC1–TC52 + TC-CLI/TC-FWD; ~50 min)
 python arena/arena.py arena/arena_v1.yaml --check
 ```
 
 `--check` is the health gate for the whole harness. It covers the Arena API,
 the episode runner, the traffic substrate, the batch runner, and the planner
-family end-to-end. All 47 PASS means the harness is healthy. (With neither flag,
+family end-to-end. All 55 PASS means the harness is healthy. (With neither flag,
 it defaults to `--check`.)
 
 | Flag | Default | Meaning |
@@ -138,7 +138,7 @@ it defaults to `--check`.)
 | `yaml_path` (positional) | required | World YAML, e.g. `arena/arena_v1.yaml`. |
 | `--seed N` | 42 | Master seed for the smoke/check run. |
 | `--render` | off | Interactive smoke loop in a visible window. |
-| `--check` | (default) | Run the headless TC1–TC46 verification suite. |
+| `--check` | (default) | Run the headless TC1–TC52 + TC-CLI/TC-FWD verification suite. |
 
 ### 2. `run_episode` — one planner, one seed
 
@@ -189,6 +189,38 @@ python -m runners.run_experiment --algorithm a_star_once --world arena/arena_v1.
 Result bytes are identical at any `--jobs` value; only `wallclock_per_step`
 (a Mission.md "freebie" metric) is perturbed by contention. Produce headline
 wall-clock numbers with `--jobs 1`.
+
+### 4. The obstacle-speed-cap sweep
+
+`runners/run_speed_sweep.py` runs a planner set across all four
+dynamic-obstacle speed bands so you can see how the obstacle-speed cap drives
+failure rate and time-to-goal. `runners/plot_speed_sweep.py` charts the result.
+
+```powershell
+# Drive the focus set (a_star_once, d_star_lite, dwa, apf) across the 4 regimes
+python -m runners.run_speed_sweep --world arena/arena_v1.yaml --algorithms focus
+
+# Chart it: failure-rate-vs-cap + median-time-vs-cap (x = max-cap factor)
+python -m runners.plot_speed_sweep --world arena/arena_v1.yaml --algorithms focus
+```
+
+The four regimes are factors of robot top speed: `slow` 0.3–0.7, `matched`
+0.3–1.0, `current` 0.3–1.5 (the Mission baseline), `fast` 0.5–2.0. Pass
+`--algorithms all` for the full 11-planner picture (~3× the episode count, more
+in wall time as the replan families add per-replan cost). The driver
+writes one per-regime subtree per planner under
+`results/speed_<regime>/<world_stem>/<label>/`; the plotter writes
+`failure_rate_vs_cap.png`, `median_time_vs_cap.png`, and a
+`speed_sweep_summary.csv` into `results/<world_stem>/speed_sweep_plots/`.
+`python -m runners.plot_speed_sweep --selfcheck` runs the plotter's headless
+fixture suite (no irsim). This is a multi-hour run; see
+`docs/plans/2026-06-23-obstacle-speed-sweep.findings.md` for how to read the
+charts and the hypothesis the sweep tests.
+
+The same `--speed-regime {slow,matched,current,fast}` knob is available on a
+single `run_episode` / `run_experiment` run (default `current` is byte-identical
+to the prior baseline), with raw `--speed-min-factor` / `--speed-max-factor`
+overrides for off-menu bands.
 
 ---
 

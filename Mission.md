@@ -237,6 +237,20 @@ Once the plot exists:
   safe is more myth than law.
 - **How does the Pareto frontier change with traffic density?** (Stretch
   goal — would need to re-run at 5 / 10 / 20 obstacles.)
+- **How does the failure rate change with obstacle speed?** Does an
+  incremental planner (D* Lite) reach near every seed once no obstacle can
+  outrun the robot, and does the crash rate floor above zero once obstacles
+  exceed robot top speed?
+
+_Tooling shipped (issue #11): the obstacle-speed sub-question above is now
+runnable. A `--speed-regime {slow,matched,current,fast}` knob on the runners
+(default `current` = this Mission's baseline, byte-identical), a
+`runners/run_speed_sweep.py` driver, and a `runners/plot_speed_sweep.py`
+plotter chart failure-rate and median-time vs the obstacle-speed cap across the
+four bands. The full 50-seed run and its confirm/refute verdict are still
+pending (the user launches it). See "The obstacle-speed-cap sweep (issue #11)"
+in CLAUDE.md and `docs/plans/2026-06-23-obstacle-speed-sweep.findings.md`. The
+traffic-density stretch goal stays a separate, unbuilt knob._
 
 This is the only phase that produces an *insight* rather than an
 artifact. Everything before it exists to make this comparison rigorous.
