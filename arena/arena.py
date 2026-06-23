@@ -25,24 +25,24 @@ ACTION_SHAPE = (2, 1)
 RENDER_PAUSE_SECONDS = 0.05
 
 
-# Re-exported from the leaf `arena._errors` module so callers can keep doing
-# `from arena.arena import ArenaConfigError, ArenaRuntimeError` unchanged.
-from arena._errors import ArenaConfigError, ArenaRuntimeError
-
-
-# Bootstrap repo root on sys.path so the `from arena.dynamic import ...` below
-# resolves whether this file is run as `python arena/arena.py` (script-mode puts
-# arena/ on sys.path, not the repo root) or as `python -m arena.arena` / via the
-# runner (repo root already on sys.path). Mirrors runners/run_episode.py:39-43.
+# Bootstrap repo root on sys.path so the `from arena.* import ...` below resolve
+# whether this file is run as `python arena/arena.py` (script-mode puts arena/ on
+# sys.path, not the repo root) or as `python -m arena.arena` / via the runner
+# (repo root already on sys.path). Mirrors runners/run_episode.py:39-43. This MUST
+# precede the arena._errors / arena.dynamic imports: in script-mode, without the
+# repo root inserted in front of sys.path, `import arena` would resolve to THIS
+# file rather than the package and the imports below would raise ModuleNotFoundError.
 import sys as _sys
 from pathlib import Path as _Path
 _repo_root = str(_Path(__file__).resolve().parent.parent)
 if _repo_root not in _sys.path:
     _sys.path.insert(0, _repo_root)
 
-# The former arena.arena <-> arena.dynamic cycle is broken: ArenaRuntimeError now
-# lives in the leaf `arena._errors` module, which arena.dynamic imports instead,
-# so this import no longer depends on definition order.
+# Re-exported from the leaf `arena._errors` module so callers can keep doing
+# `from arena.arena import ArenaConfigError, ArenaRuntimeError` unchanged. The
+# former arena.arena <-> arena.dynamic cycle is broken: ArenaRuntimeError now
+# lives in arena._errors, which arena.dynamic imports instead of arena.arena.
+from arena._errors import ArenaConfigError, ArenaRuntimeError  # noqa: E402
 from arena.dynamic import DynamicObstacleState, TrafficSpawner  # noqa: E402
 
 
