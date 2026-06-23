@@ -28,7 +28,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from arena.arena import ArenaRuntimeError
+from arena._errors import ArenaRuntimeError
 
 
 TARGET_POPULATION = 20

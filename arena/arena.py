@@ -25,12 +25,9 @@ ACTION_SHAPE = (2, 1)
 RENDER_PAUSE_SECONDS = 0.05
 
 
-class ArenaConfigError(ValueError):
-    """Raised at Arena.__init__ for malformed config (e.g. lidar beam count mismatch)."""
-
-
-class ArenaRuntimeError(RuntimeError):
-    """Raised mid-episode for irsim contract violations (e.g. lidar dict missing 'ranges')."""
+# Re-exported from the leaf `arena._errors` module so callers can keep doing
+# `from arena.arena import ArenaConfigError, ArenaRuntimeError` unchanged.
+from arena._errors import ArenaConfigError, ArenaRuntimeError
 
 
 # Bootstrap repo root on sys.path so the `from arena.dynamic import ...` below
@@ -43,8 +40,9 @@ _repo_root = str(_Path(__file__).resolve().parent.parent)
 if _repo_root not in _sys.path:
     _sys.path.insert(0, _repo_root)
 
-# NOTE: imported AFTER ArenaRuntimeError is defined so the circular dependency
-# (arena.dynamic imports ArenaRuntimeError from arena.arena) resolves cleanly.
+# The former arena.arena <-> arena.dynamic cycle is broken: ArenaRuntimeError now
+# lives in the leaf `arena._errors` module, which arena.dynamic imports instead,
+# so this import no longer depends on definition order.
 from arena.dynamic import DynamicObstacleState, TrafficSpawner  # noqa: E402
 
 
@@ -72,12 +70,31 @@ class Arena:
         render: bool = False,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         traffic: bool = False,
+        *,
+        speed_min_factor: float | None = None,
+        speed_max_factor: float | None = None,
     ) -> None:
         self._yaml_path = Path(yaml_path)
         self._render = bool(render)
         self._timeout_s = float(timeout_s)
         self._master_seed = int(seed)
         self._traffic = bool(traffic)
+
+        # Optional dynamic-obstacle speed band (factors of robot top speed). Both None
+        # ⇒ the TrafficSpawner keeps its own SPEED_MIN_FACTOR/SPEED_MAX_FACTOR defaults
+        # (the default path stays byte-identical: the kwargs are OMITTED from the
+        # TrafficSpawner(...) call below, never passed as None — passing None would trip
+        # the spawner's 0 < None validation). Both set ⇒ forwarded so the spawner
+        # validates 0 < min <= max. Exactly one set is a programmer error (a one-sided
+        # band), rejected here before any irsim/spawner construction.
+        if (speed_min_factor is None) != (speed_max_factor is None):
+            raise ValueError(
+                "speed_min_factor and speed_max_factor must both be set or both be "
+                f"None, got speed_min_factor={speed_min_factor}, "
+                f"speed_max_factor={speed_max_factor}"
+            )
+        self._speed_min_factor = speed_min_factor
+        self._speed_max_factor = speed_max_factor
 
         # With traffic on, every dynamic obstacle (omni, no behavior) makes irsim log
         # a per-tick WARNING ("Behavior not defined ..."), ~20 lines/tick that would
@@ -126,6 +143,17 @@ class Arena:
             from manual_astar import load_world  # type: ignore[import-not-found]
 
             self._world_model = load_world(str(self._yaml_path))
+            # Splat the optional speed band: empty dict (both None) reproduces the prior
+            # call verbatim so Arena(traffic=True) stays byte-identical and TC17-TC24 are
+            # unchanged; the two factors (both set) are forwarded to the spawner.
+            speed_kwargs: dict[str, float] = (
+                {}
+                if self._speed_min_factor is None
+                else {
+                    "speed_min_factor": self._speed_min_factor,
+                    "speed_max_factor": self._speed_max_factor,
+                }
+            )
             self._spawner: TrafficSpawner | None = TrafficSpawner(
                 env=self._env,
                 robot=self._robot,
@@ -135,6 +163,7 @@ class Arena:
                 arena_w=float(self._world_model.width),
                 arena_h=float(self._world_model.height),
                 static_obstacles=self._world_model.obstacles,
+                **speed_kwargs,
             )
         else:
             self._spawner = None

@@ -6,11 +6,12 @@ used by the obstacle-speed-cap sweep (issue #11). It is deliberately
 must NEVER import ``arena.arena``, ``arena.dynamic``, ``irsim``, ``numpy``, or
 ``matplotlib`` — anything that transitively pulls irsim into the process.
 
-The reason is concrete: ``arena/dynamic.py`` does
-``from arena.arena import ArenaRuntimeError``, and ``arena/arena.py`` does
-``import irsim``. The headless plotter (``runners/plot_speed_sweep.py``) and its
-``--selfcheck`` must read the speed-regime constants without standing up irsim,
-so they import them from THIS module rather than from ``arena.dynamic``.
+The reason is concrete: ``arena/dynamic.py`` imports ``numpy`` (and the wider
+``arena`` package exposes the irsim-backed ``Arena`` through ``arena.arena``,
+which does ``import irsim``). The headless plotter
+(``runners/plot_speed_sweep.py``) and its ``--selfcheck`` must read the
+speed-regime constants without standing up irsim, so they import them from THIS
+module rather than from ``arena.dynamic``.
 
 Each regime maps a name to ``(min_factor, max_factor)`` — factors of the robot's
 top speed. ``"current"`` reproduces ``arena/dynamic.py``'s ``SPEED_MIN_FACTOR`` /
