@@ -15,6 +15,12 @@ CLI:
         [--render]              # optional flag; default False
         [--results-dir <dir>]   # optional; default "results"
         [--traffic|--no-traffic]# optional; Phase 2 crossing traffic, default ON
+        [--speed-regime <name>] # optional; named dynamic-obstacle speed band
+                                #   (slow|matched|current|fast); default unset
+                                #   ⇒ "current" (the Mission baseline).
+        [--speed-min-factor <f>]# optional; raw lower speed factor (off-menu
+        [--speed-max-factor <f>]#   single runs); both required together, and
+                                #   mutually exclusive with --speed-regime.
 
 Programmatic:
     from runners.run_episode import main
@@ -58,6 +64,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from arena.arena import Arena  # noqa: E402
+from arena.speed_regimes import add_speed_args, resolve_speed_args  # noqa: E402
 
 # Importing `planners` populates ALGORITHMS via the controller modules'
 # self-registration at import time (a_star_once / a_star_replan / dijkstra_once
@@ -96,6 +103,10 @@ class RunnerArgs:
     render: bool
     results_dir: str
     traffic: bool
+    # Resolved speed band — always concrete floats after resolve_speed_args
+    # (never None). `current` resolves to (0.3, 1.5), the spawner default.
+    speed_min_factor: float
+    speed_max_factor: float
 
 
 def _parse_args(argv: list[str] | None) -> RunnerArgs:
@@ -153,7 +164,14 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         help="Disable traffic; produces a Phase-1-compatible run (deterministic, A* succeeds).",
     )
     parser.set_defaults(traffic=True)
+    add_speed_args(parser)
     ns = parser.parse_args(argv)
+    # Resolve + validate the speed band here (parser is in scope so
+    # resolve_speed_args can call parser.error → exit 2 on a bad/conflicting
+    # flag). The result is always a concrete (min, max) float pair; an unset
+    # --speed-regime defaults to "current" ⇒ (0.3, 1.5), the spawner default,
+    # which Arena forwards byte-identically to the no-flag path.
+    speed_min_factor, speed_max_factor = resolve_speed_args(parser, ns)
     return RunnerArgs(
         algorithm=ns.algorithm,
         seed=int(ns.seed),
@@ -162,6 +180,8 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         render=bool(ns.render),
         results_dir=ns.results_dir,
         traffic=bool(ns.traffic),
+        speed_min_factor=float(speed_min_factor),
+        speed_max_factor=float(speed_max_factor),
     )
 
 
@@ -251,7 +271,14 @@ def main(argv: list[str] | None = None) -> int:
     # Arena __init__ may raise ArenaConfigError — let it propagate (exit 2 via
     # the harness convention; the OS surfaces an unhandled exception as nonzero
     # but argparse-style exit 2 happens above before this line).
-    arena = Arena(args.world, args.seed, render=args.render, traffic=args.traffic)
+    arena = Arena(
+        args.world,
+        args.seed,
+        render=args.render,
+        traffic=args.traffic,
+        speed_min_factor=args.speed_min_factor,
+        speed_max_factor=args.speed_max_factor,
+    )
 
     # World-stem partitioning: same seed against different YAMLs writes to different
     # directories, so a run cannot silently overwrite a previous run on another world.
