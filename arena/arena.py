@@ -3173,6 +3173,426 @@ def tc45(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own in
 
 
 # ---------------------------------------------------------------------------
+# TC48..TC52 + TC-CLI/TC-FWD — the obstacle-speed-cap sweep (issue #11).
+# TC48 is the pure regime table/resolver; TC49 is the spawner/Arena bound
+# validation; TC50 is THE binding baseline-determinism + draw-order guard (a
+# reordered/added traffic_rng draw breaks the byte-identical baseline here);
+# TC51 proves the band is wired at the t=0 snapshot only (positions/heading
+# identical across regimes, speeds scaled); TC52 is non-baseline determinism
+# across a despawn/refill cycle; TC-CLI subprocess-asserts the runner rejects
+# bad/conflicting speed flags with exit 2; TC-FWD proves run_experiment's pure
+# command-builder forwards the flags and the manifest records the band.
+# ---------------------------------------------------------------------------
+
+
+def tc48(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure unit; no world/seed used
+    """Regime table + resolver: exact 4 bands, cross-module agreement, resolver paths."""
+    from arena.speed_regimes import (
+        SPEED_REGIMES,
+        SPEED_REGIME_CAP,
+        resolve_speed_factors,
+    )
+    from arena.dynamic import SPEED_MIN_FACTOR, SPEED_MAX_FACTOR
+
+    assert SPEED_REGIMES == {
+        "slow": (0.3, 0.7),
+        "matched": (0.3, 1.0),
+        "current": (0.3, 1.5),
+        "fast": (0.5, 2.0),
+    }, f"TC48: SPEED_REGIMES table mismatch, got {SPEED_REGIMES}"
+
+    # Cross-module agreement: the "current" regime must reproduce the spawner's
+    # own default constants exactly (the Mission baseline) — if these drift the
+    # baseline-determinism guard (TC50) and the live spawner would disagree.
+    assert SPEED_REGIMES["current"] == (SPEED_MIN_FACTOR, SPEED_MAX_FACTOR), (
+        "TC48: SPEED_REGIMES['current'] must equal "
+        f"(SPEED_MIN_FACTOR, SPEED_MAX_FACTOR)=({SPEED_MIN_FACTOR}, {SPEED_MAX_FACTOR}), "
+        f"got {SPEED_REGIMES['current']}"
+    )
+
+    assert SPEED_REGIME_CAP == {
+        "slow": 0.7,
+        "matched": 1.0,
+        "current": 1.5,
+        "fast": 2.0,
+    }, f"TC48: SPEED_REGIME_CAP mismatch, got {SPEED_REGIME_CAP}"
+
+    # Resolver: regime lookup, both-override passthrough, unknown-key ValueError.
+    assert resolve_speed_factors("current", None, None) == (0.3, 1.5), (
+        "TC48: resolve_speed_factors('current', None, None) must be (0.3, 1.5)"
+    )
+    assert resolve_speed_factors(None, 0.5, 2.0) == (0.5, 2.0), (
+        "TC48: resolve_speed_factors(None, 0.5, 2.0) must passthrough (0.5, 2.0)"
+    )
+    try:
+        resolve_speed_factors("bogus", None, None)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(
+            "TC48: resolve_speed_factors('bogus', None, None) must raise ValueError"
+        )
+
+
+def tc49(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own seed
+    """Speed-band bound validation: one-sided / bad bounds raise ValueError; min==max OK."""
+    seed_value = 0
+
+    def _expect_value_error(label: str, **speed_kwargs: float | None) -> None:
+        try:
+            arena = Arena(yaml_path, seed=seed_value, traffic=True, **speed_kwargs)
+        except ValueError:
+            return
+        except Exception as exc:  # wrong exception type — surface it
+            try:
+                arena.close()  # type: ignore[possibly-undefined]
+            except Exception:
+                pass
+            raise AssertionError(
+                f"TC49 ({label}): expected ValueError, got {type(exc).__name__}: {exc}"
+            )
+        # Construction unexpectedly succeeded — clean up and fail.
+        try:
+            arena.close()
+        except Exception:
+            pass
+        raise AssertionError(
+            f"TC49 ({label}): expected ValueError, but construction succeeded"
+        )
+
+    # One-sided band (caught in Arena.__init__ BEFORE irsim.make).
+    _expect_value_error(
+        "one-sided", speed_min_factor=0.5, speed_max_factor=None
+    )
+    # Non-positive lower bound (from the spawner's 0 < min validation).
+    _expect_value_error(
+        "min<=0", speed_min_factor=-0.1, speed_max_factor=1.0
+    )
+    # max < min (from the spawner's min <= max validation).
+    _expect_value_error(
+        "max<min", speed_min_factor=1.5, speed_max_factor=0.5
+    )
+
+    # min == max is a degenerate-but-legal band: construction must succeed.
+    arena = Arena(yaml_path, seed=seed_value, traffic=True,
+                  speed_min_factor=0.7, speed_max_factor=0.7)
+    try:
+        pass  # constructed OK — that is the assertion
+    finally:
+        arena.close()
+
+
+def tc50(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own seed
+    """Baseline determinism + draw-order guard (THE binding gate).
+
+    The explicit baseline band (0.3, 1.5) must reproduce the default
+    Arena(traffic=True) dynamic_obstacles_sha256 sequence byte-for-byte: the
+    speed draw stays the same Generator.uniform(lo, hi) call with the same
+    bounds, so it consumes the same RNG bits. THIS byte-identity is the
+    draw-order/count guard — any added or reordered traffic_rng draw (or a
+    branch on the band) changes the consumed bits and breaks the match HERE,
+    even before the hash content would differ. A non-baseline band (0.5, 2.0)
+    must then DIFFER, proving the band actually reaches the speed draw.
+    """
+    seed_value = 3
+    n_ticks = 50  # modest tick budget to bound runtime; enough to diverge the fast band
+    zero = np.array([[0.0], [0.0]], dtype=float)
+
+    def collect_hashes(**speed_kwargs: float) -> list[str]:
+        arena = Arena(yaml_path, seed=seed_value, traffic=True, **speed_kwargs)
+        try:
+            _, _, info0 = arena.reset()
+            assert info0.dynamic_obstacles_sha256 is not None, (
+                "TC50: reset() must produce a non-None sha256 when traffic=True"
+            )
+            hashes = [info0.dynamic_obstacles_sha256]
+            for _ in range(n_ticks):
+                _, _, _, info = arena.step(zero)
+                assert info.dynamic_obstacles_sha256 is not None, (
+                    f"TC50: step {info.step_idx} sha256 is None with traffic on"
+                )
+                hashes.append(info.dynamic_obstacles_sha256)
+                if info.crashed or info.timed_out or info.reached_goal:
+                    break
+            return hashes
+        finally:
+            arena.close()
+
+    default_hashes = collect_hashes()
+    baseline_hashes = collect_hashes(speed_min_factor=0.3, speed_max_factor=1.5)
+    assert default_hashes == baseline_hashes, (
+        "TC50: explicit baseline band (0.3, 1.5) is NOT byte-identical to the "
+        "default Arena(traffic=True); a traffic_rng draw was added/reordered or "
+        "the draw branched on the band. First mismatch at tick "
+        f"{next((i for i, (a, b) in enumerate(zip(default_hashes, baseline_hashes)) if a != b), 'n/a')}"
+    )
+
+    fast_hashes = collect_hashes(speed_min_factor=0.5, speed_max_factor=2.0)
+    assert fast_hashes != baseline_hashes, (
+        "TC50: the fast band (0.5, 2.0) produced an identical sha256 sequence to "
+        "the baseline — the speed band is not reaching the speed draw"
+    )
+
+
+def tc51(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own seed
+    """Band wired at the INITIAL snapshot only: same positions/heading, scaled speeds.
+
+    Overlap rejection is position-only and speed-independent, so at a fixed seed
+    the two regimes' t=0 spawn population shares identical (x, y) and identical
+    velocity DIRECTION; only the speed magnitude scales with the band. This holds
+    ONLY at the initial snapshot — once a (faster) obstacle despawns and refills,
+    the regimes draw a differing count of traffic_rng values and diverge — so we
+    assert on the snapshot only, NEVER after stepping.
+    """
+    import math
+
+    seed_value = 5
+
+    def initial_snapshot(
+        min_f: float, max_f: float
+    ) -> tuple[DynamicObstacleState, ...]:
+        arena = Arena(
+            yaml_path,
+            seed=seed_value,
+            traffic=True,
+            speed_min_factor=min_f,
+            speed_max_factor=max_f,
+        )
+        try:
+            arena.reset()  # populate; do NOT step
+            return arena.initial_dynamic_snapshot
+        finally:
+            arena.close()
+
+    slow = initial_snapshot(0.3, 0.7)
+    fast = initial_snapshot(0.5, 2.0)
+
+    assert len(slow) == len(fast) and len(slow) > 0, (
+        f"TC51: snapshots must be same non-zero length, got {len(slow)} vs {len(fast)}"
+    )
+
+    slow_speeds: list[float] = []
+    fast_speeds: list[float] = []
+    # Snapshots are id-sorted with the same population, so pair by index.
+    for i, (s, f) in enumerate(zip(slow, fast)):
+        assert (s.x, s.y) == (f.x, f.y), (
+            f"TC51: obstacle {i} spawn position differs across regimes: "
+            f"slow=({s.x}, {s.y}) fast=({f.x}, {f.y}); overlap rejection must be "
+            "speed-independent at t=0"
+        )
+        slow_dir = math.atan2(s.vy, s.vx)
+        fast_dir = math.atan2(f.vy, f.vx)
+        assert math.isclose(slow_dir, fast_dir, abs_tol=1e-9), (
+            f"TC51: obstacle {i} velocity direction differs: slow={slow_dir} "
+            f"fast={fast_dir} (heading must be identical across regimes at t=0)"
+        )
+        s_speed = math.hypot(s.vx, s.vy)
+        f_speed = math.hypot(f.vx, f.vy)
+        assert f_speed > s_speed, (
+            f"TC51: obstacle {i} fast speed {f_speed} must exceed slow speed "
+            f"{s_speed} (the band must scale the magnitude)"
+        )
+        slow_speeds.append(s_speed)
+        fast_speeds.append(f_speed)
+
+    assert max(fast_speeds) > max(slow_speeds), (
+        f"TC51: max fast speed {max(fast_speeds)} must exceed max slow speed "
+        f"{max(slow_speeds)}"
+    )
+
+
+def tc52(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own seed
+    """Non-baseline determinism across a despawn/refill cycle.
+
+    Two same-seed Arenas at the fast band (0.5, 2.0) must produce byte-identical
+    dynamic_obstacles_sha256 sequences over enough ticks to force at least one
+    despawn+refill. Fast obstacles clear the arena quickly, so ~180 ticks
+    guarantees the refill RNG path is exercised — proving determinism holds at a
+    non-baseline cap, not just at the baseline TC50 covers.
+    """
+    seed_value = 11
+    n_ticks = 180
+    zero = np.array([[0.0], [0.0]], dtype=float)
+
+    def collect_hashes() -> tuple[list[str], frozenset[int], frozenset[int]]:
+        arena = Arena(
+            yaml_path,
+            seed=seed_value,
+            traffic=True,
+            speed_min_factor=0.5,
+            speed_max_factor=2.0,
+        )
+        try:
+            _, _, info0 = arena.reset()
+            assert info0.dynamic_obstacles_sha256 is not None, (
+                "TC52: reset() must produce a non-None sha256 when traffic=True"
+            )
+            assert arena._spawner is not None, "TC52: spawner must be live with traffic=True"
+            initial_ids = frozenset(obs.id for obs in arena.initial_dynamic_snapshot)
+            hashes = [info0.dynamic_obstacles_sha256]
+            for _ in range(n_ticks):
+                _, _, _, info = arena.step(zero)
+                assert info.dynamic_obstacles_sha256 is not None, (
+                    f"TC52: step {info.step_idx} sha256 is None with traffic on"
+                )
+                hashes.append(info.dynamic_obstacles_sha256)
+                if info.crashed or info.timed_out or info.reached_goal:
+                    break
+            # Read the final live id-set straight from the spawner (the t=0
+            # initial_dynamic_snapshot is frozen) so the despawn/refill turnover
+            # is observable.
+            final_ids = frozenset(arena._spawner.live_ids)
+            return hashes, initial_ids, final_ids
+        finally:
+            arena.close()
+
+    hashes_a, initial_ids, final_ids = collect_hashes()
+    hashes_b, _, _ = collect_hashes()
+    assert hashes_a == hashes_b, (
+        "TC52: two same-seed fast-band runs produced differing sha256 sequences; "
+        "non-baseline determinism is broken. First mismatch at tick "
+        f"{next((i for i, (a, b) in enumerate(zip(hashes_a, hashes_b)) if a != b), 'n/a')}"
+    )
+    # The label "across a despawn/refill cycle" must hold: the population has to
+    # actually turn over (at least one id despawned AND a new id appeared), else
+    # the fast-band refill RNG path was never exercised.
+    despawned = initial_ids - final_ids
+    appeared = final_ids - initial_ids
+    assert despawned and appeared, (
+        f"TC52: expected a despawn/refill turnover over {n_ticks} ticks at the fast band, "
+        f"but the live-id set did not turn over (despawned={sorted(despawned)}, "
+        f"appeared={sorted(appeared)}). The refill path was not exercised, so the "
+        "non-baseline determinism claim is not actually testing a refill cycle."
+    )
+
+
+def tc_cli(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — subprocess; own world
+    """Speed-flag CLI rejection: each bad/conflicting flag exits 2, writes no JSON."""
+    repo_root = Path(__file__).resolve().parent.parent
+    base = [
+        sys.executable, "-m", "runners.run_episode",
+        "--algorithm", "a_star_once",
+        "--seed", "42",
+        "--world", yaml_path,
+        "--no-traffic",
+    ]
+    bad_flag_sets: list[tuple[str, list[str]]] = [
+        ("unknown regime", ["--speed-regime", "bogus"]),
+        ("lone min", ["--speed-min-factor", "0.5"]),
+        ("regime+override", ["--speed-regime", "current",
+                             "--speed-min-factor", "0.4", "--speed-max-factor", "1.0"]),
+        ("max<min", ["--speed-min-factor", "1.5", "--speed-max-factor", "0.5"]),
+    ]
+    for label, extra in bad_flag_sets:
+        # ignore_cleanup_errors: an irsim grandchild can briefly outlive its parent
+        # subprocess and still hold a trace-file handle at teardown, which raises
+        # PermissionError [WinError 32] on Windows. Make that race a no-op.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            r = subprocess.run(
+                [*base, "--results-dir", td, *extra],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            assert r.returncode == 2, (
+                f"TC-CLI ({label}): expected exit 2, got {r.returncode}; "
+                f"stderr={r.stderr[-400:]}"
+            )
+            stray = list(Path(td).rglob("42.json"))
+            assert not stray, (
+                f"TC-CLI ({label}): a rejected run must write no <seed>.json, "
+                f"found {stray}"
+            )
+
+
+def tc_fwd(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure + one subprocess
+    """run_experiment flag forwarding (pure builder) + manifest provenance (e2e)."""
+    from runners.run_experiment import build_episode_cmd
+
+    def _cmd(**kw: Any) -> list[str]:
+        return build_episode_cmd(
+            seed=1,
+            algorithm="a_star_once",
+            replan_k=None,
+            world_abs="w",
+            results_dir="r",
+            traffic=False,
+            **kw,
+        )
+
+    # (a) PURE: a named regime forwards --speed-regime <name>.
+    fast_cmd = _cmd(speed_regime="fast", speed_min_override=None, speed_max_override=None)
+    assert "--speed-regime" in fast_cmd and fast_cmd[fast_cmd.index("--speed-regime") + 1] == "fast", (
+        f"TC-FWD: fast-regime call must forward --speed-regime fast, got {fast_cmd}"
+    )
+
+    # An override pair forwards both float flags, not --speed-regime.
+    over_cmd = _cmd(speed_regime=None, speed_min_override=0.4, speed_max_override=1.0)
+    assert "--speed-min-factor" in over_cmd and "--speed-max-factor" in over_cmd, (
+        f"TC-FWD: override call must forward both float flags, got {over_cmd}"
+    )
+    min_token = over_cmd[over_cmd.index("--speed-min-factor") + 1]
+    max_token = over_cmd[over_cmd.index("--speed-max-factor") + 1]
+    assert float(min_token) == 0.4, (
+        f"TC-FWD: override call must forward --speed-min-factor 0.4, got {min_token!r} in {over_cmd}"
+    )
+    assert float(max_token) == 1.0, (
+        f"TC-FWD: override call must forward --speed-max-factor 1.0, got {max_token!r} in {over_cmd}"
+    )
+    assert "--speed-regime" not in over_cmd, (
+        f"TC-FWD: override call must NOT forward --speed-regime, got {over_cmd}"
+    )
+
+    # A default call (no regime, no overrides) forwards NEITHER (byte-identity).
+    default_cmd = _cmd(speed_regime=None, speed_min_override=None, speed_max_override=None)
+    assert "--speed-regime" not in default_cmd, (
+        f"TC-FWD: default call must forward no --speed-regime, got {default_cmd}"
+    )
+    assert "--speed-min-factor" not in default_cmd and "--speed-max-factor" not in default_cmd, (
+        f"TC-FWD: default call must forward no float flags, got {default_cmd}"
+    )
+
+    # (b) INTEGRATION: a 1-seed --no-traffic matched run records the band in the manifest.
+    repo_root = Path(__file__).resolve().parent.parent
+    world_stem = Path(yaml_path).stem
+    # ignore_cleanup_errors: an irsim grandchild can briefly outlive its parent
+    # subprocess and still hold a trace-file handle at teardown, which raises
+    # PermissionError [WinError 32] on Windows. Make that race a no-op.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        r = subprocess.run(
+            [
+                sys.executable, "-m", "runners.run_experiment",
+                "--algorithm", "a_star_once",
+                "--world", yaml_path,
+                "--num-seeds", "1",
+                "--no-traffic",
+                "--speed-regime", "matched",
+                "--results-dir", td,
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert r.returncode == 0, (
+            f"TC-FWD: run_experiment exit {r.returncode}; stderr={r.stderr[-400:]}"
+        )
+        manifest_path = Path(td) / world_stem / "a_star_once" / "_manifest.json"
+        assert manifest_path.exists(), f"TC-FWD: manifest missing at {manifest_path}"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest.get("speed_regime") == "matched", (
+            f"TC-FWD: manifest speed_regime must be 'matched', got {manifest.get('speed_regime')!r}"
+        )
+        assert manifest.get("speed_min_factor") == 0.3, (
+            f"TC-FWD: manifest speed_min_factor must be 0.3, got {manifest.get('speed_min_factor')!r}"
+        )
+        assert manifest.get("speed_max_factor") == 1.0, (
+            f"TC-FWD: manifest speed_max_factor must be 1.0, got {manifest.get('speed_max_factor')!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # CLI runner — --check (default) or --render. See module docstring above.
 # ---------------------------------------------------------------------------
 
@@ -3227,6 +3647,13 @@ def _run_checks(yaml_path: str, seed: int) -> int:
         ("TC44: rrt_replan/rrt_star_replan traffic e2e + labeled dir", tc44),
         ("TC45: commitment-horizon fix proof (goal + follower identity)", tc45),
         ("TC47: rrt-local LOS helper == segment_is_clear_grid (stratified fuzz)", tc47),
+        ("TC48: speed-regime table + resolver (cross-module agreement)", tc48),
+        ("TC49: speed-band bound validation (one-sided/bad bounds raise)", tc49),
+        ("TC50: baseline determinism + draw-order guard (binding gate)", tc50),
+        ("TC51: band wired at initial snapshot (positions equal, speeds scaled)", tc51),
+        ("TC52: non-baseline determinism across a despawn/refill cycle", tc52),
+        ("TC-CLI: speed-flag CLI rejection (exit 2, no JSON)", tc_cli),
+        ("TC-FWD: run_experiment flag forwarding + manifest provenance", tc_fwd),
     ]
     failures = 0
     for label, fn in cases:
@@ -3269,7 +3696,7 @@ def _parse_args() -> argparse.Namespace:
     group.add_argument(
         "--check",
         action="store_true",
-        help="Run TC1-TC47 headless (48 cases, incl. Phase 2 traffic + Phase 3 batch runner + replanning + D* Lite (incl. deferred-settle) + reactive (DWA/APF) + sampling (RRT/RRT*) families + rrt-local LOS-helper equivalence)",
+        help="Run TC1-TC52 + TC-CLI/TC-FWD headless (55 cases, incl. Phase 2 traffic + Phase 3 batch runner + replanning + D* Lite (incl. deferred-settle) + reactive (DWA/APF) + sampling (RRT/RRT*) families + rrt-local LOS-helper equivalence + the obstacle-speed-cap sweep)",
     )
     return parser.parse_args()
 
