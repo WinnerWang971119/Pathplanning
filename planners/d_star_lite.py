@@ -823,7 +823,7 @@ class DStarLiteController:
         # expensive compute_shortest_path() runs HERE, not per tick: this is the
         # one place the repaired tree is actually consumed. A failure (settle or
         # extraction) keeps the last valid follower; never rebuild it (AC8).
-        if self._follower.is_finished or self._immediate_segment_blocked(position):
+        if self._follower.is_finished or self._any_segment_blocked(position):
             try:
                 self._search.compute_shortest_path()
                 cells_path = self._search.extract_path()
@@ -846,20 +846,30 @@ class DStarLiteController:
 
         return compute_action_from_state(state, self._follower)
 
-    def _immediate_segment_blocked(self, position: np.ndarray) -> bool:
-        """Is the segment the robot is about to traverse no longer clear?
+    def _any_segment_blocked(self, position: np.ndarray) -> bool:
+        """Is any segment of the remaining path no longer clear?
 
-        The commitment horizon is exactly the robot pose -> its current target
-        waypoint: the one piece of the held path the robot will drive across next.
-        Checking only this segment (against the live folded grid, so it sees both
+        Checks the segment from the current position to the current target waypoint,
+        as well as all subsequent segments in the waypoint follower's path.
+        Checking these segments against the live folded grid (so it sees both
         static walls and dynamic traffic) reacts promptly to an obstacle that
-        actually crosses the robot's path, while ignoring the fold's far-field
-        inflation noise that would otherwise force a replan every tick.
+        crosses the path.
         """
         assert self._follower is not None and self._grid is not None
         assert self._cells is not None
+        waypoints = self._follower._waypoints
         target = self._follower.current_waypoint(position)
-        return not segment_is_clear_grid(self._cells, self._grid, position, target)
+        target_idx = self._follower._index
+        
+        # Check segment to the current target waypoint
+        if not segment_is_clear_grid(self._cells, self._grid, position, target):
+            return True
+            
+        # Check all remaining segments on the path
+        for i in range(target_idx, len(waypoints) - 1):
+            if not segment_is_clear_grid(self._cells, self._grid, waypoints[i], waypoints[i + 1]):
+                return True
+        return False
 
 
 register("d_star_lite", DStarLiteController)
