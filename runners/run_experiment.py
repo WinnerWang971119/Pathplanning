@@ -19,6 +19,13 @@ CLI:
         [--results-dir <dir>]   # default "results"; forwarded to each episode
         [--resume]              # skip seeds whose <seed>.json already exists
         [--traffic|--no-traffic]# Phase 2 crossing traffic, default ON
+        [--speed-regime <name>] # named dynamic-obstacle speed band
+                                #   (slow|matched|current|fast); default unset
+                                #   => "current" (the Mission baseline). Forwarded
+                                #   verbatim to each child run_episode.
+        [--speed-min-factor <f>]# raw lower speed factor (off-menu single runs);
+        [--speed-max-factor <f>]#   both required together, and mutually exclusive
+                                #   with --speed-regime.
 
 Outputs (per seed, written by the child run_episode):
     <results-dir>/<world_stem>/<label>/<seed>.json
@@ -73,6 +80,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from arena.speed_regimes import (  # noqa: E402
+    DEFAULT_REGIME,
+    add_speed_args,
+    resolve_speed_args,
+)
 from planners import algorithm_label, build_controller  # noqa: E402
 from runners._layout import episode_out_dir  # noqa: E402
 from runners.run_episode import ALGORITHMS  # noqa: E402
@@ -175,7 +187,7 @@ def _stderr_tail(text: str, n_lines: int = STDERR_TAIL_LINES) -> str:
     return "\n".join(lines[-n_lines:])
 
 
-def _run_one_episode(
+def build_episode_cmd(
     *,
     seed: int,
     algorithm: str,
@@ -183,9 +195,26 @@ def _run_one_episode(
     world_abs: str,
     results_dir: str,
     traffic: bool,
-    repo_root: Path,
-) -> EpisodeResult:
-    """Launch one `python -m runners.run_episode` subprocess for a single seed."""
+    speed_regime: str | None,
+    speed_min_override: float | None,
+    speed_max_override: float | None,
+) -> list[str]:
+    """Construct one ``runners.run_episode`` child command (no execution).
+
+    Appends ``--replan-k <k>`` ONLY when ``replan_k`` is not None (the child
+    rejects the flag for non-replan families), ``--traffic`` or ``--no-traffic``
+    per the flag, and the user's ORIGINAL speed flags so the child re-validates
+    and resolves the band itself:
+
+    - ``speed_regime is not None`` => ``["--speed-regime", speed_regime]``;
+    - else if ``speed_min_override is not None`` (both overrides set together) =>
+      ``["--speed-min-factor", str(min), "--speed-max-factor", str(max)]``;
+    - else (no speed flag given) => NOTHING, so an existing no-speed-flag
+      invocation forwards nothing and the children default to ``current`` —
+      keeping the byte-identical determinism TC24/TC26 rely on.
+
+    Pure (no I/O) so T7's TC-FWD can assert the forwarded argv directly.
+    """
     cmd = [
         sys.executable,
         "-m",
@@ -204,6 +233,47 @@ def _run_one_episode(
     if replan_k is not None:
         cmd.extend(["--replan-k", str(replan_k)])
     cmd.append("--traffic" if traffic else "--no-traffic")
+    # Forward the user's ORIGINAL speed flags verbatim (the child re-validates):
+    # a named regime, else a both-set override pair, else nothing.
+    if speed_regime is not None:
+        cmd.extend(["--speed-regime", speed_regime])
+    elif speed_min_override is not None:
+        cmd.extend(
+            [
+                "--speed-min-factor",
+                str(speed_min_override),
+                "--speed-max-factor",
+                str(speed_max_override),
+            ]
+        )
+    return cmd
+
+
+def _run_one_episode(
+    *,
+    seed: int,
+    algorithm: str,
+    replan_k: int | None,
+    world_abs: str,
+    results_dir: str,
+    traffic: bool,
+    speed_regime: str | None,
+    speed_min_override: float | None,
+    speed_max_override: float | None,
+    repo_root: Path,
+) -> EpisodeResult:
+    """Launch one `python -m runners.run_episode` subprocess for a single seed."""
+    cmd = build_episode_cmd(
+        seed=seed,
+        algorithm=algorithm,
+        replan_k=replan_k,
+        world_abs=world_abs,
+        results_dir=results_dir,
+        traffic=traffic,
+        speed_regime=speed_regime,
+        speed_min_override=speed_min_override,
+        speed_max_override=speed_max_override,
+    )
     # capture_output buffers the child's full stdout/stderr though only the last
     # STDERR_TAIL_LINES are surfaced; that is intentional — we need the tail on
     # failure, and a child's output is small (a few lines), so streaming to keep
@@ -259,6 +329,14 @@ class RunnerArgs:
     results_dir: str
     resume: bool
     traffic: bool
+    # The user's ORIGINAL parsed speed flags, forwarded verbatim to each child.
+    speed_regime: str | None
+    speed_min_override: float | None
+    speed_max_override: float | None
+    # The resolved band (always concrete floats after resolve_speed_args) — for
+    # the manifest provenance only; the children re-resolve from the flags above.
+    resolved_speed_min: float
+    resolved_speed_max: float
 
 
 def _parse_args(argv: list[str] | None) -> RunnerArgs:
@@ -322,7 +400,13 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         "--no-traffic", dest="traffic", action="store_false", help="Disable traffic."
     )
     parser.set_defaults(traffic=True)
+    add_speed_args(parser)
     ns = parser.parse_args(argv)
+    # Resolve + validate the speed band here (parser is in scope so
+    # resolve_speed_args can call parser.error -> exit 2 on a bad/conflicting
+    # flag). The resolved (min, max) pair is recorded in the manifest; the
+    # children re-resolve from the ORIGINAL flags forwarded by build_episode_cmd.
+    resolved_speed_min, resolved_speed_max = resolve_speed_args(parser, ns)
     return RunnerArgs(
         algorithm=ns.algorithm,
         world=ns.world,
@@ -333,6 +417,11 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         results_dir=ns.results_dir,
         resume=bool(ns.resume),
         traffic=bool(ns.traffic),
+        speed_regime=ns.speed_regime,
+        speed_min_override=ns.speed_min_factor,
+        speed_max_override=ns.speed_max_factor,
+        resolved_speed_min=float(resolved_speed_min),
+        resolved_speed_max=float(resolved_speed_max),
     )
 
 
@@ -429,6 +518,9 @@ def main(argv: list[str] | None = None) -> int:
             world_abs=world_abs_str,
             results_dir=results_dir_abs,
             traffic=args.traffic,
+            speed_regime=args.speed_regime,
+            speed_min_override=args.speed_min_override,
+            speed_max_override=args.speed_max_override,
             repo_root=_REPO_ROOT,
         )
 
@@ -453,6 +545,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # Provenance receipt — deterministic across same-master-seed runs at the same
     # commit (no timestamp / elapsed; stderr tails are console-only).
+    # Effective regime NAME for provenance: None when raw overrides were used
+    # (off-menu band, no named regime), else the explicit regime or the default.
+    effective_regime = (
+        None if args.speed_min_override is not None else (args.speed_regime or DEFAULT_REGIME)
+    )
     manifest = {
         "master_seed": args.master_seed,
         "num_seeds": args.num_seeds,
@@ -461,6 +558,9 @@ def main(argv: list[str] | None = None) -> int:
         "world": world_for_manifest,
         "world_stem": world_stem,
         "traffic": args.traffic,
+        "speed_regime": effective_regime,
+        "speed_min_factor": args.resolved_speed_min,
+        "speed_max_factor": args.resolved_speed_max,
         "git_sha": _git_sha(_REPO_ROOT),
         "derived_seeds": list(seeds),
         "episodes": [
