@@ -390,7 +390,7 @@ class PathFollowingController:
                 # robot follows its t=0 plan identically to the `_once` variant —
                 # the lidar-fold jitter that starved forward motion only appeared
                 # when a swap fired every K acts (AC8/AC10).
-                if self._follower.is_finished or self._immediate_segment_blocked(state[:2]):
+                if self._follower.is_finished or self._any_segment_blocked(state[:2]):
                     self._follower = WaypointFollower(
                         list(new_path), WAYPOINT_REACHED_DISTANCE
                     )
@@ -400,9 +400,9 @@ class PathFollowingController:
     def compute_path(self, state: np.ndarray, lidar: np.ndarray) -> Path:
         """Full-search replan from the current pose against the folded grid.
 
-        Always stores the folded occupancy in `self._last_fold` (including the
-        initial plan called from `reset()`) so the subsequent commitment check in
-        `_immediate_segment_blocked` can reuse it without a second lidar fold
+         Always stores the folded occupancy in `self._last_fold` (including the
+         initial plan called from `reset()`) so the subsequent commitment check in
+         `_any_segment_blocked` can reuse it without a second lidar fold
         (AC9). The actual search is delegated to the overridable `_plan` hook.
         """
         if (
@@ -441,21 +441,31 @@ class PathFollowingController:
             cells_path, self._grid, folded, state[:2], self._goal_xy, WAYPOINT_STRIDE
         )
 
-    def _immediate_segment_blocked(self, position: np.ndarray) -> bool:
-        """Is the segment the robot is about to traverse no longer clear?
+    def _any_segment_blocked(self, position: np.ndarray) -> bool:
+        """Is any segment of the remaining path no longer clear?
 
-        The commitment horizon is exactly the robot pose -> its current target
-        waypoint: the one piece of the held path the robot drives across next.
+        Checks the segment from the current position to the current target waypoint,
+        as well as all subsequent segments in the waypoint follower's path.
         This reuses the stored `self._last_fold` and calls ONLY
-        `segment_is_clear_grid`, so it performs no additional lidar fold (AC9).
-        `current_waypoint` advances the follower's index past reached waypoints,
-        which is intended and mirrors `DStarLiteController`.
+        `segment_is_clear_grid`, so it performs no additional lidar fold.
+        `current_waypoint` advances the follower's index past reached waypoints.
         """
         assert self._follower is not None and self._grid is not None
         if self._last_fold is None:
             return False
+        waypoints = self._follower._waypoints
         target = self._follower.current_waypoint(position)
-        return not segment_is_clear_grid(self._last_fold, self._grid, position, target)
+        target_idx = self._follower._index
+        
+        # Check segment to the current target waypoint
+        if not segment_is_clear_grid(self._last_fold, self._grid, position, target):
+            return True
+            
+        # Check all remaining segments on the path
+        for i in range(target_idx, len(waypoints) - 1):
+            if not segment_is_clear_grid(self._last_fold, self._grid, waypoints[i], waypoints[i + 1]):
+                return True
+        return False
 
 
 # --- Registry machinery -----------------------------------------------------
