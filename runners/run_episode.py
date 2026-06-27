@@ -12,6 +12,8 @@ CLI:
         --seed <int>            # required
         --world <yaml_path>     # required; e.g. arena/arena_v1.yaml
         [--replan-k <int>]      # required for the _replan family, forbidden otherwise
+        [--predict-horizon <int>] # required for the predictive D* Lite family
+                                #   (d_star_lite_oracle/_predictive), forbidden otherwise
         [--render]              # optional flag; default False
         [--results-dir <dir>]   # optional; default "results"
         [--traffic|--no-traffic]# optional; Phase 2 crossing traffic, default ON
@@ -100,6 +102,7 @@ class RunnerArgs:
     seed: int
     world: str
     replan_k: int | None
+    predict_horizon: int | None
     render: bool
     results_dir: str
     traffic: bool
@@ -141,6 +144,16 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         ),
     )
     parser.add_argument(
+        "--predict-horizon",
+        type=int,
+        default=None,
+        help=(
+            "Prediction lookahead in steps for the predictive D* Lite family "
+            "(d_star_lite_oracle / d_star_lite_predictive). Required for those "
+            "algorithms, forbidden for the rest."
+        ),
+    )
+    parser.add_argument(
         "--render",
         action="store_true",
         help="Open an irsim render window (default: headless).",
@@ -177,6 +190,7 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         seed=int(ns.seed),
         world=ns.world,
         replan_k=None if ns.replan_k is None else int(ns.replan_k),
+        predict_horizon=None if ns.predict_horizon is None else int(ns.predict_horizon),
         render=bool(ns.render),
         results_dir=ns.results_dir,
         traffic=bool(ns.traffic),
@@ -263,7 +277,9 @@ def main(argv: list[str] | None = None) -> int:
     # for a _replan family, forbidden for a non-replan family, or out of range) is
     # reported as a config error (exit 2) rather than a planner failure (exit 0).
     try:
-        controller: Controller = build_controller(args.algorithm, args.replan_k)
+        controller: Controller = build_controller(
+            args.algorithm, args.replan_k, args.predict_horizon
+        )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -286,7 +302,9 @@ def main(argv: list[str] | None = None) -> int:
     # collide; the <seed>.json / <seed>.trace.jsonl filenames are unchanged.
     world_stem = Path(args.world).stem
     out_dir = episode_out_dir(
-        args.results_dir, world_stem, algorithm_label(args.algorithm, args.replan_k)
+        args.results_dir,
+        world_stem,
+        algorithm_label(args.algorithm, args.replan_k, args.predict_horizon),
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / f"{args.seed}.json"

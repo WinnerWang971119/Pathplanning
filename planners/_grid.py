@@ -471,27 +471,47 @@ REPLAN_FAMILIES = frozenset(
     {"a_star_replan", "dijkstra_replan", "rrt_replan", "rrt_star_replan"}
 )
 
+# Predictive (motion-aware) D* Lite families. They take a --predict-horizon
+# (int steps) and label their results with _h<steps>. They are NOT in
+# REPLAN_FAMILIES, so the existing "--replan-k not allowed" branch rejects
+# --replan-k for them. Both are EXPERIMENTAL: run_all's canonical-set assertion
+# tolerates them via EXPERIMENTAL_KEYS, so they never land on the canonical-11
+# scatter.
+PREDICT_FAMILIES = frozenset({"d_star_lite_oracle", "d_star_lite_predictive"})
+EXPERIMENTAL_KEYS = PREDICT_FAMILIES
+
 
 def register(name: str, cls: type) -> None:
     """Register a controller class under its algorithm key (its `name`)."""
     ALGORITHMS[name] = cls
 
 
-def algorithm_label(name: str, replan_k: int | None) -> str:
-    """Results label for an (algorithm, cadence) pair (AC6).
+def algorithm_label(
+    name: str, replan_k: int | None, predict_horizon: int | None = None
+) -> str:
+    """Results label for an (algorithm, cadence, horizon) triple (AC6/AC7).
 
     Replanning families fold the cadence into the label (`a_star_replan_k5`);
-    every other algorithm uses its bare key.
+    predictive families fold the horizon (`d_star_lite_oracle_h10`); every other
+    algorithm uses its bare key. `predict_horizon` is defaulted to None so the
+    ~40 existing two-arg callers keep working untouched.
     """
-    return f"{name}_k{replan_k}" if name in REPLAN_FAMILIES else name
+    if name in REPLAN_FAMILIES:
+        return f"{name}_k{replan_k}"
+    if name in PREDICT_FAMILIES:
+        return f"{name}_h{predict_horizon}"
+    return name
 
 
-def build_controller(name: str, replan_k: int | None) -> Controller:
-    """Validate the (algorithm, cadence) pair and construct its controller (AC6).
+def build_controller(
+    name: str, replan_k: int | None, predict_horizon: int | None = None
+) -> Controller:
+    """Validate the (algorithm, cadence, horizon) triple and construct it (AC6/AC7).
 
-    Raises ValueError on an unknown algorithm, a missing/forbidden `--replan-k`,
-    or an out-of-range cadence. The returned instance's `.name` equals `name`
-    (AC15).
+    Raises ValueError on an unknown algorithm, a missing/forbidden/out-of-range
+    `--replan-k`, or a missing/forbidden/negative `--predict-horizon`. The
+    returned instance's `.name` equals `name` (AC15). `predict_horizon` is
+    defaulted to None so the existing two-arg call sites keep working untouched.
     """
     if name not in ALGORITHMS:
         raise ValueError(f"Unknown algorithm {name!r}.")
@@ -499,10 +519,24 @@ def build_controller(name: str, replan_k: int | None) -> Controller:
     if name in REPLAN_FAMILIES and replan_k is None:
         raise ValueError(f"{name} requires --replan-k.")
 
+    # d_star_lite_oracle / d_star_lite_predictive are NOT in REPLAN_FAMILIES, so
+    # this branch already rejects --replan-k for the predict family (AC7).
     if name not in REPLAN_FAMILIES and replan_k is not None:
         raise ValueError(f"--replan-k not allowed for {name}.")
 
     if replan_k is not None and replan_k < MIN_REPLAN_K:
         raise ValueError(f"--replan-k must be >= {MIN_REPLAN_K}, received {replan_k!r}.")
 
+    # --predict-horizon: required for the predict family, forbidden elsewhere.
+    if name in PREDICT_FAMILIES and predict_horizon is None:
+        raise ValueError(f"{name} requires --predict-horizon.")
+    if name not in PREDICT_FAMILIES and predict_horizon is not None:
+        raise ValueError(f"--predict-horizon not allowed for {name}.")
+    if predict_horizon is not None and predict_horizon < 0:
+        raise ValueError(
+            f"--predict-horizon must be >= 0, received {predict_horizon!r}."
+        )
+
+    if name in PREDICT_FAMILIES:
+        return ALGORITHMS[name](replan_k=replan_k, predict_horizon=predict_horizon)
     return ALGORITHMS[name](replan_k=replan_k)

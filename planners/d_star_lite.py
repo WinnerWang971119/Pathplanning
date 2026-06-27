@@ -794,6 +794,18 @@ class DStarLiteController:
         new_cells = lidar_to_occupancy(
             self._static_cells, self._grid, state, lidar, self._geom, self._inflation
         )
+        # Overridable predictive hook: OR any extra cells (a subclass's motion
+        # prediction) into the freshly folded array BEFORE the diff, so they
+        # enter purely as changed occupancy through the existing update_cells
+        # seam. The base returns [] => `new_cells` is unchanged and the plain
+        # d_star_lite trace stays byte-identical (TC57/AC2). Because `new_cells`
+        # is re-folded from the static grid every tick (memoryless), a predicted
+        # cell stamped last tick that is neither in this tick's fresh fold nor
+        # this tick's prediction differs from the persistent self._cells and is
+        # cleared by the diff+commit below — no separate un-stamp pass is needed.
+        extra_cells = self._extra_blocked_cells(state, lidar, new_cells)
+        for row, col in extra_cells:
+            new_cells[row, col] = True
         diff_mask = self._cells != new_cells
 
         current_cell = world_to_grid(position, self._grid)
@@ -845,6 +857,21 @@ class DStarLiteController:
                 pass
 
         return compute_action_from_state(state, self._follower)
+
+    def _extra_blocked_cells(
+        self, state: np.ndarray, lidar: np.ndarray, folded_new_cells: np.ndarray
+    ) -> list[tuple[int, int]]:
+        """Override hook: extra cells to OR into the fold before the diff.
+
+        Called between the per-tick `lidar_to_occupancy` fold and the
+        `diff_mask = self._cells != new_cells` line. The base returns an empty
+        list, so plain `d_star_lite` is a true no-op here and stays
+        byte-identical to its pre-hook behaviour (TC57/AC2).
+        `PredictiveDStarLiteController` overrides this to inject its motion
+        prediction.
+        """
+        del state, lidar, folded_new_cells
+        return []
 
     def _immediate_segment_blocked(self, position: np.ndarray) -> bool:
         """Is the segment the robot is about to traverse no longer clear?
