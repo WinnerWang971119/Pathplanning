@@ -388,6 +388,18 @@ def main(argv: list[str] | None = None) -> int:
             if getattr(controller, "wants_truth", False):
                 controller.observe_truth(current_info.dynamic_obstacles)
             action = controller.act(state, lidar)
+            # Render-only prediction overlay (T16). Strictly read-only w.r.t.
+            # state/lidar/action/trace/metrics: it only paints the controller's
+            # last predicted footprint + velocity arrows on irsim's axes. Gated
+            # on args.render so the draw path is NEVER entered headless (AC11
+            # determinism guard). `getattr` keeps the 11 non-predictive
+            # controllers (no such attrs) unaffected; draw_prediction itself is
+            # also a no-op unless the Arena is in render mode.
+            if args.render:
+                arena.draw_prediction(
+                    getattr(controller, "last_predicted_cells", []),
+                    getattr(controller, "last_tracks", []),
+                )
             state, lidar, done, info = arena.step(action)
             step_count += 1
             path_length += float(np.linalg.norm(state[:2] - prev_xy))

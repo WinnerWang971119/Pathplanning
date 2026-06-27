@@ -24,6 +24,19 @@ LIDAR_BEAM_COUNT = 360
 ACTION_SHAPE = (2, 1)
 RENDER_PAUSE_SECONDS = 0.05
 
+# Render-only prediction-overlay styling (T16). Consumed solely by
+# Arena.draw_prediction, which is a hard no-op unless render=True — so none of
+# these touch the headless step/trace pipeline (determinism is unaffected).
+PREDICTION_CELL_COLOR = "tab:orange"   # translucent predicted-footprint cells
+PREDICTION_CELL_ALPHA = 0.25
+PREDICTION_ARROW_COLOR = "red"         # per-track velocity arrows
+PREDICTION_CELL_ZORDER = 5             # above irsim's static/obstacle patches
+PREDICTION_ARROW_ZORDER = 6            # arrows above the cell overlay
+# Visual multiplier (seconds-equivalent) applied to each track's (vx, vy) so a
+# slow 0.3 m/s obstacle's arrow is still legible in a 50 m arena. Debug-only;
+# not load-bearing on any metric or trace.
+VELOCITY_ARROW_SCALE = 3.0
+
 
 # Bootstrap repo root on sys.path so the `from arena.* import ...` below resolve
 # whether this file is run as `python arena/arena.py` (script-mode puts arena/ on
@@ -185,6 +198,15 @@ class Arena:
         self._done = False
         self._closed = False
         self._reset_called = False
+
+        # Render-only prediction overlay (T16). `_prediction_artists` holds the
+        # matplotlib artists drawn last tick so draw_prediction can remove them
+        # before drawing the next tick (no frame-to-frame accumulation).
+        # `_prediction_geometry` caches the (resolution, offset_x, offset_y)
+        # cell->world conversion so the YAML is parsed at most once. Both stay
+        # untouched when render=False — the draw path is never entered.
+        self._prediction_artists: list[Any] = []
+        self._prediction_geometry: tuple[float, float, float] | None = None
 
     def reset(self) -> tuple[np.ndarray, np.ndarray, EpisodeInfo]:
         if self._closed:
@@ -363,6 +385,197 @@ class Arena:
         replanners that need the live set will query the spawner separately.
         """
         return self._initial_snapshot
+
+    # ------------------------------------------------------------------ #
+    # Render-only prediction overlay (T16)                               #
+    # ------------------------------------------------------------------ #
+
+    def draw_prediction(
+        self,
+        cells: list[tuple[int, int]],
+        tracks: list[Any],
+    ) -> None:
+        """Paint the predictive controller's debug overlay on irsim's axes.
+
+        Strictly render-only and read-only w.r.t. the step/trace pipeline. When
+        ``render=False`` this returns IMMEDIATELY — the draw path is never
+        entered, so headless runs stay byte-identical (the AC11 determinism
+        guard, covered by TC58). It never raises: any failure to locate irsim's
+        matplotlib axes, derive grid geometry, or draw degrades to a no-op so a
+        render run can never crash on the overlay.
+
+        Parameters
+        ----------
+        cells:
+            ``(row, col)`` grid cells of the predicted footprint (the
+            controller's ``last_predicted_cells``). Each is converted to a
+            translucent world-frame square of side ``GRID_RESOLUTION``. May be
+            empty (pre-first-act, horizon 0, or no threats) — drawn as nothing.
+        tracks:
+            Tracked obstacles (the controller's ``last_tracks``); each is read
+            for ``.x, .y, .vx, .vy`` and drawn as a velocity arrow from its
+            position along its velocity. May be empty.
+
+        The previous tick's artists are removed FIRST so the overlay refreshes
+        in place and never accumulates frame-to-frame.
+        """
+        # AC11 hard guard: never enter the draw path when headless.
+        if not self._render:
+            return
+
+        # Always clear the previous tick's overlay first, even when this tick
+        # draws nothing, so a transient empty `cells`/`tracks` does not leave a
+        # stale overlay on screen.
+        self._clear_prediction_artists()
+
+        ax = self._discover_render_axes()
+        if ax is None:
+            return  # irsim axes API differs — degrade to a no-op (never raise).
+
+        try:
+            resolution, offset_x, offset_y = self._prediction_grid_geometry()
+        except Exception:
+            return  # cannot place cells without grid geometry — no-op.
+
+        new_artists: list[Any] = []
+        try:
+            # Lazy, defensive imports: matplotlib is already loaded by irsim in
+            # render mode, but keep these inside the method so module import (and
+            # the `python arena/arena.py` script-mode import order) is untouched.
+            from matplotlib.collections import PatchCollection
+            from matplotlib.patches import Rectangle
+
+            # Translucent predicted-footprint cells, as one PatchCollection so a
+            # single artist covers the whole stamp (cheap to add and remove).
+            patches: list[Rectangle] = []
+            for cell in cells or []:
+                row, col = cell
+                lower_left_x = offset_x + col * resolution
+                lower_left_y = offset_y + row * resolution
+                patches.append(
+                    Rectangle((lower_left_x, lower_left_y), resolution, resolution)
+                )
+            if patches:
+                collection = PatchCollection(
+                    patches,
+                    facecolor=PREDICTION_CELL_COLOR,
+                    edgecolor="none",
+                    alpha=PREDICTION_CELL_ALPHA,
+                    zorder=PREDICTION_CELL_ZORDER,
+                )
+                ax.add_collection(collection)
+                new_artists.append(collection)
+
+            # Per-track velocity arrows, as one quiver (a single artist). The
+            # (vx, vy) vector is scaled into data units so the arrow length is
+            # proportional to speed and legible in the arena.
+            origins_x: list[float] = []
+            origins_y: list[float] = []
+            vectors_x: list[float] = []
+            vectors_y: list[float] = []
+            for track in tracks or []:
+                origins_x.append(float(track.x))
+                origins_y.append(float(track.y))
+                vectors_x.append(float(track.vx) * VELOCITY_ARROW_SCALE)
+                vectors_y.append(float(track.vy) * VELOCITY_ARROW_SCALE)
+            if origins_x:
+                quiver = ax.quiver(
+                    origins_x,
+                    origins_y,
+                    vectors_x,
+                    vectors_y,
+                    angles="xy",
+                    scale_units="xy",
+                    scale=1.0,
+                    color=PREDICTION_ARROW_COLOR,
+                    width=0.004,
+                    zorder=PREDICTION_ARROW_ZORDER,
+                )
+                new_artists.append(quiver)
+        except Exception:
+            # A drawing failure must not crash a render run. Remove anything we
+            # managed to add this tick so nothing leaks, then degrade to a no-op.
+            for artist in new_artists:
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
+            self._prediction_artists = []
+            return
+
+        self._prediction_artists = new_artists
+
+    def _clear_prediction_artists(self) -> None:
+        """Remove the artists draw_prediction added last tick (best-effort)."""
+        for artist in self._prediction_artists:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        self._prediction_artists = []
+
+    def _discover_render_axes(self) -> Any | None:
+        """Best-effort discovery of irsim's matplotlib Axes; None if not found.
+
+        irsim renders through its own ``EnvPlot`` figure/axes. The known path is
+        ``self._env._env_plot.ax``; alternates are tried with ``getattr`` so a
+        future irsim version that moves the attribute degrades to a no-op overlay
+        instead of crashing the render run.
+        """
+        env = getattr(self, "_env", None)
+        if env is None:
+            return None
+        # Primary: the EnvPlot instance's axes.
+        env_plot = getattr(env, "_env_plot", None)
+        ax = getattr(env_plot, "ax", None) if env_plot is not None else None
+        if ax is not None:
+            return ax
+        # Alternate: a direct .ax on the env.
+        ax = getattr(env, "ax", None)
+        if ax is not None:
+            return ax
+        # Last resort: the current pyplot axes, only if a figure already exists
+        # (never create a fresh blank figure as a side effect of discovery).
+        try:
+            import matplotlib.pyplot as plt
+
+            if plt.get_fignums():
+                return plt.gca()
+        except Exception:
+            return None
+        return None
+
+    def _prediction_grid_geometry(self) -> tuple[float, float, float]:
+        """``(resolution, offset_x, offset_y)`` for the cell->world conversion.
+
+        Mirrors how the planner sizes its occupancy grid: ``GRID_RESOLUTION``
+        metres per cell and the world ``offset`` from the YAML (default
+        ``[0, 0]``). Cached after the first call so the YAML is parsed at most
+        once. Reuses the already-loaded ``self._world_model`` when traffic
+        provided it; otherwise lazy-loads it via ``manual_astar`` behind the
+        repo-root ``sys.path`` shim (mirrors the other manual_astar imports in
+        this module so script-mode import order is preserved).
+        """
+        if self._prediction_geometry is not None:
+            return self._prediction_geometry
+
+        world_model = self._world_model
+        if world_model is None:
+            import sys as _sys
+
+            _repo_root = str(Path(__file__).resolve().parent.parent)
+            if _repo_root not in _sys.path:
+                _sys.path.insert(0, _repo_root)
+            from manual_astar import load_world  # type: ignore[import-not-found]
+
+            world_model = load_world(str(self._yaml_path))
+
+        from manual_astar import GRID_RESOLUTION  # type: ignore[import-not-found]
+
+        offset = world_model.offset
+        geometry = (float(GRID_RESOLUTION), float(offset[0]), float(offset[1]))
+        self._prediction_geometry = geometry
+        return geometry
 
     def close(self) -> None:
         if self._closed:
