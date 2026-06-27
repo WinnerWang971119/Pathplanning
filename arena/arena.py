@@ -58,6 +58,10 @@ class EpisodeInfo:
     dynamic_obstacle_count: int
     lidar_status: str
     dynamic_obstacles_sha256: str | None
+    # Live post-_advance() snapshot for THIS tick (same tick as dynamic_obstacles_sha256,
+    # both sourced from self._last_snapshot). () when traffic is off or pre-reset. Distinct
+    # from Arena.initial_dynamic_snapshot, which is the frozen t=0 view from _initial_snapshot.
+    dynamic_obstacles: tuple[DynamicObstacleState, ...]
 
 
 class Arena:
@@ -246,6 +250,7 @@ class Arena:
             dynamic_obstacle_count=len(self._last_snapshot),
             lidar_status=lidar_status,
             dynamic_obstacles_sha256=self._last_sha256,
+            dynamic_obstacles=self._last_snapshot,
         )
         return state, lidar, info
 
@@ -316,6 +321,7 @@ class Arena:
             dynamic_obstacle_count=len(self._last_snapshot),
             lidar_status=lidar_status,
             dynamic_obstacles_sha256=self._last_sha256,
+            dynamic_obstacles=self._last_snapshot,
         )
 
         done = crashed or timed_out or reached_goal
@@ -385,6 +391,7 @@ EXPECTED_EPISODE_INFO_FIELDS = (
     "dynamic_obstacle_count",
     "lidar_status",
     "dynamic_obstacles_sha256",
+    "dynamic_obstacles",
 )
 
 
