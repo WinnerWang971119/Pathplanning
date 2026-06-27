@@ -96,11 +96,17 @@ predicted-conflict-gate decisions recorded below.
   `OracleTracker`/`LidarTracker` both return a deterministic, id/cell-sorted
   `list[Track]`; `predict_blocked_cells(...)` is pure (plain floats in, sorted
   cells out, no irsim) so it is unit-tested in-process (Fable #5).
-- **Fail-open peel is threat-ordered and bounded.** Stamp all gated cells; if the
-  deferred settle finds no path to goal, drop predicted groups *farthest-future
-  first* (least-imminent) until a path re-exists, so the most imminent protection
-  is kept and the robot is never trapped. Triggers rarely (gate + exclusion zone
-  already bound stamping), so the extra settles are cheap.
+- **Fail-open peel is threat-ordered and bounded; a per-tick area budget caps the
+  stamp.** Stamp gated cells; if the deferred settle finds no path to goal, drop
+  predicted groups *farthest-future first* (least-imminent) until a path re-exists,
+  so the most imminent protection is kept and the robot is never trapped. The
+  predicted-conflict gate + robot exclusion zone bound how much gets stamped, and a
+  per-tick **stamped-cell area cap** (allocate to soonest-TTC tracks first, skip the
+  rest — Thinker #13) hard-bounds both the peel frequency and the per-tick cost.
+  Caveat (Fable): the "peel fires rarely" expectation is NOT proven a priori — under
+  the matched/fast speed regimes the union of ~20 capsules at T=2.0 s could
+  disconnect the arena and make the peel fire often; **T10 measures the actual peel
+  frequency**, and if it is high the area cap / a shorter best-horizon is the lever.
 - **Oracle is the go/no-go gate with a human checkpoint.** The estimator tasks are
   blocked on an explicit "report oracle sweep to the user" milestone; the user
   greenlights (or kills) the estimator after seeing the ceiling. User chose to
@@ -124,10 +130,14 @@ predicted-conflict-gate decisions recorded below.
 ## Acceptance Criteria
 
 - [ ] **AC1 (go/no-go — the user's bar):** On `arena/arena_v1.yaml` over the
-  canonical 50 seeds, `d_star_lite_oracle` at its best swept horizon achieves a
-  **strictly lower crash+timeout failure rate** than plain `d_star_lite`. If this
-  is NOT met, the result is reported to the user as a refutation (with the sweep
-  data) and the estimator tasks (T11–T14) do not proceed without a user decision.
+  canonical 50 seeds, `d_star_lite_oracle` at its best swept **non-zero** horizon
+  (the min over `{h5, h10, h20}` — `h0` is EXCLUDED because it is plain
+  `d_star_lite` by construction, AC2, so including it makes the comparison
+  vacuously true) achieves a crash+timeout failure rate **at least `MARGIN` lower**
+  than plain `d_star_lite`, where `MARGIN` ≥ 2 seeds (≥ 0.04 over 50) so a
+  one-seed flutter is not counted as a win. If NO non-zero horizon clears that
+  margin, the result is a **refutation**: reported to the user with the sweep data,
+  and the estimator tasks (T11–T14) do not proceed without a user decision.
 - [ ] **AC2:** `d_star_lite_oracle_h0` produces a **byte-identical** `trace.jsonl`
   to plain `d_star_lite` on the same seed (`--no-traffic` and traffic-on), proving
   zero-horizon stamping is a true no-op baseline.
@@ -203,19 +213,30 @@ Single source of truth for every cross-task seam.
   per-track `(threat_key, cells)` groups in **threat order** (ascending
   time-to-conflict, then `id`), each `cells` sorted row-major, with the robot
   exclusion zone already removed and only gate-passing tracks present. Consumers:
-  T5 (controller unions + bounded peel).
+  T5 (controller unions + bounded peel). **Stamp radius:** the disk at each future
+  center `(x + vx·k·dt, y + vy·k·dt)` (k = 1..horizon_steps) has radius
+  `track.radius + inflation`, where `inflation = robot_radius + SAFETY_MARGIN` —
+  i.e. the SAME body-aware band the static grid uses, so a stamped cell is
+  collision-equivalent (the lidar is center-to-surface). The function OWNS the
+  world→grid conversion of each future center via `world_to_grid` (imported from
+  `manual_astar`, like the rest of `_predict.py`).
 - `Controller.wants_truth: bool = False` and
   `Controller.observe_truth(self, snapshot: tuple) -> None` (default no-op) —
   owner: T2 (`planners/_types.py`); the oracle overrides both. Consumer: T2
   (runner call site), T5 (oracle controller).
-- `build_controller(name, replan_k, predict_horizon)` extended signature —
-  owner: T5 (`planners/_grid.py`); consumer: T2/T5 runner, T7 experiment.
-- `algorithm_label(name, replan_k, predict_horizon)` → folds `_h<steps>` for the
-  `PREDICT_FAMILIES` — owner: T5; consumers: runner, run_all, run_experiment,
-  plotters.
+- `build_controller(name, replan_k, predict_horizon=None)` and
+  `algorithm_label(name, replan_k, predict_horizon=None)` — the new third
+  parameter MUST be defaulted to `None` so the ~40 existing two-arg call sites
+  (in `arena/arena.py` TCs, `runners/plot.py`, `run_all.py`, `run_experiment.py`,
+  `run_speed_sweep.py`, `plot_speed_sweep.py`) keep working untouched; `algorithm_label`
+  folds `_h<steps>` only for the `PREDICT_FAMILIES`. Owner: T5 (`planners/_grid.py`);
+  consumers: runner, run_all, run_experiment, plotters. **Do not edit the existing
+  call sites** (a non-defaulted positional would break the 55-case suite at import —
+  AC8/AC10).
 - `PredictiveDStarLiteController.last_predicted_cells: list[tuple[int,int]]` and
-  `.last_tracks: list[Track]` (read-only debug attrs, set each `act()`) — owner:
-  T5; consumer: T16 (render overlay). `Arena.draw_prediction(cells, tracks) -> None`
+  `.last_tracks: list[Track]` (read-only debug attrs, **initialized to `[]` in
+  `__init__`, never `None`**, refreshed each `act()`) — owner: T5; consumer: T16
+  (render overlay, which must tolerate the empty pre-first-act case). `Arena.draw_prediction(cells, tracks) -> None`
   (no-op unless `render=True`) — owner: T16 (`arena/arena.py`); consumer: T16
   (runner render path).
 
@@ -234,7 +255,8 @@ Single source of truth for every cross-task seam.
 
 | File | Owner task | Consumer tasks |
 |------|-----------|----------------|
-| `arena/arena.py` (EpisodeInfo + populate) | T1 | T9, T13 (TC additions, chained) |
+| `arena/arena.py` (EpisodeInfo + populate) | T1 | T9 → T16 → T13 (TC + render, chained: T1→T9→T16→T13) |
+| `planners/d_star_lite.py` (extract stamp hook, byte-identical) | T5 | T12 (subclass) |
 | `planners/_types.py` | T2 | T5 |
 | `runners/run_episode.py` | T2 (seam) → T5 (`--predict-horizon`) | T7 |
 | `planners/_predict.py` | T3 → T4 → T11 (chained) | T5, T12 |
@@ -273,14 +295,15 @@ determinism (byte-identical traces).
 | TC54 | `predict_blocked_cells` cone widening + exclusion zone | Unit | Radius grows with step; no cell within R of robot; gate drops a non-intersecting track |
 | TC55 | Predicted-conflict gate catches a divergent-now-collide-later crosser | Unit | A shallow-angle fast track whose capsule crosses the planned-path corridor within T is stamped; a receding track is not |
 | TC56 | Threat-ordered bounded peel | Unit | A map-sealing stamp is peeled farthest-future-first until a path exists; most-imminent group retained |
+| TC56b | Peel-to-zero still unsolvable (negative path) | Unit | When even zero prediction leaves no path (a real dead-end), the controller keeps its last valid follower and `act()` does NOT raise (AC5/AC6) |
 | TC57 | `d_star_lite_oracle_h0` ≡ plain `d_star_lite` trace | Integration | Byte-identical `trace.jsonl` (`--no-traffic` and traffic-on), same seed |
 | TC58 | `d_star_lite_oracle` traffic-on e2e + determinism | Integration | Runs to terminal state, 8-key trace per line, two same-seed runs byte-identical |
 | TC59 | `--predict-horizon` validation | Integration | Required for predict family, rejected for others (exit 2); `--replan-k` rejected for predict family (exit 2); label dir `_h<steps>` |
-| TC60 | `EpisodeInfo.dynamic_obstacles` + `observe_truth` seam | Unit | `()` when traffic off/pre-reset; oracle receives the live snapshot; non-oracle controllers untouched |
+| TC60 | `EpisodeInfo.dynamic_obstacles` + `observe_truth` seam + tick alignment | Unit | `()` when traffic off/pre-reset; the snapshot the oracle observes is the SAME tick as the `state` its `act()` receives (assert the observed snapshot equals the `info.dynamic_obstacles` from the same `step()` that produced `state`); non-oracle controllers never have `observe_truth` called |
 | TC61 | `run_all` canonical assertion tolerates experimental keys | Unit | `set(_CANONICAL_ORDER) == set(ALGORITHMS) - EXPERIMENTAL_KEYS`; import of `planners` + `run_all` exits 0 |
 | TC62 | `plot_horizon_sweep --selfcheck` | Unit | Synthetic-fixture cases pass with no irsim; PNGs + CSV render |
 | TC63 (T13) | `d_star_lite_predictive` (lidar) traffic-on e2e + determinism | Integration | Runs to terminal state, 8-key trace, two same-seed runs byte-identical |
-| TC64 (T13) | `LidarTracker` determinism on a synthetic 2-frame fixture | Unit | Velocity estimate byte-identical across runs; stable cluster/association ordering |
+| TC64 (T13) | `LidarTracker` determinism across a MULTI-frame fixture with a cluster-count change | Unit | Over ≥4 synthetic frames where the number of clusters changes between frames (an obstacle enters/leaves, mirroring TC52's refill), the velocity estimates and the cluster/association ordering are byte-identical across two runs — exercises the association-stability hazard, not just a single 2-frame diff |
 
 **Test data:** synthetic `Track` lists and 2-frame lidar fixtures built in-process
 (no irsim), mirroring TC46/TC47. E2e TCs use `arena/arena_v1.yaml` and the seeded
@@ -297,17 +320,17 @@ overlay path is never entered when `render=False`, so it cannot perturb the trac
 
 | ID | Task | Blocked By | Risk | Files | Description |
 |----|------|------------|------|-------|-------------|
-| T1 | Arena live-snapshot field | — | med | `arena/arena.py` | Add `dynamic_obstacles: tuple[DynamicObstacleState,...]` to `EpisodeInfo` + `_INFO_FIELDS`; populate from the post-`_advance()` `_last_snapshot` in `reset()` and `step()` (same tick as `dynamic_obstacles_sha256`); `()` when traffic off/pre-reset. Additive only — existing fields/order preserved. Satisfies AC10 (snapshot), feeds the truth seam. |
-| T2 | Truth seam (protocol + runner) | T1 | med | `planners/_types.py`, `runners/run_episode.py` | Add `wants_truth: bool = False` + `observe_truth(self, snapshot) -> None` (no-op) to the `Controller` protocol; in the runner loop call `controller.observe_truth(info.dynamic_obstacles)` (and `info0.dynamic_obstacles` at t=0) BEFORE `act()` only when `controller.wants_truth`. Leave `act(state,lidar)` for all others. Satisfies AC contracts. |
+| T1 | Arena live-snapshot field | — | med | `arena/arena.py` | Append `dynamic_obstacles: tuple[DynamicObstacleState,...]` to `EpisodeInfo` as the LAST field (after `dynamic_obstacles_sha256`, so existing positional order is preserved) and add it to the **`EXPECTED_EPISODE_INFO_FIELDS`** constant (the real symbol name — NOT `_INFO_FIELDS`) that TC2 asserts against, updating TC2's expected list. Populate from the post-`_advance()` `_last_snapshot` in `reset()` and `step()` (same tick as `dynamic_obstacles_sha256`); `()` when traffic off/pre-reset. Keep it OUT of `_trace_line` (a tuple in the trace would break byte-identity). Satisfies AC10, feeds the truth seam. |
+| T2 | Truth seam (protocol + runner) | T1 | med | `planners/_types.py`, `runners/run_episode.py` | Add `wants_truth: bool = False` + `observe_truth(self, snapshot) -> None` (no-op) to the `Controller` protocol; in the runner loop call `controller.observe_truth(snapshot)` BEFORE `act(state, lidar)` only when `controller.wants_truth`, where `snapshot`, `state`, and `lidar` ALL come from the SAME source — `reset()` at t=0 (`state0`, `lidar0`, `info0.dynamic_obstacles`) and the SAME `arena.step(...)` return tuple thereafter (`state`, `lidar`, `info.dynamic_obstacles`). Do NOT reuse an `info` carried from a prior `step()` and do NOT advance the snapshot by a dt — each EpisodeInfo's snapshot is already at the same sim tick as the state returned by that same call (judge-confirmed alignment). Leave `act(state,lidar)` for all others. |
 | T3 | `Track` + `Tracker` + `OracleTracker` | — | low | `planners/_predict.py` (new) | Frozen `Track`; `Tracker` Protocol; `OracleTracker.update(snapshot,...)` → id-sorted `list[Track]` from `DynamicObstacleState` (convert, decouple from arena). `PREDICT_DT=0.1`. Pure, no irsim. |
 | T4 | Pure `predict_blocked_cells` (capsule+cone+gate+peel-order) | T3 | high | `planners/_predict.py` | Implement the geometry (capsule = const-radius disk train; cone = growing radius), the predicted-conflict gate (capsule-vs-planned-path-corridor intersection over [0,T]), the robot exclusion zone, and threat-ordered grouping. Cell-marking mirrors `_mark_disk` deterministically and returns sorted cells. Pure. Satisfies AC4/AC5. |
-| T5 | `PredictiveDStarLiteController` + oracle key + CLI/registry plumbing | T2, T4 | high | `planners/d_star_lite_predictive.py` (new), `planners/_grid.py`, `planners/__init__.py`, `runners/run_episode.py` | Subclass `DStarLiteController`; override `act` to fold lidar, union `predict_blocked_cells` groups into the fold BEFORE the diff with the bounded fail-open peel, then the existing diff/`update_cells`/deferred-settle path. `wants_truth=True`, store snapshot in `observe_truth`. Add `PREDICT_FAMILIES`/`EXPERIMENTAL_KEYS`, extend `build_controller`/`algorithm_label` with `predict_horizon` + `_h<steps>` label, add `--predict-horizon` to the runner (required for predict family, reject `--replan-k`). Register `d_star_lite_oracle` (capsule). Satisfies AC2/AC3/AC6/AC7. |
+| T5 | `PredictiveDStarLiteController` + oracle key + CLI/registry plumbing | T2, T4 | high | `planners/d_star_lite.py`, `planners/d_star_lite_predictive.py` (new), `planners/_grid.py`, `planners/__init__.py`, `runners/run_episode.py` | **First refactor `DStarLiteController.act()` to expose an overridable hook** (e.g. `_extra_blocked_cells(state, lidar, folded_new_cells) -> list[(row,col)]`, default returns `[]`) called between the `lidar_to_occupancy` fold and the `diff_mask = self._cells != new_cells` line, OR-ing the returned cells into `new_cells` before the diff. Base returning `[]` keeps `d_star_lite` BYTE-IDENTICAL to today (guard with TC57). Then `PredictiveDStarLiteController` subclasses it and overrides ONLY that hook to call `predict_blocked_cells` (with the bounded fail-open peel); it does NOT reimplement `act()`. `wants_truth=True`, store snapshot in `observe_truth`, set `last_predicted_cells`/`last_tracks`. Add `PREDICT_FAMILIES`/`EXPERIMENTAL_KEYS`, extend `build_controller`/`algorithm_label` with a DEFAULTED `predict_horizon: int | None = None` (existing 2-arg callers untouched) + `_h<steps>` label, add `--predict-horizon` to the runner (required for predict family, reject `--replan-k`). Register `d_star_lite_oracle` (capsule). Satisfies AC2/AC3/AC6/AC7. |
 | T6 | Relax `run_all` canonical assertion | T5 | low | `runners/run_all.py` | Change the import-time assertion to `set(_CANONICAL_ORDER) == set(ALGORITHMS) - EXPERIMENTAL_KEYS`; do NOT add the experimental keys to `_CANONICAL_ORDER`/`canonical_planner_set()`. Satisfies AC8. |
 | T7 | `run_experiment` horizon forwarding + manifest | T5 | med | `runners/run_experiment.py` | Add `--predict-horizon`, forward to each child episode, record `predict_horizon` in `_manifest.json`; reuse the `--replan-k` forwarding pattern. |
 | T8 | Horizon sweep driver + plotter | T7 | med | `runners/run_horizon_sweep.py` (new), `runners/plot_horizon_sweep.py` (new) | Driver shells `run_experiment` per horizon step in `{0,5,10,20}` for `d_star_lite_oracle`, writing label dirs `d_star_lite_oracle_h<steps>/`. Read-only headless plotter reads those dirs via `plot.load_world_results`, renders `failure_rate_vs_horizon.png` + `median_time_vs_horizon.png` + `horizon_sweep_summary.csv` (x = T seconds = steps×0.1), with `--selfcheck`. Satisfies AC9. |
-| T9 | `--check` TCs (predictor + oracle + seam) | T5, T8 | med | `arena/arena.py` | Add TC53–TC62 per the Testing Strategy. Satisfies AC2/AC4/AC5/AC7/AC8/AC10. |
+| T9 | `--check` TCs (predictor + oracle + seam) | T1, T5, T8 | med | `arena/arena.py` | Add TC53–TC62 per the Testing Strategy. Blocked by T1 too (both edit `arena/arena.py`; the file order is T1 → T9 → T16 → T13). Satisfies AC2/AC4/AC5/AC7/AC8/AC10. |
 | T10 | **ORACLE CHECKPOINT — run sweep + report to user** | T8, T9 | low | (run + `docs/plans/2026-06-27-predictive-d-star-lite.findings.md`) | Run the oracle horizon sweep on `arena_v1` (50 seeds), generate plots + findings doc, summarize to the user: oracle crash rate vs baseline, margin, best horizon. **Human go/no-go gate** — T11–T14 require user greenlight. Evaluates AC1. |
-| T11 | `LidarTracker` (frame-differencing estimator) | T10 | high | `planners/_predict.py` | Per-tick: lidar→world points (reuse the `_lidar_to_world_points` projection), subtract static returns via the static grid (same `np.linspace` bearings — gotcha), deterministic grid-bucket clustering, sorted greedy nearest-neighbor association vs the stored prior frame, `v=(centroid_now-centroid_prev)/PREDICT_DT`. No clamp (v1). Stable ordering, no RNG/set-iteration. Satisfies AC determinism. |
+| T11 | `LidarTracker` (frame-differencing estimator) | T10 | high | `planners/_predict.py` | Per-tick: lidar→world points implemented LOCALLY in `_predict.py` (mirror DWA's `_lidar_to_world_points` exactly — same `np.linspace` bearings — but do NOT import DWA's private method; duplicating ~10 deterministic lines avoids a `dwa.py` refactor that is out of scope), subtract static returns via the static grid, deterministic grid-bucket clustering, sorted greedy nearest-neighbor association vs the stored prior frame, `v=(centroid_now-centroid_prev)/PREDICT_DT`. No clamp (v1). Stable ordering, no RNG/set-iteration. Satisfies AC determinism. |
 | T12 | `d_star_lite_predictive` (lidar) controller + key | T11 | high | `planners/d_star_lite_predictive.py`, `planners/__init__.py` | Wire `LidarTracker` + `geometry="cone"` (widening, half-angle from association noise) into the predictive base; `wants_truth=False` (lidar-only). Register `d_star_lite_predictive`. |
 | T13 | Estimator `--check` TCs + sweep inclusion | T12, T16 | med | `arena/arena.py`, `runners/run_horizon_sweep.py` | Add TC63–TC64; let the sweep driver also run `d_star_lite_predictive`. Blocked by T16 too because both edit `arena/arena.py` (serialize the shared file). |
 | T14 | Lidar sweep + findings update + report | T13 | low | (run + findings doc) | Run the lidar horizon sweep, update the findings doc + plots, report to the user. |
@@ -333,6 +356,17 @@ overlay path is never entered when `render=False`, so it cannot perturb the trac
 - **Lidar is center-to-surface** (`gotcha-lidar-center-relative`): the exclusion
   zone, gate corridor, and any clearance must add the robot radius where a body
   collision is implied.
+- **The capsule is a lossy 2D projection of the true space-time reservation**
+  (Fable): it blocks every cell the obstacle occupies over [0, T] even though the
+  robot passes each cell at one specific time, so it over-blocks somewhat. This is
+  accepted for the ceiling study (a true (x,y,t) reservation was scoped out); if
+  the over-block causes timeouts that muddy AC1, the horizon sweep surfaces it as a
+  shorter best-horizon, and T10's report must call it out.
+- **The estimator risk does not vanish by choosing stamping** (Fable): velocity
+  estimation (T11) is the same hard, determinism-fragile problem the rejected VO
+  approach would need. Stamping wins on *layering* (search core untouched), not by
+  dodging the perception problem — which is exactly why the oracle gate (T10)
+  precedes the estimator.
 - **The crash-floor risk is real** (the consult's lead concern): ~1/3 of obstacles
   outrun the robot, so AC1 may be physically capped. T10 exists precisely to learn
   this cheaply (perfect velocities) before the expensive estimator. If the oracle
