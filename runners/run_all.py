@@ -59,7 +59,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from planners import ALGORITHMS, algorithm_label  # noqa: E402
-from planners._grid import REPLAN_FAMILIES  # noqa: E402
+from planners._grid import EXPERIMENTAL_KEYS, REPLAN_FAMILIES  # noqa: E402
 
 
 DEFAULT_MASTER_SEED = 20260605          # canonical experiment stream (matches run_experiment)
@@ -92,10 +92,11 @@ _CANONICAL_ORDER: tuple[str, ...] = (
 # Fail loud at import if the hand-listed order ever falls out of sync with the
 # registry (a new key added, a key renamed/removed). The driver's whole contract is
 # "ALL canonical planners", so a silent mismatch would quietly drop or duplicate a
-# planner from the study.
-if set(_CANONICAL_ORDER) != set(ALGORITHMS):
-    _missing = set(ALGORITHMS) - set(_CANONICAL_ORDER)
-    _extra = set(_CANONICAL_ORDER) - set(ALGORITHMS)
+# planner from the study. Experimental keys (EXPERIMENTAL_KEYS) are intentionally
+# excluded from the canonical set and are not expected to appear in _CANONICAL_ORDER.
+if set(_CANONICAL_ORDER) != set(ALGORITHMS) - EXPERIMENTAL_KEYS:
+    _missing = (set(ALGORITHMS) - EXPERIMENTAL_KEYS) - set(_CANONICAL_ORDER)
+    _extra = set(_CANONICAL_ORDER) - (set(ALGORITHMS) - EXPERIMENTAL_KEYS)
     raise RuntimeError(
         "run_all._CANONICAL_ORDER is out of sync with planners.ALGORITHMS "
         f"(missing from order: {sorted(_missing)}, unknown in order: {sorted(_extra)})."
