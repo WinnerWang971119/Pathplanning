@@ -115,6 +115,7 @@ from planners._grid import (
     register,
     segment_is_clear_grid,
 )
+from planners._types import Path
 
 # The eight 8-connected neighbour deltas, in the SAME order as
 # manual_astar.astar_search. Order is load-bearing for deterministic expansion
@@ -836,27 +837,42 @@ class DStarLiteController:
         # one place the repaired tree is actually consumed. A failure (settle or
         # extraction) keeps the last valid follower; never rebuild it (AC8).
         if self._follower.is_finished or self._immediate_segment_blocked(position):
-            try:
-                self._search.compute_shortest_path()
-                cells_path = self._search.extract_path()
-                waypoints = grid_path_to_waypoints(
-                    cells_path,
-                    self._grid,
-                    self._cells,
-                    position,
-                    self._goal_xy,
-                    WAYPOINT_STRIDE,
+            waypoints = self._settle_and_extract(position)
+            if waypoints:
+                self._follower = WaypointFollower(
+                    list(waypoints), WAYPOINT_REACHED_DISTANCE
                 )
-                if waypoints:
-                    self._follower = WaypointFollower(
-                        list(waypoints), WAYPOINT_REACHED_DISTANCE
-                    )
-            except (ValueError, RuntimeError):
-                # A failed incremental pass leaves the previous g/rhs and follower
-                # in place, so the held path stays drivable.
-                pass
 
         return compute_action_from_state(state, self._follower)
+
+    def _settle_and_extract(self, position: np.ndarray) -> Path | None:
+        """Settle the tree and extract the followed waypoint path for this tick.
+
+        Runs the deferred `compute_shortest_path()` + `extract_path()` and
+        collapses the cell path to waypoints. Returns the waypoint path on
+        success, or None on a settle/extraction failure — a failed incremental
+        pass leaves the previous g/rhs and follower in place, so the caller keeps
+        its last valid follower and `act()` never raises (AC8).
+
+        Extracted into an overridable method so the motion-aware predictive
+        subclass can peel its predicted stamp and re-settle here WITHOUT
+        reimplementing `act()`. The base behaviour is byte-identical to the
+        inlined block it replaced, so plain `d_star_lite` is unchanged
+        (TC35/TC46).
+        """
+        try:
+            self._search.compute_shortest_path()
+            cells_path = self._search.extract_path()
+            return grid_path_to_waypoints(
+                cells_path,
+                self._grid,
+                self._cells,
+                position,
+                self._goal_xy,
+                WAYPOINT_STRIDE,
+            )
+        except (ValueError, RuntimeError):
+            return None
 
     def _extra_blocked_cells(
         self, state: np.ndarray, lidar: np.ndarray, folded_new_cells: np.ndarray

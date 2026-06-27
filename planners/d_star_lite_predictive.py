@@ -1,14 +1,15 @@
 """Motion-aware (predictive) D* Lite controllers.
 
-These controllers subclass :class:`DStarLiteController` and override ONLY the
-:meth:`DStarLiteController._extra_blocked_cells` hook (plus ``__init__`` and
+These controllers subclass :class:`DStarLiteController` and override the
+:meth:`DStarLiteController._extra_blocked_cells` fold hook AND the
+:meth:`DStarLiteController._settle_and_extract` settle hook (plus ``__init__`` and
 ``observe_truth``). They do NOT reimplement ``act()`` / ``reset()`` / the search,
 so D* Lite's incremental invariants, grid-ownership contract, commitment horizon
 and deferred settle are inherited unchanged. The prediction enters purely as
 extra changed-occupancy cells through the existing fold -> diff -> ``update_cells``
 seam.
 
-Per tick the hook:
+Per-tick (cheap) — ``_extra_blocked_cells``:
 
 1. asks its :class:`~planners._predict.Tracker` for the current obstacle tracks
    (the oracle reads the live truth snapshot; the lidar variant frame-differences);
@@ -16,41 +17,76 @@ Per tick the hook:
    :func:`~planners._predict.predict_blocked_cells` (threat-ordered groups,
    robot-exclusion zone already removed, gated to the planned-path corridor);
 3. applies a per-tick stamped-cell area cap (soonest-TTC tracks first);
-4. runs a threat-ordered, fail-open reachability peel so a stamp can never leave
-   the grid unsolvable (drop farthest-future groups until a path re-exists);
-5. returns the surviving cells, which the base ORs into the fold before the diff.
+4. STORES the threat-ordered groups and the un-stamped fold for the settle, and
+   returns the FULL stamp (the union of all groups' cells). The base ORs that
+   union into the fold before the diff, so the whole predicted footprint enters
+   ``self._cells`` this tick.
 
-Determinism: every step above is deterministic — the tracker returns id-sorted
-tracks, ``predict_blocked_cells`` returns sorted/deduped cells in threat order,
-the area cap and peel are pure list operations, and the survivors are returned as
-a sorted, deduped ``list[(row, col)]``. No RNG, no set-iteration leaks into the
-output order.
+This per-tick hook does NO reachability search — the expensive part is deferred.
 
-The horizon-0 fast path is a true no-op (no tracker side effect, no stamp), so
-``d_star_lite_oracle_h0`` produces a byte-identical trace to plain
-``d_star_lite`` (AC2/TC57).
+At settle-time (rare — only when the follower finishes or its committed segment is
+blocked) — ``_settle_and_extract``:
+
+1. first settles + extracts with the FULL stamp already committed. This REUSES
+   the D* Lite search's own ``g``-values: ``compute_shortest_path`` +
+   ``extract_path`` returns a path exactly when ``g(start)`` is finite, and raises
+   (-> None) exactly when the stamp sealed the grid. No separate from-scratch A*
+   reachability probe is run — the incremental search already knows reachability.
+2. if the full stamp sealed the grid, peels predicted groups farthest-future
+   first (drop the least-imminent group, un-stamp its cells from ``self._cells``
+   via ``update_cells``, re-settle incrementally) until a path re-exists, so the
+   most-imminent protection is retained (AC5).
+3. if even zero predicted stamp leaves the grid unsolvable (a real static
+   dead-end), returns None so the base keeps its last valid follower — ``act()``
+   never raises (AC6).
+
+Why this is correct and fast. The reachability question the old per-tick A* probe
+answered ("can the robot still reach the goal with this stamp?") is exactly what
+``g(start) < inf`` answers after a settle — and the settle is incremental
+(``move_start`` + batched ``update_cells`` accumulate the edge changes; one
+``compute_shortest_path`` folds them into the same optimum a from-scratch A* would
+find, the TC46 property). Reusing the search drops the per-tick cost back to
+near-baseline: on a clear run no settle fires, so no search runs at all, and a
+settle that does fire is incremental (cheap) plus, only when the stamp seals the
+map, a bounded re-settle per peeled group.
+
+Determinism: every step is deterministic — the tracker returns id-sorted tracks,
+``predict_blocked_cells`` returns sorted/deduped cells in threat order, the area
+cap and peel are pure list operations over the threat-ordered groups, the peel
+drops groups from a fixed (soonest-first) order, and ``update_cells`` is reported
+with sorted cell lists. No RNG, no set-iteration leaks into the output or the
+update order.
+
+Grid ownership: the peel mutates ``self._cells`` IN PLACE at the un-stamped
+positions and reports them via ``self._search.update_cells`` — it NEVER rebinds
+``self._cells`` (rebinding would detach the search's occupancy mirror, the same
+load-bearing invariant the base relies on).
+
+The horizon-0 fast path is a true no-op (no tracker side effect, no stamp, no
+pending groups), so ``d_star_lite_oracle_h0`` produces a byte-identical trace to
+plain ``d_star_lite`` (AC2/TC57).
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from manual_astar import OccupancyGrid, astar_search, world_to_grid
 from planners._predict import (
     OracleTracker,
     PREDICT_DT,
     Tracker,
     predict_blocked_cells,
 )
+from planners._types import Path
 from planners.d_star_lite import DStarLiteController
 
 # Per-tick stamped-cell area cap. The predictive hook stamps at most this many
 # cells per tick, allocating the budget to the soonest-time-to-conflict tracks
 # first (the area cap loop below stops at the first group that would overflow).
-# This hard-bounds both the per-tick stamping cost and the fail-open peel's
-# reachability-search frequency. ~6000 cells is a small fraction of a 50x50 grid
-# at GRID_RESOLUTION 0.1 m (250000 cells total); it is a safety cap, tuned by the
-# T10 horizon sweep, not a tight functional limit.
+# This hard-bounds both the per-tick stamping cost and the number of groups the
+# fail-open settle-peel may have to drop. ~6000 cells is a small fraction of a
+# 50x50 grid at GRID_RESOLUTION 0.1 m (250000 cells total); it is a safety cap,
+# tuned by the T10 horizon sweep, not a tight functional limit.
 MAX_STAMP_CELLS: int = 6000
 
 
@@ -59,8 +95,9 @@ class PredictiveDStarLiteController(DStarLiteController):
 
     Subclasses set :attr:`geometry` (``"capsule"`` / ``"cone"``) and
     :attr:`wants_truth`, and implement :meth:`_make_tracker`. They MUST NOT
-    override ``act()`` / ``reset()`` — the only behavioural override is
-    :meth:`_extra_blocked_cells`.
+    override ``act()`` / ``reset()`` — the only behavioural overrides are
+    :meth:`_extra_blocked_cells` (the per-tick fold stamp) and
+    :meth:`_settle_and_extract` (the settle-time fail-open peel).
     """
 
     # Prediction geometry; subclasses set "capsule" (oracle) or "cone" (lidar).
@@ -93,6 +130,15 @@ class PredictiveDStarLiteController(DStarLiteController):
         self._tracker: Tracker = self._make_tracker()
         self._snapshot: tuple = ()
 
+        # Settle-peel state, refreshed every act() by _extra_blocked_cells and
+        # consumed by _settle_and_extract. `_pending_groups` is the threat-ordered
+        # (soonest-TTC-first) list of (ThreatKey, cells) stamped this tick;
+        # `_last_fold` is the un-stamped fold (False where the stamp added a cell),
+        # needed to restore a peeled cell to its true fold value. Initialised so a
+        # defensive early settle is a no-op (empty groups -> no peel).
+        self._pending_groups: list[tuple[object, list[tuple[int, int]]]] = []
+        self._last_fold: np.ndarray | None = None
+
         # Read-only debug attributes for the render overlay (T16). Initialised to
         # [] (never None) so the overlay tolerates the pre-first-act case;
         # refreshed every act() via _extra_blocked_cells.
@@ -109,27 +155,34 @@ class PredictiveDStarLiteController(DStarLiteController):
         self._snapshot = snapshot
 
     # ------------------------------------------------------------------ #
-    # The predictive stamp hook                                          #
+    # The predictive stamp hook (per tick, cheap — no reachability probe) #
     # ------------------------------------------------------------------ #
 
     def _extra_blocked_cells(
         self, state: np.ndarray, lidar: np.ndarray, folded_new_cells: np.ndarray
     ) -> list[tuple[int, int]]:
-        """Return the predicted extra-blocked cells for this tick.
+        """Return the full predicted stamp for this tick (no peel here).
 
-        AC6 is structural here: the prediction body (tracker update -> predict ->
-        area cap -> peel) is wrapped in a ``try/except Exception`` so a failed
-        prediction tick degrades to ``[]`` (the controller behaves like plain
-        D* Lite for that tick) instead of propagating out of ``act()`` and
-        crashing the episode. The horizon-0 fast path stays outside the guard
-        because it is already a pure no-op.
+        Cheap by design: tracker update -> predict -> area cap, then STORE the
+        threat-ordered groups + the un-stamped fold for the settle-time peel and
+        RETURN the union of all groups' cells (the full stamp). The reachability
+        peel that used to run a from-scratch A* every stamp-bearing tick now lives
+        in :meth:`_settle_and_extract`, which reuses the D* Lite search's own
+        g-values and only fires when a fresh path is actually needed.
+
+        AC6 is structural here: the prediction body is wrapped in a
+        ``try/except Exception`` so a failed prediction tick degrades to ``[]``
+        (the controller behaves like plain D* Lite for that tick) instead of
+        propagating out of ``act()``. The horizon-0 fast path stays outside the
+        guard because it is already a pure no-op.
         """
         # h0 fast path: a true no-op. No tracker update (no side effect on the
-        # trajectory) and no stamp, so h0 is byte-identical to plain d_star_lite
-        # (AC2/TC57). Kept outside the guard below: it is already a pure no-op.
+        # trajectory), no stamp, no pending groups, so h0 is byte-identical to
+        # plain d_star_lite (AC2/TC57). Kept outside the guard: it cannot fail.
         if self._horizon_steps == 0:
             self.last_tracks = []
             self.last_predicted_cells = []
+            self._pending_groups = []
             return []
 
         # AC6: any failure in the prediction body degrades to no extra cells for
@@ -142,6 +195,13 @@ class PredictiveDStarLiteController(DStarLiteController):
                 snapshot=self._snapshot, state=state, lidar=lidar, dt=PREDICT_DT
             )
             self.last_tracks = tracks
+
+            # No tracks -> nothing to predict or stamp. Clear the pending groups
+            # so a settle this tick does no peel work.
+            if not tracks:
+                self.last_predicted_cells = []
+                self._pending_groups = []
+                return []
 
             planned_path = self._current_planned_path(state)
 
@@ -162,15 +222,122 @@ class PredictiveDStarLiteController(DStarLiteController):
                 corridor_half_width=self._inflation,
             )
             groups = self._apply_area_cap(groups)
-            survivors = self._peel(groups, folded_new_cells, robot_xy)
+
+            # No gated threats survived the cap -> no stamp, no pending groups.
+            if not groups:
+                self.last_predicted_cells = []
+                self._pending_groups = []
+                return []
+
+            # Store the threat-ordered groups (soonest-TTC first) and the
+            # un-stamped fold so the settle-time peel can drop the least-imminent
+            # groups and restore their cells to the true fold value.
+            self._pending_groups = groups
+            self._last_fold = folded_new_cells.copy()
+
+            # The full stamp: the union of ALL groups' cells, sorted + deduped
+            # row-major. Enters the fold this tick; the settle-time peel removes
+            # farthest-future groups only if this full stamp seals the grid.
+            stamped: set[tuple[int, int]] = set()
+            for _key, cells in groups:
+                stamped.update(cells)
+            survivors = sorted(stamped)
             self.last_predicted_cells = survivors
             return survivors
         except Exception:
-            # Degrade to "no extra cells": clear the debug attrs and behave like
-            # plain D* Lite for this tick.
+            # Degrade to "no extra cells": clear the debug attrs + pending groups
+            # and behave like plain D* Lite for this tick.
             self.last_tracks = []
             self.last_predicted_cells = []
+            self._pending_groups = []
             return []
+
+    # ------------------------------------------------------------------ #
+    # The settle-time fail-open peel (rare — reuses the search's g-values) #
+    # ------------------------------------------------------------------ #
+
+    def _settle_and_extract(self, position: np.ndarray) -> Path | None:
+        """Settle + extract, peeling the predicted stamp only if it sealed the grid.
+
+        First settle/extract with the FULL stamp already committed into
+        ``self._cells``. This reuses the search's reachability: the base
+        :meth:`DStarLiteController._settle_and_extract` runs
+        ``compute_shortest_path`` + ``extract_path`` and returns None exactly when
+        ``g(start)`` is infinite (the stamp sealed the robot off from the goal).
+
+        On a seal, peel farthest-future groups (drop the least-imminent first —
+        ``_pending_groups`` is soonest-TTC-first, so pop from the END), un-stamping
+        each dropped group's cells from ``self._cells`` and re-settling
+        incrementally, until a path re-exists. If even zero predicted stamp leaves
+        the grid unsolvable (a real static dead-end), return None so the base keeps
+        the last valid follower — ``act()`` never raises (AC6).
+        """
+        # Common path: the full stamp did not seal the grid (or there is no stamp
+        # at all). The base settle reuses the incremental g-values; no peel needed.
+        result = super()._settle_and_extract(position)
+        if result is not None:
+            return result
+
+        # S1: wrapping the peel makes AC6 structural even if the
+        # _pending_groups/_last_fold co-invariant is ever broken (e.g. by a future
+        # subclass) -- any peel exception falls back to the un-peeled base settle.
+        # except Exception (not bare) so KeyboardInterrupt/SystemExit propagate.
+        try:
+            # Sealed by the stamp (g(start) is infinite): peel the least-imminent
+            # group, restore its cells, and re-settle until a path re-exists.
+            kept = list(self._pending_groups)
+            while kept:
+                dropped = kept.pop()  # farthest-future (least-imminent) group
+                self._unstamp_group(dropped, kept)
+                result = super()._settle_and_extract(position)
+                if result is not None:
+                    return result
+
+            # Even with zero predicted stamp the grid is unsolvable: a real static
+            # dead-end. Return None so the base keeps the last valid follower.
+            return None
+        except Exception:
+            # Fall back to the un-peeled settle. The base returns None on failure,
+            # so the base keeps the last valid follower and act() never raises.
+            return super()._settle_and_extract(position)
+
+    def _unstamp_group(
+        self,
+        dropped: tuple[object, list[tuple[int, int]]],
+        kept: list[tuple[object, list[tuple[int, int]]]],
+    ) -> None:
+        """Remove a dropped group's stamp-only cells from the live search grid.
+
+        A dropped cell is un-stamped ONLY when it is currently stamped
+        (``True`` in ``self._cells``), is NOT retained by any KEPT group, and was
+        ``False`` in the un-stamped fold (i.e. it was stamp-only, not a real fold
+        obstacle). Such a cell is restored to its fold value (``False``) IN PLACE
+        and reported through :meth:`DStarLiteSearch.update_cells`, so the search
+        re-syncs its occupancy mirror and repairs those vertices for the next
+        incremental re-settle. ``self._cells`` is NEVER rebound (grid-ownership
+        invariant).
+        """
+        # Union of the kept groups' cells: these must stay stamped, so they are
+        # never un-stamped even if `dropped` also lists them.
+        kept_cells: set[tuple[int, int]] = set()
+        for _key, cells in kept:
+            kept_cells.update(cells)
+
+        _dropped_key, dropped_cells = dropped
+        changed: list[tuple[int, int]] = []
+        for cell in dropped_cells:
+            row, col = cell
+            if not self._cells[row, col]:
+                continue  # already cleared (a prior peel iteration, or never set)
+            if cell in kept_cells:
+                continue  # a kept group still needs this cell stamped
+            if self._last_fold[row, col]:
+                continue  # a real fold obstacle, not stamp-only — never erase it
+            self._cells[row, col] = self._last_fold[row, col]  # restore to False
+            changed.append(cell)
+
+        if changed:
+            self._search.update_cells(sorted(changed))
 
     # ------------------------------------------------------------------ #
     # Helpers                                                            #
@@ -211,72 +378,6 @@ class PredictiveDStarLiteController(DStarLiteController):
             kept.append(group)
             total += group_size
         return kept
-
-    def _peel(
-        self,
-        groups: list[tuple[object, list[tuple[int, int]]]],
-        folded_new_cells: np.ndarray,
-        robot_xy: np.ndarray,
-    ) -> list[tuple[int, int]]:
-        """Threat-ordered, bounded, fail-open peel; return surviving cells.
-
-        1. If the UNSTAMPED fold is already unsolvable, return [] — stamping
-           cannot help, and the base D* Lite swallow keeps the last valid
-           follower so act() never raises (AC6/TC56b). Do NOT raise.
-        2. Otherwise stamp all kept groups; if that seals the grid, drop the LAST
-           (farthest-future, least-imminent) group and retry, so the most
-           imminent protection is retained (AC5/TC56).
-        3. Return the union of surviving cells, sorted and deduped.
-        """
-        # Step 1: a real dead-end (even zero prediction is unsolvable) -> stamp
-        # nothing; the base keeps committing to its last valid follower.
-        if not self._reachable(folded_new_cells, robot_xy):
-            return []
-
-        # Step 2: peel farthest-future first until the trial grid is solvable.
-        kept = list(groups)
-        while kept:
-            trial = folded_new_cells.copy()
-            for _key, cells in kept:
-                for row, col in cells:
-                    trial[row, col] = True
-            if self._reachable(trial, robot_xy):
-                break
-            kept.pop()  # drop the last (least-imminent) group and retry
-
-        # Step 3: union the survivors, sorted + deduped row-major.
-        survivors: set[tuple[int, int]] = set()
-        for _key, cells in kept:
-            survivors.update(cells)
-        return sorted(survivors)
-
-    def _reachable(self, cells: np.ndarray, robot_xy: np.ndarray) -> bool:
-        """Is the goal reachable from the robot's current cell on ``cells``?
-
-        Uses the same traversability as the search (8-connected, octile cost, no
-        corner cutting) by running ``manual_astar.astar_search`` over an
-        OccupancyGrid wrapping ``cells`` (reusing this grid's resolution/offset).
-        ``astar_search`` RAISES RuntimeError when no path exists, so a raise (or
-        any geometry error) is treated as "unreachable".
-
-        Note: this peel cost shows only in total episode wall time, never in the
-        runner's wallclock_per_step metric (which times only irsim's env.step,
-        not act()).
-        """
-        if self._grid is None or self._goal_xy is None:
-            return False
-        robot_cell = world_to_grid(robot_xy, self._grid)
-        goal_cell = world_to_grid(self._goal_xy, self._grid)
-        probe_grid = OccupancyGrid(
-            cells=cells,
-            resolution=self._grid.resolution,
-            offset=self._grid.offset,
-        )
-        try:
-            astar_search(probe_grid, robot_cell, goal_cell)
-        except (RuntimeError, ValueError):
-            return False
-        return True
 
 
 class DStarLiteOracleController(PredictiveDStarLiteController):
