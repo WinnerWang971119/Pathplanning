@@ -348,6 +348,12 @@ def main(argv: list[str] | None = None) -> int:
         # follower/replan logic and must never raise on a mid-episode replan
         # failure, so no per-step guard is needed here.
         state, lidar = state0, lidar0
+        # `current_info` always holds the EpisodeInfo from the SAME source call
+        # that produced the current `state`/`lidar`: at t=0 that is reset()'s
+        # `info0`; thereafter the same `arena.step(...)` return. The truth seam
+        # below reads `current_info.dynamic_obstacles` so the snapshot an oracle
+        # observes is tick-aligned with the `state`/`lidar` its `act()` receives.
+        current_info = info0
         path_length = 0.0
         total_wallclock = 0.0
         prev_xy = state0[:2].copy()
@@ -356,6 +362,13 @@ def main(argv: list[str] | None = None) -> int:
         info = None
 
         while not done:
+            # Truth seam (opt-in): hand the oracle the live dynamic-obstacle
+            # snapshot that matches the `state`/`lidar` this `act()` will see —
+            # both come from `current_info`'s source call. `getattr(...)` keeps
+            # the 11 existing controllers (which never define `wants_truth`)
+            # untouched: `observe_truth` is never called for them.
+            if getattr(controller, "wants_truth", False):
+                controller.observe_truth(current_info.dynamic_obstacles)
             action = controller.act(state, lidar)
             state, lidar, done, info = arena.step(action)
             step_count += 1
@@ -373,6 +386,9 @@ def main(argv: list[str] | None = None) -> int:
                 done=done,
                 dynamic_obstacles_sha256=info.dynamic_obstacles_sha256,
             )
+            # Advance the matching info so the NEXT iteration's `observe_truth`
+            # reads the snapshot tick-aligned with the new `state`/`lidar`.
+            current_info = info
 
         # Defensive: the only way `info` is None here is a zero-iteration loop,
         # which can't happen because `done` starts False. Keep the guard so a
