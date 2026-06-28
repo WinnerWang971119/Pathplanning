@@ -437,7 +437,9 @@ class DStarLitePredictiveController(PredictiveDStarLiteController):
         bearings = np.linspace(
             self._geom.angle_min, self._geom.angle_max, self._geom.number
         )
-        return LidarTracker(self._grid, bearings)
+        # range_max lets the tracker drop no-hit returns at the sensing rim (which
+        # otherwise cluster into phantom obstacles); see LidarTracker.
+        return LidarTracker(self._grid, bearings, range_max=self._geom.range_max)
 
 
 # Self-register at import (mirrors d_star_lite.py). Imported after the

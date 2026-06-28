@@ -60,6 +60,7 @@ class LidarGeometry:
     angle_min: float
     angle_max: float
     number: int
+    range_max: float
 
 
 def load_lidar_geometry(world_yaml: str) -> LidarGeometry:
@@ -83,9 +84,16 @@ def load_lidar_geometry(world_yaml: str) -> LidarGeometry:
                 raise ValueError(
                     f"lidar2d 'number' must be at least 1, received {number!r}."
                 )
+            # range_max is the no-hit sentinel: a beam that reaches it without
+            # hitting comes back AT range_max. Absent in the YAML -> inf (so the
+            # LidarTracker's rim filter becomes a no-op). Mirrors the Arena's
+            # scan.get("range_max", inf) default.
+            range_max = float(sensor.get("range_max", float("inf")))
             wrapped = angle_range % TWO_PI
             half = wrapped / 2.0
-            return LidarGeometry(angle_min=-half, angle_max=half, number=number)
+            return LidarGeometry(
+                angle_min=-half, angle_max=half, number=number, range_max=range_max
+            )
 
     raise ValueError(
         f"World {world_yaml!r} has no 'lidar2d' sensor block in robot.sensors."

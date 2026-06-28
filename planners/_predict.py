@@ -55,6 +55,17 @@ MAX_ASSOCIATION_DISTANCE: float = 1.0
 # Assumes non-negative world bucket coordinates (the arena offset is (0, 0)).
 CLUSTER_ID_MULTIPLIER: int = 100000
 
+# Deadband (metres) below the lidar's range_max within which a return is treated
+# as a NO-HIT, not an obstacle. irsim returns a no-hit beam AT range_max, but
+# float jitter scatters a few just under it; the Arena's strict ``< range_max``
+# filter only catches the >= side, so those survivors reach the tracker as a ring
+# of points at the sensing rim. Without this cut they cluster into phantom
+# "obstacles" with spurious frame-differenced velocities (the rim moves with the
+# robot), which over-stamp the grid and make the lidar predictor net-harmful.
+# 0.05 m sits in the clean gap between real returns (<= ~4.9 m here) and the
+# ~range_max no-hit ring, and costs only the outermost 5 cm of a 5 m sensor.
+RANGE_MAX_DEADBAND: float = 0.05
+
 
 class ThreatKey(NamedTuple):
     """Sort key placing soonest-conflict tracks first, ties broken by id.
@@ -194,14 +205,24 @@ class LidarTracker:
     is correct (one frame cannot reveal motion).
     """
 
-    def __init__(self, grid: OccupancyGrid, bearings: np.ndarray) -> None:
-        """Store the static grid and the per-beam bearings.
+    def __init__(
+        self,
+        grid: OccupancyGrid,
+        bearings: np.ndarray,
+        range_max: float = float("inf"),
+    ) -> None:
+        """Store the static grid, the per-beam bearings, and the no-hit range.
 
         Parameters
         ----------
         grid:
             The STATIC inflated occupancy grid.  Read-only here: ``grid.cells``
             is consulted to subtract static returns and is never mutated.
+        range_max:
+            The lidar's max range (the no-hit sentinel).  Returns within
+            ``RANGE_MAX_DEADBAND`` of it are dropped as no-hits before clustering
+            (see ``_lidar_to_world_points``).  Defaults to ``inf``, which disables
+            the cut so a tracker built without a range stays byte-compatible.
         bearings:
             The per-beam angles, already recovered by the caller as
             ``np.linspace(angle_min, angle_max, number)`` (the exact recovery the
@@ -220,6 +241,7 @@ class LidarTracker:
 
         self._grid = grid
         self._bearings = bearings_array
+        self._range_max = float(range_max)
         # Prior-frame cluster centroids, stored in the current frame's
         # rep-cell-sorted order.  Empty until the first update(), so the first
         # update yields zero velocities.
@@ -287,12 +309,18 @@ class LidarTracker:
         empty, with the surviving points in beam order.
         """
         ranges = np.asarray(lidar, dtype=float)
-        finite_mask = np.isfinite(ranges)
-        if not finite_mask.any():
+        # Drop NaN (no-return) AND near-range_max returns. A no-hit beam comes
+        # back AT range_max with tiny float jitter; the Arena clears the
+        # >= range_max ones but a few land just under and survive, forming a ring
+        # at the sensing rim. Treating them as no-hits here (a RANGE_MAX_DEADBAND
+        # cut below range_max) keeps that ring from clustering into phantom
+        # obstacles. range_max == inf disables the cut (keeps every finite beam).
+        valid_mask = np.isfinite(ranges) & (ranges < self._range_max - RANGE_MAX_DEADBAND)
+        if not valid_mask.any():
             return np.empty((0, 2), dtype=float)
 
-        finite_ranges = ranges[finite_mask]
-        world_angles = float(state[2]) + self._bearings[finite_mask]
+        finite_ranges = ranges[valid_mask]
+        world_angles = float(state[2]) + self._bearings[valid_mask]
         hit_x = float(state[0]) + finite_ranges * np.cos(world_angles)
         hit_y = float(state[1]) + finite_ranges * np.sin(world_angles)
         return np.column_stack((hit_x, hit_y))
