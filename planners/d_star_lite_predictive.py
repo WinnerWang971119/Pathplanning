@@ -72,6 +72,7 @@ from __future__ import annotations
 import numpy as np
 
 from planners._predict import (
+    LidarTracker,
     OracleTracker,
     PREDICT_DT,
     Tracker,
@@ -100,6 +101,11 @@ class PredictiveDStarLiteController(DStarLiteController):
     :meth:`_settle_and_extract` (the settle-time fail-open peel).
     """
 
+    # Abstract base: it carries no registry key. The concrete subclasses
+    # (oracle / lidar) set their own real `name`. Blanking it here prevents the
+    # base from inheriting d_star_lite's name and masquerading as that key.
+    name = ""
+
     # Prediction geometry; subclasses set "capsule" (oracle) or "cone" (lidar).
     geometry: str = "capsule"
     # Opt-in live-truth flag; the oracle sets True so the runner feeds it the
@@ -127,7 +133,13 @@ class PredictiveDStarLiteController(DStarLiteController):
                 f"predict_horizon must be a non-negative int, received {predict_horizon!r}."
             )
         self._horizon_steps: int = int(predict_horizon)
-        self._tracker: Tracker = self._make_tracker()
+        # Tracker construction is DEFERRED to first use (first non-h0 act()).
+        # The lidar variant's tracker needs self._grid / self._geom, which only
+        # exist after reset(); the oracle's tracker is stateless, so lazy build
+        # is behaviourally identical for it. Built lazily inside
+        # _extra_blocked_cells' try block so a _make_tracker() failure degrades
+        # the tick (AC6) instead of crashing act().
+        self._tracker: Tracker | None = None
         self._snapshot: tuple = ()
 
         # Settle-peel state, refreshed every act() by _extra_blocked_cells and
@@ -190,6 +202,12 @@ class PredictiveDStarLiteController(DStarLiteController):
         # except Exception (not bare) so KeyboardInterrupt/SystemExit propagate.
         try:
             robot_xy = np.asarray(state[:2], dtype=float)
+
+            # Lazy tracker build (first non-h0 act() after reset()). Inside the
+            # try so a _make_tracker() failure degrades to no extra cells (AC6),
+            # matching the plain-D*-Lite fallback for any other prediction fault.
+            if self._tracker is None:
+                self._tracker = self._make_tracker()
 
             tracks = self._tracker.update(
                 snapshot=self._snapshot, state=state, lidar=lidar, dt=PREDICT_DT
@@ -397,8 +415,34 @@ class DStarLiteOracleController(PredictiveDStarLiteController):
         return OracleTracker()
 
 
+class DStarLitePredictiveController(PredictiveDStarLiteController):
+    """Lidar-fed predictive D* Lite: estimated velocities, widening cone.
+
+    The Mission-faithful variant: velocities come from frame-differencing the
+    live lidar (LidarTracker), not the truth seam (wants_truth=False). The cone
+    geometry widens the predicted footprint with the lookahead step to absorb
+    the estimator's velocity error, where the oracle's exact velocities warrant
+    only a constant-radius capsule.
+    """
+
+    name = "d_star_lite_predictive"
+    geometry = "cone"
+    wants_truth = False
+
+    def _make_tracker(self) -> Tracker:
+        # Lazy: reset() has populated self._geom / self._grid by the time this
+        # first fires (first non-h0 act()). Recover the beam bearings exactly as
+        # the rest of the harness does (np.linspace over the inclusive endpoints,
+        # NOT i*angle_increment), then hand them + the static grid to the tracker.
+        bearings = np.linspace(
+            self._geom.angle_min, self._geom.angle_max, self._geom.number
+        )
+        return LidarTracker(self._grid, bearings)
+
+
 # Self-register at import (mirrors d_star_lite.py). Imported after the
 # module-level imports so the registry sees the fully-defined class.
 from planners._grid import register  # noqa: E402
 
 register("d_star_lite_oracle", DStarLiteOracleController)
+register("d_star_lite_predictive", DStarLitePredictiveController)
