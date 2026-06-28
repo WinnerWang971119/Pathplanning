@@ -86,23 +86,28 @@ OUTCOMES = ("success", "crash", "timeout", "planner_error", "dnf")
 # every executed path is compared against (the robot must detour around walls).
 STRAIGHT_LINE_IDEAL_M = 46.0 * (2.0 ** 0.5)   # ~= 65.05 m
 
-# The canonical algorithm set, in the order they appear in every chart legend.
-# Each tuple is (registry name, replan_k or None, family, display label). The
-# concrete replan_k values here are placeholders; load_world_results() overrides
-# them with the CLI's --replan-k so the labels match the dirs run_experiment
-# actually wrote.
-CANONICAL: list[tuple[str, int | None, str, str]] = [
-    ("a_star_once",        None, "grid",        "A* once"),
-    ("a_star_replan",      5,    "grid",        "A* replan (K=5)"),
-    ("dijkstra_once",      None, "grid",        "Dijkstra once"),
-    ("dijkstra_replan",    5,    "grid",        "Dijkstra replan (K=5)"),
-    ("d_star_lite",        None, "incremental", "D* Lite"),
-    ("dwa",                None, "reactive",    "DWA"),
-    ("apf",                None, "reactive",    "APF"),
-    ("rrt_once",           None, "sampling",    "RRT once"),
-    ("rrt_replan",         5,    "sampling",    "RRT replan (K=5)"),
-    ("rrt_star_once",      None, "sampling",    "RRT* once"),
-    ("rrt_star_replan",    5,    "sampling",    "RRT* replan (K=5)"),
+# The algorithm set charted on the scatter, in legend order. Each tuple is
+# (registry name, replan_k or None, predict_horizon or None, family, display).
+# load_world_results() folds the replan_k / predict_horizon into the dir label
+# (a_star_replan_k5, d_star_lite_predictive_h10) so the label matches the dir
+# run_experiment wrote. The first 11 are the canonical Mission set; the last,
+# d_star_lite_predictive, is the experimental motion-aware planner shown at its
+# proven horizon (h10) so the headline scatter can include it. It is NOT in
+# run_all's canonical-11 (that set, and TC-P10's count, stay 11) — adding it here
+# only changes what this chart draws, not the canonical experiment.
+CANONICAL: list[tuple[str, int | None, int | None, str, str]] = [
+    ("a_star_once",            None, None, "grid",        "A* once"),
+    ("a_star_replan",          5,    None, "grid",        "A* replan (K=5)"),
+    ("dijkstra_once",          None, None, "grid",        "Dijkstra once"),
+    ("dijkstra_replan",        5,    None, "grid",        "Dijkstra replan (K=5)"),
+    ("d_star_lite",            None, None, "incremental", "D* Lite"),
+    ("dwa",                    None, None, "reactive",    "DWA"),
+    ("apf",                    None, None, "reactive",    "APF"),
+    ("rrt_once",               None, None, "sampling",    "RRT once"),
+    ("rrt_replan",             5,    None, "sampling",    "RRT replan (K=5)"),
+    ("rrt_star_once",          None, None, "sampling",    "RRT* once"),
+    ("rrt_star_replan",        5,    None, "sampling",    "RRT* replan (K=5)"),
+    ("d_star_lite_predictive", None, 10,   "predictive",  "D* Lite (predictive, h10)"),
 ]
 
 
@@ -534,11 +539,12 @@ def load_world_results(
     manifest_seed_order: tuple[int, ...] | None = None
     seen_seeds: set[int] = set()
 
-    for name, default_k, family, display in CANONICAL:
-        # A replan family takes the CLI cadence; everything else stays at None so
-        # algorithm_label returns its bare key.
+    for name, default_k, default_h, family, display in CANONICAL:
+        # A replan family takes the CLI cadence; a predict family folds in its
+        # horizon (default_h); everything else stays bare. algorithm_label handles
+        # all three from the (replan_k, predict_horizon) pair.
         effective_k = replan_k if default_k is not None else None
-        label = algorithm_label(name, effective_k)
+        label = algorithm_label(name, effective_k, default_h)
         label_dir = episode_out_dir(results_root, world_stem, label)
 
         acc = _AlgoAccumulator()
@@ -1838,9 +1844,9 @@ def _build_full_fixture(
     from planners import algorithm_label
 
     n_seeds = len(seeds)
-    for index, (name, default_k, _family, _display) in enumerate(CANONICAL):
+    for index, (name, default_k, default_h, _family, _display) in enumerate(CANONICAL):
         effective_k = replan_k if default_k is not None else None
-        label = algorithm_label(name, effective_k)
+        label = algorithm_label(name, effective_k, default_h)
 
         if name == "dwa":
             # 0-success algorithm: every present seed crashes (the experimental
