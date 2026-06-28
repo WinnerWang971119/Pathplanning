@@ -84,10 +84,10 @@ DEFAULT_RESULTS_DIR = "results"
 # PREDICT_DT = 0.1. h0 stamps nothing and is the plain-D*-Lite baseline/ablation.
 DEFAULT_HORIZONS: tuple[int, ...] = (0, 5, 10, 20)
 
-# The predictive keys this driver sweeps. T8 ships only the oracle; T13 appends
-# "d_star_lite_predictive" here (a one-line change) and the (horizon, planner)
-# loop picks it up. Every predictive key is non-replan, so replan_k is None.
-SWEEP_ALGORITHMS: tuple[str, ...] = ("d_star_lite_oracle",)
+# The predictive keys this driver sweeps. T8 shipped the oracle; T13 added the
+# lidar key "d_star_lite_predictive", which the (horizon, planner) loop picks up
+# automatically. Every predictive key is non-replan, so replan_k is None.
+SWEEP_ALGORITHMS: tuple[str, ...] = ("d_star_lite_oracle", "d_star_lite_predictive")
 
 
 def build_experiment_cmd(

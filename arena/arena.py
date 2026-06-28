@@ -4677,6 +4677,231 @@ def tc62(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — subprocess self
     )
 
 
+def tc63(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """d_star_lite_predictive (lidar) traffic-on e2e + determinism.
+
+    The lidar-fed, Mission-faithful predictive variant: it estimates obstacle
+    velocities from frame-to-frame lidar clustering (no truth seam — wants_truth=False)
+    and stamps a WIDENING cone (geometry="cone") to absorb that estimation noise.
+    Runs d_star_lite_predictive --predict-horizon 10 traffic-on to a terminal state,
+    asserts every trace line carries the 8-key schema (incl. dynamic_obstacles_sha256),
+    and that two same-seed runs produce byte-identical trace JSONL. NOTE: kept to one
+    horizon (10) and one seed pair (mirrors TC58's oracle e2e).
+
+    PERFORMANCE GATE: like the oracle (TC58), the lidar variant shares the settle-time
+    fail-open peel — no per-tick reachability probe. The per-tick hook only runs the
+    LidarTracker + cone stamp; reachability is answered at settle-time by
+    _settle_and_extract reusing the D* Lite search's own g(start) values, which fires
+    only when the follower finishes or its committed segment is blocked. That keeps
+    per-tick cost near baseline, so a full non-zero-horizon traffic episode terminates
+    well within the 600 s per-run wall.
+    """
+    repo_root = _ensure_repo_root_on_path()
+    seed_value = "63"
+    horizon = "10"
+    world_stem = Path(yaml_path).stem
+    cmd = [
+        sys.executable, "-m", "runners.run_episode",
+        "--algorithm", "d_star_lite_predictive",
+        "--predict-horizon", horizon,
+        "--seed", seed_value,
+        "--world", yaml_path,
+        "--traffic",  # default; stated explicitly
+    ]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_a, \
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_b:
+        for td in (td_a, td_b):
+            r = subprocess.run(
+                [*cmd, "--results-dir", td],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            assert r.returncode == 0, (
+                f"TC63 predictive traffic runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+            )
+
+        out_a = Path(td_a) / world_stem / f"d_star_lite_predictive_h{horizon}"
+        out_b = Path(td_b) / world_stem / f"d_star_lite_predictive_h{horizon}"
+        json_a = out_a / f"{seed_value}.json"
+        jsonl_a = out_a / f"{seed_value}.trace.jsonl"
+        jsonl_b = out_b / f"{seed_value}.trace.jsonl"
+        assert json_a.exists(), (
+            f"TC63: metrics JSON missing at {json_a} (label must be "
+            f"'d_star_lite_predictive_h{horizon}')"
+        )
+        assert jsonl_a.exists() and jsonl_b.exists(), (
+            f"TC63: trace JSONLs missing: a={jsonl_a.exists()}, b={jsonl_b.exists()}"
+        )
+
+        # The episode RAN to completion (no runner fault): t=0 planning succeeded.
+        metrics = json.loads(json_a.read_text(encoding="utf-8"))
+        assert metrics["planner_error"] is None, (
+            f"TC63: d_star_lite_predictive must plan successfully at t=0; "
+            f"planner_error={metrics['planner_error']}"
+        )
+
+        lines = jsonl_a.read_text(encoding="utf-8").splitlines()
+        assert lines, "TC63: predictive traffic trace JSONL is empty"
+        for idx, raw in enumerate(lines):
+            rec = json.loads(raw)
+            assert isinstance(rec, dict), f"TC63: trace line {idx} is not an object"
+            assert "dynamic_obstacles_sha256" in rec, (
+                f"TC63: trace line {idx} missing dynamic_obstacles_sha256 with traffic "
+                f"on; keys={sorted(rec)}"
+            )
+            assert len(rec) == 8, (
+                f"TC63: trace line {idx} must have 8 keys with traffic on, got "
+                f"{len(rec)}: {sorted(rec)}"
+            )
+
+        assert filecmp.cmp(str(jsonl_a), str(jsonl_b), shallow=False), (
+            "TC63: two same-seed predictive traffic runs produced differing trace JSONL; "
+            "predictive determinism through the runner is broken"
+        )
+
+
+def tc64(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure in-process; fixed synthetic fixture
+    """LidarTracker determinism across a multi-frame cluster-count change.
+
+    Drives a LidarTracker over a >=4-frame synthetic lidar fixture WHERE THE CLUSTER
+    COUNT CHANGES between frames (one obstacle for 3 frames, a 2nd appears, the 1st
+    leaves), twice on fresh instances. This exercises the association-stability hazard
+    — the danger that a changing cluster population reorders or mis-associates tracks
+    and silently desyncs the velocity estimate — not just a single 2-frame diff.
+
+    In-process only (NO irsim, NO subprocess). The fixture is fully fixed (no RNG), so
+    the case is self-deterministic regardless of the `seed` arg, which is ignored. The
+    grid is all-free (80x80 cells at 0.5 m, offset (-10,-10)) so the static occupancy
+    subtracts nothing — this case targets determinism + association, not static
+    subtraction.
+
+    Asserts:
+      1. Determinism (binding): the two list[list[Track]] sequences are byte-identical
+         via dataclasses.astuple comparison.
+      2. The cluster count genuinely changed across frames (per-frame counts ==
+         [1, 1, 1, 2, 1], an enter then a leave).
+      3. The first frame has zero velocity (no prior) and a +x-moving obstacle yields a
+         non-zero, correctly-signed velocity after the second frame (the estimator is
+         actually frame-differencing, not returning zeros).
+    """
+    import math
+
+    _ensure_repo_root_on_path()
+    from manual_astar import OccupancyGrid  # type: ignore[import-not-found]
+    from planners._predict import PREDICT_DT, LidarTracker, Track  # type: ignore[import-not-found]
+
+    def make_grid() -> OccupancyGrid:
+        """An all-free 40x40 m grid (offset (-10,-10)) so nothing is subtracted."""
+        rows = cols = 80
+        cells = np.zeros((rows, cols), dtype=bool)
+        return OccupancyGrid(
+            cells=cells, resolution=0.5, offset=np.array([-10.0, -10.0], dtype=float)
+        )
+
+    def ray_disk_range(
+        bearing: float, center: tuple[float, float], radius: float
+    ) -> float | None:
+        """Nearest forward hit range of a beam from the origin against a disk."""
+        dx, dy = math.cos(bearing), math.sin(bearing)
+        cx, cy = center
+        d_dot_c = dx * cx + dy * cy
+        disc = d_dot_c * d_dot_c - (cx * cx + cy * cy - radius * radius)
+        if disc < 0.0:
+            return None
+        t = d_dot_c - math.sqrt(disc)
+        return t if t > 0.0 else None
+
+    def synth_lidar(
+        bearings: np.ndarray, disks: list[tuple[tuple[float, float], float]]
+    ) -> np.ndarray:
+        """Synthesize a scan (robot at origin, theta=0) hitting the given disks."""
+        ranges = np.full(bearings.shape[0], np.nan, dtype=float)
+        for i, bearing in enumerate(bearings):
+            best: float | None = None
+            for center, radius in disks:
+                r = ray_disk_range(float(bearing), center, radius)
+                if r is not None and (best is None or r < best):
+                    best = r
+            if best is not None:
+                ranges[i] = best
+        return ranges
+
+    def run_sequence(
+        bearings: np.ndarray,
+        frames: list[list[tuple[tuple[float, float], float]]],
+    ) -> list[list[Track]]:
+        grid = make_grid()
+        tracker = LidarTracker(grid, bearings)
+        state = np.array([0.0, 0.0, 0.0], dtype=float)
+        out: list[list[Track]] = []
+        for disks in frames:
+            lidar = synth_lidar(bearings, disks)
+            tracks = tracker.update(snapshot=(), state=state, lidar=lidar, dt=PREDICT_DT)
+            out.append(tracks)
+        return out
+
+    # Slightly under 2*pi (math.pi * 0.999) so WrapTo2Pi does not collapse the scan to
+    # a single ray (gotcha-lidar-wraptopi-collapses-2pi).
+    bearings = np.linspace(-math.pi, math.pi * 0.999, 180)
+    radius = 0.4
+
+    # Obstacle A is on-axis and moves +x in 0.15 m straight-line steps (=> ~1.5 m/s,
+    # vy~0 by symmetry of the visible near arc). Obstacle B appears in frame 4; A
+    # leaves in frame 5, so the cluster count walks 1 -> 1 -> 1 -> 2 -> 1.
+    a0 = (5.0, 0.0)
+    a1 = (5.15, 0.0)
+    a2 = (5.30, 0.0)
+    a3 = (5.45, 0.0)
+    b = (3.0, -3.0)
+
+    frames: list[list[tuple[tuple[float, float], float]]] = [
+        [(a0, radius)],                 # frame 1: 1 cluster
+        [(a1, radius)],                 # frame 2: 1 cluster
+        [(a2, radius)],                 # frame 3: 1 cluster
+        [(a3, radius), (b, radius)],    # frame 4: 2 clusters (B appears)
+        [(b, radius)],                  # frame 5: 1 cluster (A leaves)
+    ]
+
+    seq1 = run_sequence(bearings, frames)
+    seq2 = run_sequence(bearings, frames)
+
+    # 1. Determinism (binding): two fresh-instance runs byte-identical.
+    tup1 = [[dataclasses.astuple(t) for t in frame] for frame in seq1]
+    tup2 = [[dataclasses.astuple(t) for t in frame] for frame in seq2]
+    assert tup1 == tup2, (
+        "TC64: two fresh LidarTracker runs over the same 5-frame fixture diverged; "
+        "the estimator/association is non-deterministic"
+    )
+
+    # 2. The cluster count actually changed across frames (enter/leave exercised, not a
+    #    static count) — fail loud with the observed counts if not.
+    counts = [len(frame) for frame in seq1]
+    assert counts == [1, 1, 1, 2, 1], (
+        f"TC64: fixture did not exercise a cluster-count change; per-frame track counts "
+        f"were {counts}, expected [1, 1, 1, 2, 1]"
+    )
+
+    # 3a. The first frame has no prior, so its velocity estimate must be exactly zero.
+    frame1 = seq1[0]
+    assert len(frame1) == 1, f"TC64: expected 1 track in frame 1, got {len(frame1)}"
+    assert frame1[0].vx == 0.0 and frame1[0].vy == 0.0, (
+        f"TC64: first-frame velocity must be (0, 0) with no prior, got "
+        f"({frame1[0].vx}, {frame1[0].vy})"
+    )
+
+    # 3b. After the obstacle moves +x, the estimate must be non-zero and correctly
+    #     signed — proving the estimator is differencing, not returning zeros.
+    frame2 = seq1[1]
+    assert len(frame2) == 1, f"TC64: expected 1 track in frame 2, got {len(frame2)}"
+    track_a = frame2[0]
+    assert track_a.vx > 0.5 and abs(track_a.vy) < 0.2, (
+        f"TC64: a +x-moving obstacle must yield vx>0.5 and |vy|<0.2 (estimator is "
+        f"frame-differencing), got vx={track_a.vx:.4f} vy={track_a.vy:.4f}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI runner — --check (default) or --render. See module docstring above.
 # ---------------------------------------------------------------------------
@@ -4750,6 +4975,8 @@ def _run_checks(yaml_path: str, seed: int) -> int:
         ("TC60: dynamic_obstacles truth seam + tick alignment", tc60),
         ("TC61: run_all tolerates experimental keys (canonical carve-out)", tc61),
         ("TC62: plot_horizon_sweep --selfcheck passes (no irsim)", tc62),
+        ("TC63: d_star_lite_predictive traffic-on e2e + determinism", tc63),
+        ("TC64: LidarTracker determinism across a multi-frame cluster-count change", tc64),
     ]
     failures = 0
     for label, fn in cases:
@@ -4792,7 +5019,7 @@ def _parse_args() -> argparse.Namespace:
     group.add_argument(
         "--check",
         action="store_true",
-        help="Run TC1-TC62 + TC-CLI/TC-FWD headless (66 cases, incl. Phase 2 traffic + Phase 3 batch runner + replanning + D* Lite (incl. deferred-settle) + reactive (DWA/APF) + sampling (RRT/RRT*) families + rrt-local LOS-helper equivalence + the obstacle-speed-cap sweep + the predictive (motion-aware) D* Lite family)",
+        help="Run TC1-TC64 + TC-CLI/TC-FWD headless (68 cases, incl. Phase 2 traffic + Phase 3 batch runner + replanning + D* Lite (incl. deferred-settle) + reactive (DWA/APF) + sampling (RRT/RRT*) families + rrt-local LOS-helper equivalence + the obstacle-speed-cap sweep + the predictive (motion-aware) D* Lite family, incl. the lidar frame-differencing estimator)",
     )
     return parser.parse_args()
 
