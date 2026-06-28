@@ -92,10 +92,11 @@ from runners._layout import episode_out_dir
 
 DEFAULT_RESULTS_DIR = "results"
 
-# The single oracle key this plotter charts. T13 may add a second predictive key
-# (d_star_lite_predictive); the loader/series logic already handles a multi-key
-# dict, so adding it is a one-line change to this tuple.
-SWEEP_ALGORITHMS: tuple[str, ...] = ("d_star_lite_oracle",)
+# The predictive keys this plotter charts. The oracle (perfect velocities) is the
+# motion-aware ceiling; the lidar variant (frame-differencing) is the realizable
+# estimator. The loader/series logic handles a multi-key dict, so both render as
+# separate colored lines on the same axes (a label with no result dir is skipped).
+SWEEP_ALGORITHMS: tuple[str, ...] = ("d_star_lite_oracle", "d_star_lite_predictive")
 
 # Display names for the swept predictive keys (kept local so the headless plotter
 # never imports `planners` at module top just to resolve a label).
