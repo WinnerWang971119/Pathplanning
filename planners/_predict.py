@@ -6,6 +6,7 @@ no RNG, no set-iteration.  T4 will add predict_blocked_cells() here.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import NamedTuple, Protocol
 
@@ -22,6 +23,37 @@ PREDICT_DT: float = 0.1
 # a grid cell per step (GRID_RESOLUTION is 0.1 m, so ~0.05 m), a small default
 # tuned later by the lidar variant (T12).  The capsule geometry ignores it.
 CONE_GROWTH_PER_STEP: float = 0.05
+
+# --- LidarTracker tunables (frame-differencing velocity estimator) ----------
+
+# Grid-bucket edge length (metres) for clustering surviving dynamic lidar
+# returns into obstacle clusters.  Roughly one obstacle radius (the arena's
+# dynamic obstacles are r=0.3 m circles), so a single obstacle's arc of returns
+# falls into a few adjacent buckets that 8-connectivity then merges into one
+# cluster, while two distinct obstacles a metre apart stay separate.
+CLUSTER_RESOLUTION: float = 0.3
+
+# Floor (metres) on a cluster's estimated radius.  A one-point cluster has zero
+# extent, so without a floor its predicted disk would collapse to nothing; lidar
+# only ever sees the near surface and under-estimates the true radius anyway
+# (the cone geometry in T12 widens to cover that), so a small sane floor is all
+# that is required.
+MIN_TRACK_RADIUS: float = 0.15
+
+# Maximum centroid displacement (metres) accepted when associating a current
+# cluster to a prior-frame cluster.  The fastest obstacle moves
+# 1.5 * MAX_LINEAR_SPEED(=1.0) * PREDICT_DT(=0.1) = 0.15 m per frame, so 1.0 m
+# comfortably covers that plus clustering/centroid jitter while staying tight
+# enough to reject a spurious cross-association to an unrelated obstacle.
+MAX_ASSOCIATION_DISTANCE: float = 1.0
+
+# Multiplier folding a cluster's representative (smallest) bucket cell
+# ``(row, col)`` into a single integer track id: ``id = row * MULT + col``.
+# Chosen larger than any column index a 50x50 world reaches at
+# CLUSTER_RESOLUTION (~167 buckets), so distinct representative cells map to
+# distinct ids and a stationary obstacle keeps a stable id across frames.
+# Assumes non-negative world bucket coordinates (the arena offset is (0, 0)).
+CLUSTER_ID_MULTIPLIER: int = 100000
 
 
 class ThreatKey(NamedTuple):
@@ -118,6 +150,340 @@ class OracleTracker:
             for rec in snapshot  # type: ignore[union-attr]
         ]
         tracks.sort(key=lambda t: t.id)
+        return tracks
+
+
+@dataclass(frozen=True)
+class _Cluster:
+    """One connected-component cluster of dynamic lidar returns (internal).
+
+    ``rep_cell`` is the smallest bucket key in the component (its deterministic
+    representative); ``track_id`` is that cell folded into a single integer. It is
+    stable WITHIN a frame (distinct components have distinct rep_cells), and stable
+    across frames only while the obstacle is stationary — a moving obstacle's
+    rep_cell (and thus id) shifts as its return arc moves. Nothing relies on
+    cross-frame id stability: cross-frame state is carried positionally via
+    ``_prev_centroids``, and each tick's prediction is computed fresh.
+    """
+
+    track_id: int
+    rep_cell: tuple[int, int]
+    centroid_x: float
+    centroid_y: float
+    radius: float
+
+
+class LidarTracker:
+    """Frame-differencing velocity estimator — the lidar-only ``Tracker``.
+
+    Each tick it projects the live lidar frame to world points, drops returns
+    that land on the STATIC inflated grid (walls / pillars and their inflation
+    band), clusters the surviving dynamic returns by grid bucket, associates
+    each cluster to the nearest cluster from the PRIOR frame, and estimates the
+    velocity as ``(centroid_now - centroid_prev) / dt``.  The prior-frame
+    centroids are the only mutable state.
+
+    Determinism is the whole contract (the plan's "landmine"): the pipeline never
+    iterates a ``set`` to build output or to order points, draws no RNG, and
+    feeds every ``np.mean`` reduction a fixed, sorted-order array, so two
+    ``update`` sequences on byte-identical inputs (same constructor args, same
+    per-frame ``state`` / ``lidar``) return byte-identical ``Track`` lists — even
+    across a frame where the cluster count changes (an obstacle enters / leaves).
+
+    The first ``update`` has no prior frame, so it yields zero velocities; that
+    is correct (one frame cannot reveal motion).
+    """
+
+    def __init__(self, grid: OccupancyGrid, bearings: np.ndarray) -> None:
+        """Store the static grid and the per-beam bearings.
+
+        Parameters
+        ----------
+        grid:
+            The STATIC inflated occupancy grid.  Read-only here: ``grid.cells``
+            is consulted to subtract static returns and is never mutated.
+        bearings:
+            The per-beam angles, already recovered by the caller as
+            ``np.linspace(angle_min, angle_max, number)`` (the exact recovery the
+            rest of the harness uses — NOT ``i * angle_increment``).  No YAML is
+            loaded and no bearings are recomputed here.
+        """
+        if grid is None:
+            raise ValueError("LidarTracker requires a non-None OccupancyGrid.")
+
+        bearings_array = np.asarray(bearings, dtype=float)
+        if bearings_array.ndim != 1:
+            raise ValueError(
+                "bearings must be a 1-D array of beam angles, received shape "
+                f"{bearings_array.shape}."
+            )
+
+        self._grid = grid
+        self._bearings = bearings_array
+        # Prior-frame cluster centroids, stored in the current frame's
+        # rep-cell-sorted order.  Empty until the first update(), so the first
+        # update yields zero velocities.
+        self._prev_centroids: list[tuple[float, float]] = []
+
+    def update(
+        self,
+        *,
+        snapshot: object,
+        state: np.ndarray,
+        lidar: np.ndarray,
+        dt: float,
+    ) -> list[Track]:
+        """Estimate one Track per dynamic cluster, sorted by ``id`` ascending.
+
+        Parameters
+        ----------
+        snapshot:
+            Ignored — this tracker is lidar-only (accepted for protocol parity).
+        state:
+            ``(3,)`` ``[x, y, theta]`` robot pose in the world frame.
+        lidar:
+            ``(number,)`` range scan (NaN = no return), one entry per bearing.
+        dt:
+            Frame interval in seconds (the caller passes ``PREDICT_DT``); the
+            velocity denominator.  Must be positive.
+        """
+        del snapshot  # lidar-only: the truth snapshot is ignored.
+
+        state_array = np.asarray(state, dtype=float)
+        if state_array.shape != (3,):
+            raise ValueError(
+                f"Expected (3,) [x, y, theta] state, received shape "
+                f"{state_array.shape}."
+            )
+
+        lidar_array = np.asarray(lidar, dtype=float)
+        expected_lidar_shape = (self._bearings.shape[0],)
+        if lidar_array.shape != expected_lidar_shape:
+            raise ValueError(
+                f"Expected lidar of shape {expected_lidar_shape}, received "
+                f"{lidar_array.shape}."
+            )
+
+        if not dt > 0.0:
+            raise ValueError(f"dt must be positive, received {dt!r}.")
+
+        world_points = self._lidar_to_world_points(state_array, lidar_array)
+        dynamic_points = self._drop_static_returns(world_points)
+        clusters = self._cluster(dynamic_points)
+        return self._associate_and_build(clusters, float(dt))
+
+    # --- Internal helpers ---------------------------------------------------
+
+    def _lidar_to_world_points(
+        self, state: np.ndarray, lidar: np.ndarray
+    ) -> np.ndarray:
+        """Project finite lidar returns to world-frame obstacle points.
+
+        Mirrors DWA's ``_lidar_to_world_points`` exactly (duplicated rather than
+        imported to avoid a cross-module dependency on a private method): for
+        beam ``i`` with finite range ``r`` the world bearing is
+        ``theta + bearings[i]`` and the hit is ``(x + r*cos, y + r*sin)``.  NaN
+        (no-return) beams are skipped.  Returns an ``(N, 2)`` array, possibly
+        empty, with the surviving points in beam order.
+        """
+        ranges = np.asarray(lidar, dtype=float)
+        finite_mask = np.isfinite(ranges)
+        if not finite_mask.any():
+            return np.empty((0, 2), dtype=float)
+
+        finite_ranges = ranges[finite_mask]
+        world_angles = float(state[2]) + self._bearings[finite_mask]
+        hit_x = float(state[0]) + finite_ranges * np.cos(world_angles)
+        hit_y = float(state[1]) + finite_ranges * np.sin(world_angles)
+        return np.column_stack((hit_x, hit_y))
+
+    def _drop_static_returns(self, points: np.ndarray) -> np.ndarray:
+        """Drop every hit point whose grid cell is occupied in the static grid.
+
+        Vectorized for speed but byte-equivalent to per-point
+        ``world_to_grid`` + ``grid.cells[cell]`` (same ``np.floor`` / ``np.clip``
+        clamp, same offset and resolution): a wall or pillar return lands on a
+        ``True`` cell (the obstacle or its inflation band) and is removed,
+        leaving only dynamic-obstacle returns.  Input beam ORDER is preserved.
+        """
+        if points.shape[0] == 0:
+            return points
+
+        cells = self._grid.cells
+        rows, cols = cells.shape
+        resolution = self._grid.resolution
+        offset_x = float(self._grid.offset[0])
+        offset_y = float(self._grid.offset[1])
+
+        raw_col = (points[:, 0] - offset_x) / resolution
+        raw_row = (points[:, 1] - offset_y) / resolution
+        grid_col = np.clip(np.floor(raw_col), 0, cols - 1).astype(int)
+        grid_row = np.clip(np.floor(raw_row), 0, rows - 1).astype(int)
+
+        occupied = cells[grid_row, grid_col]
+        return points[~occupied]
+
+    def _cluster(self, points: np.ndarray) -> list[_Cluster]:
+        """Deterministically cluster dynamic points into obstacle clusters.
+
+        Buckets each point into an integer ``(row, col)`` cell at
+        ``CLUSTER_RESOLUTION`` (row = y, col = x to match the grid convention),
+        runs 8-connected connected components over the occupied buckets seeded in
+        sorted bucket-key order, and reduces each component to a ``_Cluster``.
+        Returns the clusters in component-seed order; the caller re-sorts by
+        ``rep_cell`` before association.
+        """
+        if points.shape[0] == 0:
+            return []
+
+        # 1. Bucket points, preserving input (beam) order within each bucket.
+        buckets: dict[tuple[int, int], list[tuple[float, float]]] = {}
+        for index in range(points.shape[0]):
+            point_x = float(points[index, 0])
+            point_y = float(points[index, 1])
+            bucket_key = (
+                int(math.floor(point_y / CLUSTER_RESOLUTION)),
+                int(math.floor(point_x / CLUSTER_RESOLUTION)),
+            )
+            buckets.setdefault(bucket_key, []).append((point_x, point_y))
+
+        # 2. Connected components (8-connectivity) over the occupied buckets,
+        #    seeding components in sorted bucket-key order so component output
+        #    order is deterministic.  Flood-fill internal order is irrelevant
+        #    because each component's members are re-sorted in _build_cluster.
+        occupied_keys = set(buckets.keys())
+        visited: set[tuple[int, int]] = set()
+        clusters: list[_Cluster] = []
+        for seed_key in sorted(occupied_keys):
+            if seed_key in visited:
+                continue
+            component_keys: list[tuple[int, int]] = []
+            stack = [seed_key]
+            visited.add(seed_key)
+            while stack:
+                current = stack.pop()
+                component_keys.append(current)
+                current_row, current_col = current
+                for delta_row in (-1, 0, 1):
+                    for delta_col in (-1, 0, 1):
+                        if delta_row == 0 and delta_col == 0:
+                            continue
+                        neighbor = (current_row + delta_row, current_col + delta_col)
+                        if neighbor in occupied_keys and neighbor not in visited:
+                            visited.add(neighbor)
+                            stack.append(neighbor)
+            clusters.append(self._build_cluster(component_keys, buckets))
+
+        return clusters
+
+    def _build_cluster(
+        self,
+        component_keys: list[tuple[int, int]],
+        buckets: dict[tuple[int, int], list[tuple[float, float]]],
+    ) -> _Cluster:
+        """Reduce one connected component to a centroid, radius, and stable id.
+
+        Member points are gathered and sorted by ``(bucket_key, x, y)`` into a
+        fixed order, so the centroid ``np.mean`` reduces an identically-ordered
+        array every run.  The radius is the max centroid-to-member distance,
+        floored at ``MIN_TRACK_RADIUS``.  The id is the smallest bucket key
+        folded by ``CLUSTER_ID_MULTIPLIER``.
+        """
+        member_points: list[tuple[tuple[int, int], float, float]] = []
+        for bucket_key in component_keys:
+            for point_x, point_y in buckets[bucket_key]:
+                member_points.append((bucket_key, point_x, point_y))
+        # Lexicographic sort by (bucket_key, x, y) — a fixed, reproducible order.
+        member_points.sort()
+
+        points_array = np.array(
+            [[point_x, point_y] for (_, point_x, point_y) in member_points],
+            dtype=float,
+        )
+        centroid = np.mean(points_array, axis=0)
+        centroid_x = float(centroid[0])
+        centroid_y = float(centroid[1])
+
+        deltas = points_array - centroid
+        distances = np.sqrt(np.sum(deltas * deltas, axis=1))
+        radius = max(float(distances.max()), MIN_TRACK_RADIUS)
+
+        rep_cell = min(component_keys)
+        track_id = rep_cell[0] * CLUSTER_ID_MULTIPLIER + rep_cell[1]
+        return _Cluster(
+            track_id=track_id,
+            rep_cell=rep_cell,
+            centroid_x=centroid_x,
+            centroid_y=centroid_y,
+            radius=radius,
+        )
+
+    def _associate_and_build(
+        self, clusters: list[_Cluster], dt: float
+    ) -> list[Track]:
+        """Associate current clusters to the prior frame and build Tracks.
+
+        Greedy, sorted, first-match-wins: current clusters are processed in
+        ``rep_cell`` ascending order, each claiming the nearest UNUSED prior
+        centroid within ``MAX_ASSOCIATION_DISTANCE`` (distance ties broken by the
+        lowest prior index).  A cluster with no prior in range gets zero velocity
+        (a freshly-appeared obstacle).  The current centroids replace the prior
+        state for the next tick.  Tracks are returned sorted by ``id``.
+        """
+        ordered = sorted(clusters, key=lambda cluster: cluster.rep_cell)
+        prior = self._prev_centroids
+        used = [False] * len(prior)
+
+        tracks: list[Track] = []
+        for cluster in ordered:
+            best_index = -1
+            best_distance: float | None = None
+            for prior_index in range(len(prior)):
+                if used[prior_index]:
+                    continue
+                prior_x, prior_y = prior[prior_index]
+                delta_x = cluster.centroid_x - prior_x
+                delta_y = cluster.centroid_y - prior_y
+                distance = math.sqrt(delta_x * delta_x + delta_y * delta_y)
+                # First-match-wins on equal distance: strict `<` keeps the lowest
+                # prior index (we iterate prior_index ascending).
+                if distance <= MAX_ASSOCIATION_DISTANCE and (
+                    best_distance is None or distance < best_distance
+                ):
+                    best_distance = distance
+                    best_index = prior_index
+
+            if best_index >= 0:
+                used[best_index] = True
+                prior_x, prior_y = prior[best_index]
+                velocity_x = (cluster.centroid_x - prior_x) / dt
+                velocity_y = (cluster.centroid_y - prior_y) / dt
+            else:
+                velocity_x = 0.0
+                velocity_y = 0.0
+
+            tracks.append(
+                Track(
+                    id=cluster.track_id,
+                    x=cluster.centroid_x,
+                    y=cluster.centroid_y,
+                    vx=velocity_x,
+                    vy=velocity_y,
+                    radius=cluster.radius,
+                )
+            )
+
+        # Store this frame's centroids (in current sorted order) for next tick.
+        # A frame with zero dynamic returns (all-static or all-NaN) leaves this
+        # empty, so the NEXT frame restarts every track at zero velocity. That is
+        # an inherent frame-differencing limitation, deterministic, and accepted
+        # for v1 (the cone widening + gate + fail-open peel absorb a one-frame
+        # zero-velocity blip).
+        self._prev_centroids = [
+            (cluster.centroid_x, cluster.centroid_y) for cluster in ordered
+        ]
+
+        tracks.sort(key=lambda track: track.id)
         return tracks
 
 
