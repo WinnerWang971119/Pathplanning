@@ -34,6 +34,7 @@ from manual_astar import (
     load_world,
     wrap_to_pi,
 )
+from planners._geometry import lidar_to_world_points
 from planners._grid import LidarGeometry, load_lidar_geometry, register
 
 # --- Tunable constants ------------------------------------------------------
@@ -343,23 +344,14 @@ class DWAController:
     ) -> np.ndarray:
         """Project finite lidar returns to world-frame obstacle points.
 
-        For beam ``i`` with finite range ``r``: world bearing is
-        ``theta + bearings[i]`` and the hit is ``(x + r*cos, y + r*sin)``. NaN
-        (no-return) beams are skipped. Returns an ``(N, 2)`` array (possibly
-        empty).
+        Delegates to the shared :func:`planners._geometry.lidar_to_world_points`
+        (the one projection the family uses): for beam ``i`` with finite range
+        ``r`` the hit is ``(x + r*cos(theta + bearings[i]), y + r*sin(...))``; NaN
+        beams are skipped. DWA wants the full scan, so it passes no ``range_max``
+        (no rim deadband). Returns an ``(N, 2)`` array (possibly empty).
         """
         assert self._bearings is not None  # narrowed by act()'s guard
-
-        ranges = np.asarray(lidar, dtype=float)
-        finite_mask = np.isfinite(ranges)
-        if not finite_mask.any():
-            return np.empty((0, 2), dtype=float)
-
-        finite_ranges = ranges[finite_mask]
-        world_angles = float(state[2]) + self._bearings[finite_mask]
-        hit_x = float(state[0]) + finite_ranges * np.cos(world_angles)
-        hit_y = float(state[1]) + finite_ranges * np.sin(world_angles)
-        return np.column_stack((hit_x, hit_y))
+        return lidar_to_world_points(state, lidar, self._bearings)
 
     def _fallback_action(self, lidar: np.ndarray) -> np.ndarray:
         """In-place rotation toward the side with more mean lidar clearance.

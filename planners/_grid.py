@@ -41,6 +41,7 @@ from manual_astar import (
     load_world,
     world_to_grid,
 )
+from planners._geometry import iter_disk_cells, lidar_to_world_points
 from planners._types import Controller, Path
 
 # Lidar sits at the robot origin (the canonical worlds give it no sensor offset),
@@ -85,9 +86,14 @@ def load_lidar_geometry(world_yaml: str) -> LidarGeometry:
                     f"lidar2d 'number' must be at least 1, received {number!r}."
                 )
             # range_max is the no-hit sentinel: a beam that reaches it without
-            # hitting comes back AT range_max. Absent in the YAML -> inf (so the
-            # LidarTracker's rim filter becomes a no-op). Mirrors the Arena's
-            # scan.get("range_max", inf) default.
+            # hitting comes back AT range_max. Absent in the YAML -> inf, kept to
+            # mirror the Arena's own scan.get("range_max", inf) default.
+            # CAVEAT: with range_max == inf the LidarTracker's near-rim deadband
+            # (a `< range_max - RANGE_MAX_DEADBAND` cut) becomes a no-op, so a world
+            # that omits range_max re-admits the rim no-hit ring as phantom dynamic
+            # obstacles for the lidar predictive variant. Every shipped world sets
+            # `range_max: 5.0`, so this is latent; a new world feeding the lidar
+            # variant should set range_max explicitly.
             range_max = float(sensor.get("range_max", float("inf")))
             wrapped = angle_range % TWO_PI
             half = wrapped / 2.0
@@ -109,36 +115,14 @@ def _mark_disk(
 ) -> None:
     """Mark every grid cell whose CENTER lies within `inflation` of (cx, cy).
 
-    Iterates only the axis-aligned bounding box of cells reachable within the
-    inflation radius (clamped to the grid) in stable row-major order, so the
-    fold is byte-deterministic run to run.
+    Fills the boolean array from the shared :func:`iter_disk_cells` bounding-box
+    scan (the same row-major scan `_predict` collects its predicted footprint from),
+    so the lidar fold stays byte-deterministic and can never drift from the
+    predicted stamp. Marking is idempotent, so the scan order does not affect the
+    result.
     """
-    rows, cols = grid.shape
-    resolution = grid.resolution
-    offset_x = float(grid.offset[0])
-    offset_y = float(grid.offset[1])
-
-    # Bounding box of candidate cell indices (centers within `inflation`).
-    min_col = int(np.floor((center_x - inflation - offset_x) / resolution))
-    max_col = int(np.floor((center_x + inflation - offset_x) / resolution))
-    min_row = int(np.floor((center_y - inflation - offset_y) / resolution))
-    max_row = int(np.floor((center_y + inflation - offset_y) / resolution))
-
-    min_col = max(min_col, 0)
-    max_col = min(max_col, cols - 1)
-    min_row = max(min_row, 0)
-    max_row = min(max_row, rows - 1)
-
-    inflation_sq = inflation * inflation
-
-    for row in range(min_row, max_row + 1):
-        cell_center_y = offset_y + (row + 0.5) * resolution
-        delta_y = cell_center_y - center_y
-        for col in range(min_col, max_col + 1):
-            cell_center_x = offset_x + (col + 0.5) * resolution
-            delta_x = cell_center_x - center_x
-            if delta_x * delta_x + delta_y * delta_y <= inflation_sq:
-                cells[row, col] = True
+    for row, col in iter_disk_cells(grid, center_x, center_y, inflation):
+        cells[row, col] = True
 
 
 def lidar_to_occupancy(
@@ -170,22 +154,14 @@ def lidar_to_occupancy(
     folded = static_cells.copy()
 
     # irsim lays beams with linspace over the inclusive [angle_min, angle_max]
-    # endpoints (NOT angle_increment spacing).
+    # endpoints (NOT angle_increment spacing). The shared projection drops NaN
+    # (no-return) beams and folds every finite one (range_max defaults to inf, so
+    # NO rim deadband here — the fold wants the full scan); the points come back in
+    # beam order, and marking is order-independent anyway.
     bearings = np.linspace(geom.angle_min, geom.angle_max, geom.number)
-
-    robot_x = float(state[0])
-    robot_y = float(state[1])
-    robot_theta = float(state[2])
-
-    for beam_index in range(geom.number):
-        beam_range = float(lidar[beam_index])
-        if not np.isfinite(beam_range):
-            continue
-
-        world_angle = robot_theta + float(bearings[beam_index])
-        hit_x = robot_x + beam_range * np.cos(world_angle)
-        hit_y = robot_y + beam_range * np.sin(world_angle)
-        _mark_disk(folded, grid, hit_x, hit_y, inflation)
+    points = lidar_to_world_points(state, lidar, bearings)
+    for index in range(points.shape[0]):
+        _mark_disk(folded, grid, float(points[index, 0]), float(points[index, 1]), inflation)
 
     return folded
 

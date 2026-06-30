@@ -1,18 +1,34 @@
 """planners/_predict.py — shared predictive substrate for motion-aware D* Lite.
 
-This module is PURE: plain floats/ints in, deterministic output, no irsim,
-no RNG, no set-iteration.  T4 will add predict_blocked_cells() here.
+The LOGIC here is pure: plain floats/ints + numpy in, deterministic output, no
+irsim/RNG calls, no set-iteration leaking into output order. The shared grid
+geometry it builds on lives in the pure ``planners._geometry`` module; the one
+manual_astar helper it needs at runtime (``point_to_polyline_distance`` for the
+conflict gate) is lazy-imported inside ``predict_blocked_cells``.
+
+NOTE: "pure" describes the computation, NOT the import. Like every ``planners``
+submodule, importing this one runs the package ``__init__`` (which eagerly imports
+the controllers) and therefore pulls irsim + matplotlib — the documented
+"importing planners pulls irsim + matplotlib" gotcha. A headless tool does NOT
+become irsim-free by importing from here; it must still lazy-import ``planners``
+symbols inside functions.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import NamedTuple, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import numpy as np
 
-from manual_astar import OccupancyGrid, world_to_grid
+from planners._geometry import iter_disk_cells, lidar_to_world_points
+
+if TYPE_CHECKING:
+    # Annotation-only (stringified by `from __future__ import annotations`), so it
+    # never runs at import time. The one runtime manual_astar symbol — the conflict
+    # gate's point_to_polyline_distance — is lazy-imported inside predict_blocked_cells.
+    from manual_astar import OccupancyGrid
 
 # Prediction timestep in seconds.  Matches irsim step_time and DWA CONTROL_DT.
 PREDICT_DT: float = 0.1
@@ -55,16 +71,8 @@ MAX_ASSOCIATION_DISTANCE: float = 1.0
 # Assumes non-negative world bucket coordinates (the arena offset is (0, 0)).
 CLUSTER_ID_MULTIPLIER: int = 100000
 
-# Deadband (metres) below the lidar's range_max within which a return is treated
-# as a NO-HIT, not an obstacle. irsim returns a no-hit beam AT range_max, but
-# float jitter scatters a few just under it; the Arena's strict ``< range_max``
-# filter only catches the >= side, so those survivors reach the tracker as a ring
-# of points at the sensing rim. Without this cut they cluster into phantom
-# "obstacles" with spurious frame-differenced velocities (the rim moves with the
-# robot), which over-stamp the grid and make the lidar predictor net-harmful.
-# 0.05 m sits in the clean gap between real returns (<= ~4.9 m here) and the
-# ~range_max no-hit ring, and costs only the outermost 5 cm of a 5 m sensor.
-RANGE_MAX_DEADBAND: float = 0.05
+# The near-rim no-hit deadband (RANGE_MAX_DEADBAND) the LidarTracker applies when
+# projecting beams now lives with the shared projection in planners._geometry.
 
 
 class ThreatKey(NamedTuple):
@@ -301,29 +309,18 @@ class LidarTracker:
     ) -> np.ndarray:
         """Project finite lidar returns to world-frame obstacle points.
 
-        Mirrors DWA's ``_lidar_to_world_points`` exactly (duplicated rather than
-        imported to avoid a cross-module dependency on a private method): for
-        beam ``i`` with finite range ``r`` the world bearing is
-        ``theta + bearings[i]`` and the hit is ``(x + r*cos, y + r*sin)``.  NaN
-        (no-return) beams are skipped.  Returns an ``(N, 2)`` array, possibly
-        empty, with the surviving points in beam order.
+        Delegates to the shared :func:`planners._geometry.lidar_to_world_points`
+        (the one projection the family uses — formerly copy-pasted here, in DWA, and
+        inline in the occupancy fold). Passing ``self._range_max`` enables the
+        near-rim no-hit deadband: a beam coming back AT range_max with float jitter
+        survives the Arena's ``>= range_max`` filter and would otherwise cluster into
+        a phantom rim obstacle, so a RANGE_MAX_DEADBAND cut below range_max drops it
+        (``range_max == inf`` keeps every finite beam). Returns an ``(N, 2)`` array,
+        possibly empty, with the surviving points in beam order.
         """
-        ranges = np.asarray(lidar, dtype=float)
-        # Drop NaN (no-return) AND near-range_max returns. A no-hit beam comes
-        # back AT range_max with tiny float jitter; the Arena clears the
-        # >= range_max ones but a few land just under and survive, forming a ring
-        # at the sensing rim. Treating them as no-hits here (a RANGE_MAX_DEADBAND
-        # cut below range_max) keeps that ring from clustering into phantom
-        # obstacles. range_max == inf disables the cut (keeps every finite beam).
-        valid_mask = np.isfinite(ranges) & (ranges < self._range_max - RANGE_MAX_DEADBAND)
-        if not valid_mask.any():
-            return np.empty((0, 2), dtype=float)
-
-        finite_ranges = ranges[valid_mask]
-        world_angles = float(state[2]) + self._bearings[valid_mask]
-        hit_x = float(state[0]) + finite_ranges * np.cos(world_angles)
-        hit_y = float(state[1]) + finite_ranges * np.sin(world_angles)
-        return np.column_stack((hit_x, hit_y))
+        return lidar_to_world_points(
+            state, lidar, self._bearings, range_max=self._range_max
+        )
 
     def _drop_static_returns(self, points: np.ndarray) -> np.ndarray:
         """Drop every hit point whose grid cell is occupied in the static grid.
@@ -515,153 +512,6 @@ class LidarTracker:
         return tracks
 
 
-def _point_to_segment_distance(
-    px: float,
-    py: float,
-    ax: float,
-    ay: float,
-    bx: float,
-    by: float,
-) -> float:
-    """Euclidean distance from point (px, py) to segment [(ax,ay), (bx,by)].
-
-    Degenerate (zero-length) segments collapse to a point-to-point distance.
-    Pure scalar arithmetic — no numpy boxing — so the gate stays deterministic.
-    """
-    seg_dx = bx - ax
-    seg_dy = by - ay
-    seg_len_sq = seg_dx * seg_dx + seg_dy * seg_dy
-
-    if seg_len_sq < 1e-18:
-        # Degenerate segment: distance to the shared endpoint.
-        ex = px - ax
-        ey = py - ay
-        return float(np.sqrt(ex * ex + ey * ey))
-
-    # Projection parameter of the point onto the (infinite) line, clamped to
-    # the segment so we measure to the nearest point ON the segment.
-    projection = ((px - ax) * seg_dx + (py - ay) * seg_dy) / seg_len_sq
-    if projection < 0.0:
-        projection = 0.0
-    elif projection > 1.0:
-        projection = 1.0
-
-    closest_x = ax + projection * seg_dx
-    closest_y = ay + projection * seg_dy
-    dx = px - closest_x
-    dy = py - closest_y
-    return float(np.sqrt(dx * dx + dy * dy))
-
-
-def _dist_point_to_polyline(
-    px: float,
-    py: float,
-    polyline: list[np.ndarray],
-) -> float:
-    """Minimum distance from (px, py) to a polyline of (2,) world waypoints.
-
-    A single-point polyline degrades to a point-to-point distance.  The caller
-    guarantees ``len(polyline) >= 1``.
-    """
-    if len(polyline) == 1:
-        only = polyline[0]
-        dx = px - float(only[0])
-        dy = py - float(only[1])
-        return float(np.sqrt(dx * dx + dy * dy))
-
-    min_distance = np.inf
-    for index in range(len(polyline) - 1):
-        start = polyline[index]
-        end = polyline[index + 1]
-        distance = _point_to_segment_distance(
-            px,
-            py,
-            float(start[0]),
-            float(start[1]),
-            float(end[0]),
-            float(end[1]),
-        )
-        if distance < min_distance:
-            min_distance = distance
-    return float(min_distance)
-
-
-def _cell_center_within(
-    grid: OccupancyGrid,
-    cell: tuple[int, int],
-    center_x: float,
-    center_y: float,
-    radius_sq: float,
-) -> bool:
-    """True iff `cell`'s center lies within sqrt(radius_sq) of (center_x, center_y).
-
-    Uses the same cell-center formula as ``_mark_disk`` so membership matches the
-    bounding-box scan exactly.
-    """
-    row, col = cell
-    resolution = grid.resolution
-    cell_center_x = float(grid.offset[0]) + (col + 0.5) * resolution
-    cell_center_y = float(grid.offset[1]) + (row + 0.5) * resolution
-    delta_x = cell_center_x - center_x
-    delta_y = cell_center_y - center_y
-    return delta_x * delta_x + delta_y * delta_y <= radius_sq
-
-
-def _collect_disk_cells(
-    grid: OccupancyGrid,
-    center_x: float,
-    center_y: float,
-    radius: float,
-    accumulator: set[tuple[int, int]],
-    center_cell: tuple[int, int],
-) -> None:
-    """Append every grid cell whose CENTER lies within `radius` of (cx, cy).
-
-    Mirrors ``_grid._mark_disk`` exactly — the same axis-aligned bounding box
-    (clamped to the grid), the same row-major scan order, and the same cell
-    center formula ``offset + (idx + 0.5) * resolution`` with the squared-radius
-    membership test — but COLLECTS ``(row, col)`` tuples into `accumulator``
-    instead of mutating a boolean array.  Keeping the scan discipline identical
-    guarantees the collected set is independent of insertion order.
-
-    ``center_cell`` is the caller's ``world_to_grid`` conversion of the disk
-    center (the function-owns-the-conversion contract).  It is added only when it
-    genuinely passes the disk membership test, so a future center that lies
-    off-grid — where ``world_to_grid`` clamps to a non-covered border cell —
-    never contributes a spurious cell.  This keeps the result a strict function
-    of the disk geometry (a subset the bounding-box scan would also emit).
-    """
-    radius_sq = radius * radius
-
-    if _cell_center_within(grid, center_cell, center_x, center_y, radius_sq):
-        accumulator.add(center_cell)
-
-    rows, cols = grid.shape
-    resolution = grid.resolution
-    offset_x = float(grid.offset[0])
-    offset_y = float(grid.offset[1])
-
-    # Bounding box of candidate cell indices (centers within `radius`).
-    min_col = int(np.floor((center_x - radius - offset_x) / resolution))
-    max_col = int(np.floor((center_x + radius - offset_x) / resolution))
-    min_row = int(np.floor((center_y - radius - offset_y) / resolution))
-    max_row = int(np.floor((center_y + radius - offset_y) / resolution))
-
-    min_col = max(min_col, 0)
-    max_col = min(max_col, cols - 1)
-    min_row = max(min_row, 0)
-    max_row = min(max_row, rows - 1)
-
-    for row in range(min_row, max_row + 1):
-        cell_center_y = offset_y + (row + 0.5) * resolution
-        delta_y = cell_center_y - center_y
-        for col in range(min_col, max_col + 1):
-            cell_center_x = offset_x + (col + 0.5) * resolution
-            delta_x = cell_center_x - center_x
-            if delta_x * delta_x + delta_y * delta_y <= radius_sq:
-                accumulator.add((row, col))
-
-
 def predict_blocked_cells(
     tracks: list[Track],
     planned_path: list[np.ndarray],     # ordered (2,) world-frame waypoints (the robot's current committed path)
@@ -717,6 +567,11 @@ def predict_blocked_cells(
     if len(planned_path) < 1:
         return []
 
+    # The conflict gate's polyline distance comes from manual_astar's canonical
+    # helper, lazy-imported here (not at module top) so this module's top-level
+    # imports stay free of the manual_astar coupling.
+    from manual_astar import point_to_polyline_distance
+
     robot_x = float(robot_xy[0])
     robot_y = float(robot_xy[1])
     exclusion_radius_sq = exclusion_radius * exclusion_radius
@@ -738,20 +593,20 @@ def predict_blocked_cells(
                 r_k = base_radius + CONE_GROWTH_PER_STEP * k
 
             # Predicted-conflict gate: does this disk reach the path corridor?
-            distance = _dist_point_to_polyline(center_x, center_y, planned_path)
+            # Reuses manual_astar's canonical point_to_polyline_distance (open
+            # polyline) so the gate measures distance the SAME way the rest of the
+            # harness does, with no drifting private copy.
+            distance = point_to_polyline_distance(
+                np.array([center_x, center_y], dtype=float), planned_path, closed=False
+            )
             if distance <= r_k + corridor_half_width:
                 if ttc_steps is None:
                     ttc_steps = k
-                # The function owns the world->grid conversion of each future
-                # center via world_to_grid (the contract), then collects the full
-                # disk footprint with the _mark_disk-mirroring bounding-box
-                # row-major scan around that converted center.
-                center_cell = world_to_grid(
-                    np.array([center_x, center_y], dtype=float), grid
-                )
-                _collect_disk_cells(
-                    grid, center_x, center_y, r_k, cells, center_cell
-                )
+                # Collect the full disk footprint via the shared _geometry scan —
+                # the SAME bounding-box row-major scan _grid._mark_disk fills the
+                # lidar fold from — so the predicted stamp can never drift from the
+                # fold's geometry.
+                cells.update(iter_disk_cells(grid, center_x, center_y, r_k))
 
         # Drop tracks whose footprint never reaches the corridor.
         if ttc_steps is None:

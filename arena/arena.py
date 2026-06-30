@@ -3832,10 +3832,10 @@ def tc53(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure unit; synt
     """
     _ensure_repo_root_on_path()
     from manual_astar import OccupancyGrid, world_to_grid  # type: ignore[import-not-found]
+    from planners._geometry import iter_disk_cells  # type: ignore[import-not-found]
     from planners._predict import (  # type: ignore[import-not-found]
         PREDICT_DT,
         Track,
-        _collect_disk_cells,
         predict_blocked_cells,
     )
 
@@ -3873,21 +3873,19 @@ def tc53(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure unit; synt
     )
 
     # Constant-radius disk train: recompute each lookahead step's disk via the same
-    # private _collect_disk_cells helper the predictor uses (capsule => r_k is the
-    # constant body-aware band radius). The per-step disk cell COUNT must NOT grow
-    # with k (it would for a cone). Distinct k's give distinct centers, so the union
-    # is genuinely a TRAIN of equal-radius disks, not a single disk.
+    # shared planners._geometry.iter_disk_cells scan the predictor now uses (capsule
+    # => r_k is the constant body-aware band radius). The per-step disk cell COUNT
+    # must NOT grow with k (it would for a cone). Distinct k's give distinct centers,
+    # so the union is genuinely a TRAIN of equal-radius disks, not a single disk.
     base_radius = track.radius + inflation
     per_step_counts: list[int] = []
     centers: list[tuple[int, int]] = []
     for k in range(1, horizon_steps + 1):
         center_x = track.x + track.vx * k * PREDICT_DT
         center_y = track.y + track.vy * k * PREDICT_DT
-        center_cell = world_to_grid(np.array([center_x, center_y], dtype=float), grid)
-        disk: set[tuple[int, int]] = set()
-        _collect_disk_cells(grid, center_x, center_y, base_radius, disk, center_cell)
+        disk = set(iter_disk_cells(grid, center_x, center_y, base_radius))
         per_step_counts.append(len(disk))
-        centers.append(center_cell)
+        centers.append(world_to_grid(np.array([center_x, center_y], dtype=float), grid))
     assert len(set(per_step_counts)) == 1, (
         f"TC53: capsule per-step disk cell count must be CONSTANT along v (constant "
         f"radius), got varying counts {per_step_counts}"
