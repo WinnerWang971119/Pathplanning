@@ -157,6 +157,34 @@ class PredictiveDStarLiteController(DStarLiteController):
         self.last_predicted_cells: list[tuple[int, int]] = []
         self.last_tracks: list = []
 
+    def reset(
+        self,
+        world_yaml: str,
+        initial_snapshot: tuple,
+        lidar0: np.ndarray,
+        state0: np.ndarray,
+    ) -> None:
+        """Rebuild the static substrate AND clear this subclass's per-episode state.
+
+        The base ``reset`` only re-initializes its own search / cells / follower; it
+        knows nothing about the tracker, the stored snapshot, or the pending-peel
+        state this subclass adds in ``__init__``. The ``Controller`` contract allows
+        an instance to be reset and reused for a second episode, so without this
+        override the lazy ``if self._tracker is None`` guard would be skipped on
+        reuse and episode 2's first frame would be differenced against episode 1's
+        final centroids — bogus velocities, phantom stamps. Null every added member
+        back to its constructed state (``_horizon_steps`` / ``geometry`` /
+        ``wants_truth`` are construction-time config, not episode state, so they are
+        left intact). The tracker rebuilds lazily on the next non-h0 ``act()``.
+        """
+        super().reset(world_yaml, initial_snapshot, lidar0, state0)
+        self._tracker = None
+        self._snapshot = ()
+        self._pending_groups = []
+        self._last_fold = None
+        self.last_predicted_cells = []
+        self.last_tracks = []
+
     def observe_truth(self, snapshot: tuple) -> None:
         """Store the live dynamic-obstacle snapshot for the upcoming act() tick.
 
@@ -309,10 +337,17 @@ class PredictiveDStarLiteController(DStarLiteController):
                 self._unstamp_group(dropped, kept)
                 result = super()._settle_and_extract(position)
                 if result is not None:
+                    # Render overlay (T16): expose the POST-peel stamp so the debug
+                    # view never paints cells the peel un-stamped (which the robot
+                    # then routed through). Render-only — `self._cells` already
+                    # reflects the peel; this just refreshes the read-only debug attr
+                    # to the cells that are STILL stamped (the surviving groups).
+                    self.last_predicted_cells = self._stamped_cells(kept)
                     return result
 
             # Even with zero predicted stamp the grid is unsolvable: a real static
-            # dead-end. Return None so the base keeps the last valid follower.
+            # dead-end. Every predicted group was peeled, so nothing is stamped now.
+            self.last_predicted_cells = []
             return None
         except Exception:
             # Fall back to the un-peeled settle. The base returns None on failure,
@@ -374,6 +409,14 @@ class PredictiveDStarLiteController(DStarLiteController):
         follower = self._follower
         if follower is None:
             return [head]
+        # NOTE: `follower.index` is read here during the fold, BEFORE the follower
+        # advances it later in this same tick (its current_waypoint() runs inside
+        # the base act() AFTER this hook). On a tick where the robot has just reached
+        # its target waypoint the corridor therefore leads with one already-passed
+        # waypoint ([head, reached_wp, next_wp, ...]). The effect is bounded and
+        # safe: it only OVER-includes corridor area near the robot's recent past
+        # (nudging the ttc ordering at worst) — it can never drop a real threat,
+        # since a slightly longer corridor only ever admits MORE stamps, never fewer.
         remaining = follower._waypoints[follower.index:]
         return [head, *(np.asarray(wp, dtype=float) for wp in remaining)]
 
@@ -386,16 +429,40 @@ class PredictiveDStarLiteController(DStarLiteController):
         groups greedily while the cumulative cell count stays within
         :data:`MAX_STAMP_CELLS`; stop at the first group that would overflow and
         skip the rest (the budget goes to the most imminent threats).
+
+        The single most-imminent group is kept UNCONDITIONALLY — even if it alone
+        exceeds the budget. Dropping it would silently degrade the controller to
+        plain D* Lite for exactly the threat the cap claims to prioritize, so the
+        cap can never strip the highest-priority group; it only bounds the tail.
         """
         kept: list[tuple[object, list[tuple[int, int]]]] = []
         total = 0
         for group in groups:
             group_size = len(group[1])
-            if total + group_size > MAX_STAMP_CELLS:
+            # `kept and ...`: the first (most-imminent) group is appended before
+            # this guard can fire, so an oversized leading group is always kept;
+            # every later group is capped normally.
+            if kept and total + group_size > MAX_STAMP_CELLS:
                 break
             kept.append(group)
             total += group_size
         return kept
+
+    @staticmethod
+    def _stamped_cells(
+        groups: list[tuple[object, list[tuple[int, int]]]]
+    ) -> list[tuple[int, int]]:
+        """The sorted, deduped union of `groups`' cells.
+
+        After a peel the still-stamped predicted cells are exactly the union of the
+        surviving (kept) groups — ``_unstamp_group`` only ever clears a cell that no
+        kept group still lists. Used to refresh the render overlay's debug attr to
+        the post-peel footprint.
+        """
+        union: set[tuple[int, int]] = set()
+        for _key, cells in groups:
+            union.update(cells)
+        return sorted(union)
 
 
 class DStarLiteOracleController(PredictiveDStarLiteController):
