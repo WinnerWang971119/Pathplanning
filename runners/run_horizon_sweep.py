@@ -1,20 +1,22 @@
-"""Sweep driver — run the predictive D* Lite oracle across a set of prediction horizons.
+"""Sweep driver — run the predictive D* Lite family across a set of prediction horizons.
 
 Phase 7 (Predictive / motion-aware D* Lite). The predictive D* Lite family stamps
 each obstacle's predicted future footprint into the occupancy grid so the planner
 routes *behind* moving traffic. The lookahead is the ``--predict-horizon`` knob
 (integer steps; T seconds = steps x PREDICT_DT, PREDICT_DT = 0.1). This module is
-the top-level orchestrator that sweeps that horizon for ``d_star_lite_oracle`` so
-``plot_horizon_sweep`` can chart failure rate / time-to-goal vs lookahead — the
-AC1 go/no-go deliverable.
+the top-level orchestrator that sweeps that horizon for BOTH predictive keys — the
+``d_star_lite_oracle`` (perfect velocities, the motion-aware ceiling) and the
+``d_star_lite_predictive`` lidar estimator (frame-differencing velocities, the
+realizable variant) — so ``plot_horizon_sweep`` can chart failure rate /
+time-to-goal vs lookahead for each, the AC1 go/no-go deliverable.
 
 It is a sibling of ``runners.run_speed_sweep``: where the speed sweep loops the 4
-named speed regimes x a planner set, this driver loops the swept horizons x a
-(currently single-key) experimental planner set and shells ``run_experiment`` once
-per (horizon, planner). Going through a subprocess (rather than calling
-``run_experiment.main()`` in-process) keeps each run isolated from the others'
-``sys.path`` / irsim import side effects and mirrors the established two-tier
-subprocess pattern, so per-episode byte-determinism carries over unchanged.
+named speed regimes x a planner set, this driver loops the swept horizons x the
+predictive planner set (both keys in :data:`SWEEP_ALGORITHMS`) and shells
+``run_experiment`` once per (horizon, planner). Going through a subprocess (rather
+than calling ``run_experiment.main()`` in-process) keeps each run isolated from the
+others' ``sys.path`` / irsim import side effects and mirrors the established
+two-tier subprocess pattern, so per-episode byte-determinism carries over unchanged.
 
 No per-horizon subtree:
 
@@ -41,9 +43,10 @@ CLI:
         [--horizons H ...]       # default 0 5 10 20 (steps); a list of ints
 
 Swept planner set:
-    SWEEP_ALGORITHMS lists which predictive keys to sweep. For T8 it holds only
-    ``d_star_lite_oracle``; T13 adds ``d_star_lite_predictive`` by extending the
-    tuple (a one-line change — the per-(horizon, planner) loop already iterates it).
+    SWEEP_ALGORITHMS lists which predictive keys to sweep. It holds both the
+    ``d_star_lite_oracle`` (perfect-velocity ceiling) and the
+    ``d_star_lite_predictive`` (lidar frame-differencing estimator) keys; the
+    per-(horizon, planner) loop runs each at every horizon.
 
 Exit codes:
     0 — every (horizon, planner) child subprocess exited 0 (ran to completion)
@@ -59,7 +62,6 @@ mirroring run_all / run_experiment / run_speed_sweep.
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,14 +73,17 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from runners._sweep_run import (  # noqa: E402
+    SweepJob,
+    add_common_sweep_args,
+    run_jobs,
+    summarize,
+)
 from runners.run_all import (  # noqa: E402
     DEFAULT_MASTER_SEED,
     DEFAULT_NUM_SEEDS,
 )
 
-
-DEFAULT_JOBS = 1                         # per-child run_experiment concurrency
-DEFAULT_RESULTS_DIR = "results"
 
 # The horizon steps swept by default: 0/5/10/20 steps == 0.0/0.5/1.0/2.0 s at
 # PREDICT_DT = 0.1. h0 stamps nothing and is the plain-D*-Lite baseline/ablation.
@@ -144,16 +149,6 @@ def build_experiment_cmd(
 
 
 @dataclass(frozen=True)
-class SweepResult:
-    """Outcome of one (horizon, planner) child `run_experiment` subprocess."""
-
-    horizon: int
-    algorithm: str
-    exit_code: int          # child return code; 0 == ran to completion
-    ok: bool                # exit_code == 0
-
-
-@dataclass(frozen=True)
 class RunnerArgs:
     """Parsed CLI arguments — frozen so accidental mutation is impossible."""
 
@@ -171,55 +166,22 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
     parser = argparse.ArgumentParser(
         prog="runners.run_horizon_sweep",
         description=(
-            "Run the predictive D* Lite oracle across a set of prediction horizons "
-            "(Phase 7 horizon sweep driver)."
+            "Run the predictive D* Lite family (the d_star_lite_oracle ceiling and "
+            "the d_star_lite_predictive lidar estimator) across a set of prediction "
+            "horizons (Phase 7 horizon sweep driver)."
         ),
     )
-    parser.add_argument(
-        "--world",
-        required=True,
-        help="Path to the world YAML (e.g. arena/arena_v1.yaml).",
-    )
-    parser.add_argument(
-        "--master-seed",
-        type=int,
-        default=DEFAULT_MASTER_SEED,
-        help=f"Master seed for the seed derivation (default {DEFAULT_MASTER_SEED}).",
-    )
-    parser.add_argument(
-        "--num-seeds",
-        type=int,
-        default=DEFAULT_NUM_SEEDS,
-        help=f"Seeds per (horizon, planner) (default {DEFAULT_NUM_SEEDS}).",
-    )
-    parser.add_argument(
-        "--jobs",
-        type=int,
-        default=DEFAULT_JOBS,
-        help="Concurrency forwarded to each child run_experiment (default 1).",
-    )
-    parser.add_argument(
-        "--results-dir",
-        default=DEFAULT_RESULTS_DIR,
-        help=(
+    add_common_sweep_args(
+        parser,
+        master_seed_default=DEFAULT_MASTER_SEED,
+        num_seeds_default=DEFAULT_NUM_SEEDS,
+        num_seeds_help=f"Seeds per (horizon, planner) (default {DEFAULT_NUM_SEEDS}).",
+        results_dir_help=(
             "Output directory root; each horizon writes "
-            "<results-dir>/<world_stem>/d_star_lite_oracle_h<H>/ (the label folds "
-            "in the horizon, so no per-horizon subtree is needed)."
+            "<results-dir>/<world_stem>/<key>_h<H>/ (the label folds in the "
+            "horizon, so no per-horizon subtree is needed)."
         ),
     )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Skip seeds whose <seed>.json already exists; forwarded to each child (default: overwrite).",
-    )
-    traffic_group = parser.add_mutually_exclusive_group()
-    traffic_group.add_argument(
-        "--traffic", dest="traffic", action="store_true", help="Enable crossing traffic (default)."
-    )
-    traffic_group.add_argument(
-        "--no-traffic", dest="traffic", action="store_false", help="Disable traffic."
-    )
-    parser.set_defaults(traffic=True)
     parser.add_argument(
         "--horizons",
         type=int,
@@ -280,7 +242,6 @@ def main(argv: list[str] | None = None) -> int:
 
     horizons = list(args.horizons)
     algorithms = list(SWEEP_ALGORITHMS)
-    total = len(horizons) * len(algorithms)
 
     print(
         f"run_horizon_sweep: world_stem={world_abs.stem} "
@@ -291,11 +252,12 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
 
-    results: list[SweepResult] = []
-    index = 0
+    # Build the (horizon x planner) job list in the same nested order the [i/N]
+    # numbering used to follow; build_experiment_cmd is pure (no I/O), so building
+    # every job up front before launching any is behavior-preserving.
+    jobs: list[SweepJob] = []
     for horizon in horizons:
         for algorithm in algorithms:
-            index += 1
             cmd = build_experiment_cmd(
                 algorithm,
                 world_abs_str,
@@ -307,50 +269,16 @@ def main(argv: list[str] | None = None) -> int:
                 traffic=args.traffic,
                 resume=args.resume,
             )
-            print(
-                f"[sweep {index}/{total}] horizon={horizon} {algorithm}: launching",
-                flush=True,
-            )
-            try:
-                proc = subprocess.run(cmd, cwd=str(_REPO_ROOT))
-                exit_code = proc.returncode
-            except OSError as exc:
-                # The child never started (e.g. a missing interpreter). Treat it like
-                # a non-zero exit so the sweep continues and the failure is reported.
-                print(
-                    f"[sweep {index}/{total}] horizon={horizon} {algorithm}: "
-                    f"failed to spawn child: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                exit_code = 1
-            ok = exit_code == 0
-            print(
-                f"[sweep {index}/{total}] horizon={horizon} {algorithm} exit={exit_code}",
-                flush=True,
-            )
-            results.append(
-                SweepResult(
-                    horizon=horizon,
-                    algorithm=algorithm,
-                    exit_code=exit_code,
-                    ok=ok,
+            jobs.append(
+                SweepJob(
+                    display_label=f"horizon={horizon} {algorithm}",
+                    roster_label=f"[horizon={horizon}] {algorithm}",
+                    argv=cmd,
                 )
             )
 
-    failures = [r for r in results if not r.ok]
-    n_total = len(results)
-    n_ok = n_total - len(failures)
-    print(
-        f"done: {n_ok}/{n_total} (horizon, planner) runs exited 0, {len(failures)} runner-failed.",
-        flush=True,
-    )
-    if failures:
-        print("runner failures:", file=sys.stderr)
-        for r in failures:
-            print(f"  [horizon={r.horizon}] {r.algorithm} exit={r.exit_code}", file=sys.stderr)
-        return 1
-    return 0
+    outcomes = run_jobs(jobs, cwd=str(_REPO_ROOT))
+    return summarize(outcomes, unit="(horizon, planner)")
 
 
 if __name__ == "__main__":

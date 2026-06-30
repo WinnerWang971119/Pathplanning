@@ -87,6 +87,18 @@ from runners.plot import (
 )
 from runners._layout import episode_out_dir
 
+# Shared headless sweep-plot helpers (the line-chart render, the synthetic
+# metrics-record builder, the matplotlib-absent guard TC, the self-check loop, and
+# the NaN sentinel). `runners._sweep_plot` is headless at import, so this pulls
+# neither irsim nor matplotlib.
+from runners._sweep_plot import (
+    is_nan as _is_nan,
+    make_selfcheck_record,
+    render_line_chart,
+    run_selfcheck_suite,
+    tc_matplotlib_guard,
+)
+
 
 # --- Module constants -------------------------------------------------------
 
@@ -118,10 +130,6 @@ SUMMARY_CSV_NAME = "horizon_sweep_summary.csv"
 PLOTS_DIR_NAME = "horizon_sweep_plots"     # default out-dir leaf under <results-dir>/<world_stem>/
 FAILURE_CHART_NAME = "failure_rate_vs_horizon.png"
 MEDIAN_CHART_NAME = "median_time_vs_horizon.png"
-
-# Marker shape used for the per-algorithm line points (one shape; color carries
-# the algorithm identity via the shared color map).
-LINE_MARKER = "o"
 
 
 def horizon_seconds(horizon_steps: int) -> float:
@@ -272,11 +280,6 @@ class AlgoSeries:
     present_anywhere: bool
 
 
-def _is_nan(value: float) -> bool:
-    """True iff `value` is NaN (the loader's "no data" sentinel for floats)."""
-    return value != value
-
-
 def build_series(
     horizon_results: dict[str, dict[int, AlgoSummary]],
     horizons: tuple[int, ...] | list[int],
@@ -373,100 +376,34 @@ def _render_line_chart(
     y_label: str,
     y_lim: tuple[float, float] | None,
 ) -> Path:
-    """Render one per-algorithm line chart (x = horizon seconds) and save it.
+    """Render one per-algorithm line chart (x = horizon seconds) via the shared renderer.
 
-    `value_attr` selects the y series on each `AlgoSeries` (`"failure_rates"` or
-    `"median_times"`). Points whose y value is NaN are skipped (a horizon where the
-    algorithm was present but never succeeded has a NaN median time), so a line is
-    drawn only through the horizons that have a finite value. The x ticks are the
-    full swept horizon set (in seconds) regardless of which points each line has,
-    so a gap reads as a gap. A side legend maps each line color to its algorithm
-    display name, mirroring plot_speed_sweep's legend placement.
+    Fills in this plotter's x-axis specifics — one tick per swept horizon at its
+    `horizon_seconds`, the "prediction horizon T" x label, `algo.seconds` as the
+    per-point x values, and `algo.algorithm` as the color key — then delegates the
+    actual drawing/saving to `runners._sweep_plot.render_line_chart` (shared with
+    the speed plotter). The x ticks are the full swept horizon set regardless of
+    which points each line has, so a gap reads as a gap.
     """
-    fig, ax = plt.subplots(figsize=(11, 7))
-
-    # The x ticks are every swept horizon in seconds, labelled "<T>s\n(<steps> st)".
     ordered_horizons = list(horizons)
     tick_positions = [horizon_seconds(h) for h in ordered_horizons]
     tick_labels = [f"{horizon_seconds(h):g}s\n({h} st)" for h in ordered_horizons]
-
-    drawn_handles = []
-    for algo in series:
-        color = color_map.get(algo.algorithm, "#333333")
-        values = getattr(algo, value_attr)
-
-        # Keep only the finite (seconds, value) points; a NaN value (e.g. NaN
-        # median time at a present-but-0-success horizon) is a gap in THIS line.
-        xs: list[float] = []
-        ys: list[float] = []
-        for seconds, value in zip(algo.seconds, values):
-            if _is_nan(value):
-                continue
-            xs.append(seconds)
-            ys.append(value)
-
-        if not xs:
-            # No finite points for this chart (e.g. an algo that never succeeded
-            # in any horizon on the median-time chart): omit its line entirely.
-            continue
-
-        (line,) = ax.plot(
-            xs,
-            ys,
-            marker=LINE_MARKER,
-            markersize=7,
-            linewidth=1.8,
-            color=color,
-            markeredgecolor="black",
-            markeredgewidth=0.6,
-            label=algo.display,
-            zorder=3,
-        )
-        drawn_handles.append(line)
-
-    ax.set_xlabel("prediction horizon T (seconds; steps x 0.1)")
-    ax.set_ylabel(y_label)
-    ax.set_title(title)
-    ax.set_xticks(tick_positions)
-    ax.set_xticklabels(tick_labels, fontsize=9)
-    if y_lim is not None:
-        ax.set_ylim(*y_lim)
-    ax.grid(True, linestyle=":", alpha=0.4, zorder=0)
-    ax.set_axisbelow(True)
-
-    # Side legend (color -> algorithm), placed outside the axes like plot_speed_sweep.
-    if drawn_handles:
-        legend = ax.legend(
-            handles=drawn_handles,
-            title="algorithm",
-            loc="upper left",
-            bbox_to_anchor=(1.02, 1.0),
-            fontsize=8,
-            title_fontsize=9,
-            borderaxespad=0.0,
-        )
-        extra = (legend,)
-    else:
-        # No drawable series for this chart; annotate so the PNG is not blank.
-        ax.annotate(
-            "no data to plot",
-            xy=(0.5, 0.5),
-            xycoords="axes fraction",
-            ha="center",
-            va="center",
-            fontsize=12,
-            color="#999999",
-            fontweight="bold",
-        )
-        extra = ()
-
-    fig.tight_layout()
-    out_path = out_dir / out_name
-    # The legend sits OUTSIDE the axes; pass it to savefig so bbox_inches="tight"
-    # includes it (it may otherwise clip out-of-axes artists).
-    fig.savefig(out_path, dpi=150, bbox_inches="tight", bbox_extra_artists=extra)
-    plt.close(fig)
-    return out_path
+    return render_line_chart(
+        series,
+        color_map,
+        plt,
+        out_dir,
+        tick_positions=tick_positions,
+        tick_labels=tick_labels,
+        x_label="prediction horizon T (seconds; steps x 0.1)",
+        x_getter=lambda algo: algo.seconds,
+        color_key=lambda algo: algo.algorithm,
+        value_attr=value_attr,
+        out_name=out_name,
+        title=title,
+        y_label=y_label,
+        y_lim=y_lim,
+    )
 
 
 def chart_failure_rate_vs_horizon(
@@ -594,44 +531,6 @@ _SELFCHECK_METRIC_KEYS = (
 _ORACLE = "d_star_lite_oracle"
 
 
-def _make_record(
-    outcome: str,
-    *,
-    time_to_goal: float | None = None,
-) -> dict:
-    """Build one synthetic 7-key metrics record for the given outcome.
-
-    Mirrors `runners.plot._make_record` but kept local so the selfcheck stays
-    self-contained (and so a future plot.py refactor cannot silently break it). A
-    "success" record carries a non-null `time_to_goal`; every other outcome sets
-    its flag (or `planner_error` string) with `time_to_goal` null.
-    """
-    record = {
-        "time_to_goal": None,
-        "crashed": False,
-        "timed_out": False,
-        "path_length": 0.0,
-        "mean_speed": 0.0,
-        "wallclock_per_step": 0.01,
-        "planner_error": None,
-    }
-    if outcome == "success":
-        if time_to_goal is None:
-            raise ValueError("a success record needs a time_to_goal")
-        record["time_to_goal"] = float(time_to_goal)
-        record["path_length"] = 65.0 + float(time_to_goal)
-        record["mean_speed"] = record["path_length"] / float(time_to_goal)
-    elif outcome == "crash":
-        record["crashed"] = True
-    elif outcome == "timeout":
-        record["timed_out"] = True
-    elif outcome == "planner_error":
-        record["planner_error"] = "synthetic planner failure"
-    else:
-        raise ValueError(f"unknown outcome {outcome!r}")
-    return record
-
-
 def _write_horizon_algo_tree(
     *,
     results_root: Path,
@@ -669,9 +568,9 @@ def _write_horizon_algo_tree(
             else:
                 time_value = ramp
                 ramp += 5.0
-            record = _make_record("success", time_to_goal=time_value)
+            record = make_selfcheck_record("success", time_to_goal=time_value)
         else:
-            record = _make_record(outcome)
+            record = make_selfcheck_record(outcome)
         (label_dir / f"{seed}.json").write_text(
             json.dumps(record, sort_keys=True), encoding="utf-8"
         )
@@ -898,11 +797,11 @@ def _tc_s6_manifest_roster_dnf(tmp: Path) -> str:
     # Two seeds have JSON (1 success, 1 crash); a third was killed at the wallclock
     # wall (status=runner_error, no JSON) -> it must count as a DNF failure.
     (label_dir / "1.json").write_text(
-        json.dumps(_make_record("success", time_to_goal=22.0), sort_keys=True),
+        json.dumps(make_selfcheck_record("success", time_to_goal=22.0), sort_keys=True),
         encoding="utf-8",
     )
     (label_dir / "2.json").write_text(
-        json.dumps(_make_record("crash"), sort_keys=True), encoding="utf-8"
+        json.dumps(make_selfcheck_record("crash"), sort_keys=True), encoding="utf-8"
     )
     manifest = {
         "derived_seeds": [1, 2, 3],
@@ -929,40 +828,8 @@ def _tc_s6_manifest_roster_dnf(tmp: Path) -> str:
     return "manifest roster authoritative: runner_error seed folds in as a DNF (2/3 failure)"
 
 
-def _tc_s7_matplotlib_guard(_tmp: Path) -> str:
-    """TC-S7: the matplotlib-absent guard exits non-zero (patch find_spec, like plot.py's TC-P8)."""
-    import importlib.util
-    import io
-    import contextlib
-
-    real_find_spec = importlib.util.find_spec
-
-    def fake_find_spec(name, *args, **kwargs):
-        if name == "matplotlib":
-            return None
-        return real_find_spec(name, *args, **kwargs)
-
-    stderr_capture = io.StringIO()
-    importlib.util.find_spec = fake_find_spec
-    try:
-        with contextlib.redirect_stderr(stderr_capture):
-            try:
-                ensure_matplotlib()
-            except SystemExit as exc:
-                code = exc.code
-            else:
-                raise AssertionError("ensure_matplotlib must raise SystemExit when matplotlib is absent")
-    finally:
-        importlib.util.find_spec = real_find_spec
-
-    assert code is not None and code != 0, f"the guard must exit non-zero, got {code!r}"
-    message = stderr_capture.getvalue()
-    assert "pip install -r requirements.txt" in message, \
-        f"the guard must print the pip hint, stderr was: {message!r}"
-    return "find_spec=None -> SystemExit non-zero + pip hint printed"
-
-
-# Ordered registry of the self-check cases. Each entry is (id, callable).
+# Ordered registry of the self-check cases. Each entry is (id, callable). TC-S7 is
+# the shared matplotlib-absent guard (`tc_matplotlib_guard`); the rest are local.
 _SELFCHECK_CASES = (
     ("TC-S1", _tc_s1_loader_aggregates),
     ("TC-S2", _tc_s2_x_positions_are_seconds),
@@ -970,38 +837,20 @@ _SELFCHECK_CASES = (
     ("TC-S4", _tc_s4_missing_horizon_is_gap),
     ("TC-S5", _tc_s5_summary_csv),
     ("TC-S6", _tc_s6_manifest_roster_dnf),
-    ("TC-S7", _tc_s7_matplotlib_guard),
+    ("TC-S7", tc_matplotlib_guard),
 )
 
 
 def run_selfcheck() -> int:
     """Run the horizon-sweep plotter's self-check suite (TC-S1..TC-S7). Return 0 if all pass, else 1.
 
-    Builds every fixture inside a single TemporaryDirectory (each TC namespaces its
-    own subdir), runs each TC in isolation so one failure never aborts the rest,
-    prints a per-TC PASS/FAIL line, and ends with an "N/M passed" summary. No
-    irsim, no real episodes — synthetic per-horizon JSON trees only. Charts are
-    rendered through the real chart functions under the headless Agg backend
-    selected by `ensure_matplotlib()`.
+    Delegates to the shared `runners._sweep_plot.run_selfcheck_suite` harness with
+    this plotter's case registry and tempdir prefix: it builds every fixture inside
+    a single TemporaryDirectory, runs each TC in isolation so one failure never
+    aborts the rest, prints a per-TC PASS/FAIL line, and ends with an "N/M passed"
+    summary. No irsim, no real episodes — synthetic per-horizon JSON trees only.
     """
-    import tempfile
-
-    n_passed = 0
-    n_total = len(_SELFCHECK_CASES)
-
-    with tempfile.TemporaryDirectory(prefix="horizon_sweep_selfcheck_") as tmp_name:
-        tmp = Path(tmp_name)
-        for tc_id, tc_func in _SELFCHECK_CASES:
-            try:
-                detail = tc_func(tmp)
-            except Exception as exc:  # noqa: BLE001 — one TC must not abort the suite
-                print(f"{tc_id}: FAIL - {type(exc).__name__}: {exc}")
-            else:
-                n_passed += 1
-                print(f"{tc_id}: PASS - {detail}")
-
-    print(f"selfcheck: {n_passed}/{n_total} passed")
-    return 0 if n_passed == n_total else 1
+    return run_selfcheck_suite(_SELFCHECK_CASES, tempdir_prefix="horizon_sweep_selfcheck_")
 
 
 # --- CLI --------------------------------------------------------------------

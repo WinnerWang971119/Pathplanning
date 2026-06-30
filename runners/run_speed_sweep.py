@@ -62,7 +62,6 @@ mirroring run_all / run_experiment.
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,6 +75,12 @@ if str(_REPO_ROOT) not in sys.path:
 
 from arena.speed_regimes import SPEED_REGIMES  # noqa: E402
 from planners import algorithm_label  # noqa: E402
+from runners._sweep_run import (  # noqa: E402
+    SweepJob,
+    add_common_sweep_args,
+    run_jobs,
+    summarize,
+)
 from runners.run_all import (  # noqa: E402
     DEFAULT_MASTER_SEED,
     DEFAULT_NUM_SEEDS,
@@ -83,8 +88,6 @@ from runners.run_all import (  # noqa: E402
 )
 
 
-DEFAULT_JOBS = 1                         # per-child run_experiment concurrency
-DEFAULT_RESULTS_DIR = "results"
 SPEED_SUBDIR_PREFIX = "speed_"           # results-dir suffix per regime; the child
                                          # re-inserts <world_stem>/<label> beneath it
 
@@ -183,17 +186,6 @@ def build_experiment_cmd(
 
 
 @dataclass(frozen=True)
-class SweepResult:
-    """Outcome of one (regime, planner) child `run_experiment` subprocess."""
-
-    regime: str
-    algorithm: str
-    label: str
-    exit_code: int          # child return code; 0 == ran to completion
-    ok: bool                # exit_code == 0
-
-
-@dataclass(frozen=True)
 class RunnerArgs:
     """Parsed CLI arguments — frozen so accidental mutation is impossible."""
 
@@ -212,10 +204,15 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         prog="runners.run_speed_sweep",
         description="Run a planner set across the 4 named obstacle-speed regimes (Phase 7 sweep driver).",
     )
-    parser.add_argument(
-        "--world",
-        required=True,
-        help="Path to the world YAML (e.g. arena/arena_v1.yaml).",
+    add_common_sweep_args(
+        parser,
+        master_seed_default=DEFAULT_MASTER_SEED,
+        num_seeds_default=DEFAULT_NUM_SEEDS,
+        num_seeds_help=f"Seeds per (regime, planner) (default {DEFAULT_NUM_SEEDS}).",
+        results_dir_help=(
+            "Output directory root; each regime writes "
+            "<results-dir>/speed_<regime>/<world_stem>/<label>/."
+        ),
     )
     parser.add_argument(
         "--algorithms",
@@ -226,42 +223,6 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
             f"{', '.join(FOCUS_SET)}; 'all' = the 11 canonical planners."
         ),
     )
-    parser.add_argument(
-        "--master-seed",
-        type=int,
-        default=DEFAULT_MASTER_SEED,
-        help=f"Master seed for the seed derivation (default {DEFAULT_MASTER_SEED}).",
-    )
-    parser.add_argument(
-        "--num-seeds",
-        type=int,
-        default=DEFAULT_NUM_SEEDS,
-        help=f"Seeds per (regime, planner) (default {DEFAULT_NUM_SEEDS}).",
-    )
-    parser.add_argument(
-        "--jobs",
-        type=int,
-        default=DEFAULT_JOBS,
-        help="Concurrency forwarded to each child run_experiment (default 1).",
-    )
-    parser.add_argument(
-        "--results-dir",
-        default=DEFAULT_RESULTS_DIR,
-        help="Output directory root; each regime writes <results-dir>/speed_<regime>/<world_stem>/<label>/.",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Skip seeds whose <seed>.json already exists; forwarded to each child (default: overwrite).",
-    )
-    traffic_group = parser.add_mutually_exclusive_group()
-    traffic_group.add_argument(
-        "--traffic", dest="traffic", action="store_true", help="Enable crossing traffic (default)."
-    )
-    traffic_group.add_argument(
-        "--no-traffic", dest="traffic", action="store_false", help="Disable traffic."
-    )
-    parser.set_defaults(traffic=True)
     ns = parser.parse_args(argv)
     return RunnerArgs(
         world=ns.world,
@@ -305,7 +266,6 @@ def main(argv: list[str] | None = None) -> int:
     # x the planner-set order. Deterministic run to run so the [i/N] numbering and
     # the failure roster are reproducible.
     regimes = list(SPEED_REGIMES)
-    total = len(regimes) * len(planners)
 
     print(
         f"run_speed_sweep: world_stem={world_abs.stem} algorithms={args.algorithms} "
@@ -314,12 +274,13 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
 
-    results: list[SweepResult] = []
-    index = 0
+    # Build the (regime x planner) job list in the same nested order the [i/N]
+    # numbering used to follow; build_experiment_cmd is pure (no I/O), so building
+    # every job up front before launching any is behavior-preserving.
+    jobs: list[SweepJob] = []
     for regime in regimes:
         regime_dir = regime_results_dir(results_root_abs, regime)
         for algorithm, replan_k, label in planners:
-            index += 1
             cmd = build_experiment_cmd(
                 algorithm,
                 replan_k,
@@ -332,44 +293,16 @@ def main(argv: list[str] | None = None) -> int:
                 traffic=args.traffic,
                 resume=args.resume,
             )
-            print(f"[sweep {index}/{total}] regime={regime} {label}: launching", flush=True)
-            try:
-                proc = subprocess.run(cmd, cwd=str(_REPO_ROOT))
-                exit_code = proc.returncode
-            except OSError as exc:
-                # The child never started (e.g. a missing interpreter). Treat it like
-                # a non-zero exit so the sweep continues and the failure is reported.
-                print(
-                    f"[sweep {index}/{total}] regime={regime} {label}: failed to spawn child: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                exit_code = 1
-            ok = exit_code == 0
-            print(f"[sweep {index}/{total}] regime={regime} {label} exit={exit_code}", flush=True)
-            results.append(
-                SweepResult(
-                    regime=regime,
-                    algorithm=algorithm,
-                    label=label,
-                    exit_code=exit_code,
-                    ok=ok,
+            jobs.append(
+                SweepJob(
+                    display_label=f"regime={regime} {label}",
+                    roster_label=f"[regime={regime}] {label}",
+                    argv=cmd,
                 )
             )
 
-    failures = [r for r in results if not r.ok]
-    n_total = len(results)
-    n_ok = n_total - len(failures)
-    print(
-        f"done: {n_ok}/{n_total} (regime, planner) runs exited 0, {len(failures)} runner-failed.",
-        flush=True,
-    )
-    if failures:
-        print("runner failures:", file=sys.stderr)
-        for r in failures:
-            print(f"  [regime={r.regime}] {r.label} exit={r.exit_code}", file=sys.stderr)
-        return 1
-    return 0
+    outcomes = run_jobs(jobs, cwd=str(_REPO_ROOT))
+    return summarize(outcomes, unit="(regime, planner)")
 
 
 if __name__ == "__main__":
