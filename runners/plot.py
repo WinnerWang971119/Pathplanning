@@ -89,12 +89,15 @@ STRAIGHT_LINE_IDEAL_M = 46.0 * (2.0 ** 0.5)   # ~= 65.05 m
 # The algorithm set charted on the scatter, in legend order. Each tuple is
 # (registry name, replan_k or None, predict_horizon or None, family, display).
 # load_world_results() folds the replan_k / predict_horizon into the dir label
-# (a_star_replan_k5, d_star_lite_predictive_h10) so the label matches the dir
-# run_experiment wrote. The first 11 are the canonical Mission set; the last,
-# d_star_lite_predictive, is the experimental motion-aware planner shown at its
-# proven horizon (h10) so the headline scatter can include it. It is NOT in
-# run_all's canonical-11 (that set, and TC-P10's count, stay 11) — adding it here
-# only changes what this chart draws, not the canonical experiment.
+# (a_star_replan_k5) so the label matches the dir run_experiment wrote. These are
+# exactly the 11 canonical Mission planners run_all writes — the same set, and the
+# same order, as run_all._CANONICAL_ORDER. The experimental motion-aware keys
+# (d_star_lite_oracle / d_star_lite_predictive) are EXCLUDED here on purpose: they
+# are held out of run_all's canonical-11 (EXPERIMENTAL_KEYS), so their `_h<steps>`
+# label dirs are never written by the documented run_all -> plot workflow. Charting
+# one here would draw a data-less line on every chart (the headline A1 scatter
+# included). The predictive family's results live on the horizon-sweep charts
+# (`runners.plot_horizon_sweep`), their proper experimental venue.
 CANONICAL: list[tuple[str, int | None, int | None, str, str]] = [
     ("a_star_once",            None, None, "grid",        "A* once"),
     ("a_star_replan",          5,    None, "grid",        "A* replan (K=5)"),
@@ -107,7 +110,6 @@ CANONICAL: list[tuple[str, int | None, int | None, str, str]] = [
     ("rrt_replan",             5,    None, "sampling",    "RRT replan (K=5)"),
     ("rrt_star_once",          None, None, "sampling",    "RRT* once"),
     ("rrt_star_replan",        5,    None, "sampling",    "RRT* replan (K=5)"),
-    ("d_star_lite_predictive", None, 10,   "predictive",  "D* Lite (predictive, h10)"),
 ]
 
 
