@@ -12,6 +12,8 @@ CLI:
         --seed <int>            # required
         --world <yaml_path>     # required; e.g. arena/arena_v1.yaml
         [--replan-k <int>]      # required for the _replan family, forbidden otherwise
+        [--predict-horizon <int>] # required for the predictive D* Lite family
+                                #   (d_star_lite_oracle/_predictive), forbidden otherwise
         [--render]              # optional flag; default False
         [--results-dir <dir>]   # optional; default "results"
         [--traffic|--no-traffic]# optional; Phase 2 crossing traffic, default ON
@@ -100,6 +102,7 @@ class RunnerArgs:
     seed: int
     world: str
     replan_k: int | None
+    predict_horizon: int | None
     render: bool
     results_dir: str
     traffic: bool
@@ -141,6 +144,16 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         ),
     )
     parser.add_argument(
+        "--predict-horizon",
+        type=int,
+        default=None,
+        help=(
+            "Prediction lookahead in steps for the predictive D* Lite family "
+            "(d_star_lite_oracle / d_star_lite_predictive). Required for those "
+            "algorithms, forbidden for the rest."
+        ),
+    )
+    parser.add_argument(
         "--render",
         action="store_true",
         help="Open an irsim render window (default: headless).",
@@ -177,6 +190,7 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         seed=int(ns.seed),
         world=ns.world,
         replan_k=None if ns.replan_k is None else int(ns.replan_k),
+        predict_horizon=None if ns.predict_horizon is None else int(ns.predict_horizon),
         render=bool(ns.render),
         results_dir=ns.results_dir,
         traffic=bool(ns.traffic),
@@ -263,7 +277,9 @@ def main(argv: list[str] | None = None) -> int:
     # for a _replan family, forbidden for a non-replan family, or out of range) is
     # reported as a config error (exit 2) rather than a planner failure (exit 0).
     try:
-        controller: Controller = build_controller(args.algorithm, args.replan_k)
+        controller: Controller = build_controller(
+            args.algorithm, args.replan_k, args.predict_horizon
+        )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -286,7 +302,9 @@ def main(argv: list[str] | None = None) -> int:
     # collide; the <seed>.json / <seed>.trace.jsonl filenames are unchanged.
     world_stem = Path(args.world).stem
     out_dir = episode_out_dir(
-        args.results_dir, world_stem, algorithm_label(args.algorithm, args.replan_k)
+        args.results_dir,
+        world_stem,
+        algorithm_label(args.algorithm, args.replan_k, args.predict_horizon),
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / f"{args.seed}.json"
@@ -348,6 +366,12 @@ def main(argv: list[str] | None = None) -> int:
         # follower/replan logic and must never raise on a mid-episode replan
         # failure, so no per-step guard is needed here.
         state, lidar = state0, lidar0
+        # `current_info` always holds the EpisodeInfo from the SAME source call
+        # that produced the current `state`/`lidar`: at t=0 that is reset()'s
+        # `info0`; thereafter the same `arena.step(...)` return. The truth seam
+        # below reads `current_info.dynamic_obstacles` so the snapshot an oracle
+        # observes is tick-aligned with the `state`/`lidar` its `act()` receives.
+        current_info = info0
         path_length = 0.0
         total_wallclock = 0.0
         prev_xy = state0[:2].copy()
@@ -356,7 +380,26 @@ def main(argv: list[str] | None = None) -> int:
         info = None
 
         while not done:
+            # Truth seam (opt-in): hand the oracle the live dynamic-obstacle
+            # snapshot that matches the `state`/`lidar` this `act()` will see —
+            # both come from `current_info`'s source call. `getattr(...)` keeps
+            # the 11 existing controllers (which never define `wants_truth`)
+            # untouched: `observe_truth` is never called for them.
+            if getattr(controller, "wants_truth", False):
+                controller.observe_truth(current_info.dynamic_obstacles)
             action = controller.act(state, lidar)
+            # Render-only prediction overlay (T16). Strictly read-only w.r.t.
+            # state/lidar/action/trace/metrics: it only paints the controller's
+            # last predicted footprint + velocity arrows on irsim's axes. Gated
+            # on args.render so the draw path is NEVER entered headless (AC11
+            # determinism guard). `getattr` keeps the 11 non-predictive
+            # controllers (no such attrs) unaffected; draw_prediction itself is
+            # also a no-op unless the Arena is in render mode.
+            if args.render:
+                arena.draw_prediction(
+                    getattr(controller, "last_predicted_cells", []),
+                    getattr(controller, "last_tracks", []),
+                )
             state, lidar, done, info = arena.step(action)
             step_count += 1
             path_length += float(np.linalg.norm(state[:2] - prev_xy))
@@ -373,6 +416,9 @@ def main(argv: list[str] | None = None) -> int:
                 done=done,
                 dynamic_obstacles_sha256=info.dynamic_obstacles_sha256,
             )
+            # Advance the matching info so the NEXT iteration's `observe_truth`
+            # reads the snapshot tick-aligned with the new `state`/`lidar`.
+            current_info = info
 
         # Defensive: the only way `info` is None here is a zero-iteration loop,
         # which can't happen because `done` starts False. Keep the guard so a

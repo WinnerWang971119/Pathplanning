@@ -115,6 +115,7 @@ from planners._grid import (
     register,
     segment_is_clear_grid,
 )
+from planners._types import Path
 
 # The eight 8-connected neighbour deltas, in the SAME order as
 # manual_astar.astar_search. Order is load-bearing for deterministic expansion
@@ -794,6 +795,18 @@ class DStarLiteController:
         new_cells = lidar_to_occupancy(
             self._static_cells, self._grid, state, lidar, self._geom, self._inflation
         )
+        # Overridable predictive hook: OR any extra cells (a subclass's motion
+        # prediction) into the freshly folded array BEFORE the diff, so they
+        # enter purely as changed occupancy through the existing update_cells
+        # seam. The base returns [] => `new_cells` is unchanged and the plain
+        # d_star_lite trace stays byte-identical (TC57/AC2). Because `new_cells`
+        # is re-folded from the static grid every tick (memoryless), a predicted
+        # cell stamped last tick that is neither in this tick's fresh fold nor
+        # this tick's prediction differs from the persistent self._cells and is
+        # cleared by the diff+commit below — no separate un-stamp pass is needed.
+        extra_cells = self._extra_blocked_cells(state, lidar, new_cells)
+        for row, col in extra_cells:
+            new_cells[row, col] = True
         diff_mask = self._cells != new_cells
 
         current_cell = world_to_grid(position, self._grid)
@@ -824,27 +837,57 @@ class DStarLiteController:
         # one place the repaired tree is actually consumed. A failure (settle or
         # extraction) keeps the last valid follower; never rebuild it (AC8).
         if self._follower.is_finished or self._immediate_segment_blocked(position):
-            try:
-                self._search.compute_shortest_path()
-                cells_path = self._search.extract_path()
-                waypoints = grid_path_to_waypoints(
-                    cells_path,
-                    self._grid,
-                    self._cells,
-                    position,
-                    self._goal_xy,
-                    WAYPOINT_STRIDE,
+            waypoints = self._settle_and_extract(position)
+            if waypoints:
+                self._follower = WaypointFollower(
+                    list(waypoints), WAYPOINT_REACHED_DISTANCE
                 )
-                if waypoints:
-                    self._follower = WaypointFollower(
-                        list(waypoints), WAYPOINT_REACHED_DISTANCE
-                    )
-            except (ValueError, RuntimeError):
-                # A failed incremental pass leaves the previous g/rhs and follower
-                # in place, so the held path stays drivable.
-                pass
 
         return compute_action_from_state(state, self._follower)
+
+    def _settle_and_extract(self, position: np.ndarray) -> Path | None:
+        """Settle the tree and extract the followed waypoint path for this tick.
+
+        Runs the deferred `compute_shortest_path()` + `extract_path()` and
+        collapses the cell path to waypoints. Returns the waypoint path on
+        success, or None on a settle/extraction failure — a failed incremental
+        pass leaves the previous g/rhs and follower in place, so the caller keeps
+        its last valid follower and `act()` never raises (AC8).
+
+        Extracted into an overridable method so the motion-aware predictive
+        subclass can peel its predicted stamp and re-settle here WITHOUT
+        reimplementing `act()`. The base behaviour is byte-identical to the
+        inlined block it replaced, so plain `d_star_lite` is unchanged
+        (TC35/TC46).
+        """
+        try:
+            self._search.compute_shortest_path()
+            cells_path = self._search.extract_path()
+            return grid_path_to_waypoints(
+                cells_path,
+                self._grid,
+                self._cells,
+                position,
+                self._goal_xy,
+                WAYPOINT_STRIDE,
+            )
+        except (ValueError, RuntimeError):
+            return None
+
+    def _extra_blocked_cells(
+        self, state: np.ndarray, lidar: np.ndarray, folded_new_cells: np.ndarray
+    ) -> list[tuple[int, int]]:
+        """Override hook: extra cells to OR into the fold before the diff.
+
+        Called between the per-tick `lidar_to_occupancy` fold and the
+        `diff_mask = self._cells != new_cells` line. The base returns an empty
+        list, so plain `d_star_lite` is a true no-op here and stays
+        byte-identical to its pre-hook behaviour (TC57/AC2).
+        `PredictiveDStarLiteController` overrides this to inject its motion
+        prediction.
+        """
+        del state, lidar, folded_new_cells
+        return []
 
     def _immediate_segment_blocked(self, position: np.ndarray) -> bool:
         """Is the segment the robot is about to traverse no longer clear?

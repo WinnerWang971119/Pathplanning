@@ -198,13 +198,15 @@ def build_episode_cmd(
     speed_regime: str | None,
     speed_min_override: float | None,
     speed_max_override: float | None,
+    predict_horizon: int | None = None,
 ) -> list[str]:
     """Construct one ``runners.run_episode`` child command (no execution).
 
     Appends ``--replan-k <k>`` ONLY when ``replan_k`` is not None (the child
-    rejects the flag for non-replan families), ``--traffic`` or ``--no-traffic``
-    per the flag, and the user's ORIGINAL speed flags so the child re-validates
-    and resolves the band itself:
+    rejects the flag for non-replan families), ``--predict-horizon <h>`` ONLY when
+    ``predict_horizon`` is not None (the child rejects it for non-predict
+    families), ``--traffic`` or ``--no-traffic`` per the flag, and the user's
+    ORIGINAL speed flags so the child re-validates and resolves the band itself:
 
     - ``speed_regime is not None`` => ``["--speed-regime", speed_regime]``;
     - else if ``speed_min_override is not None`` (both overrides set together) =>
@@ -232,6 +234,10 @@ def build_episode_cmd(
     # (run_episode rejects --replan-k for those, so passing None would be wrong).
     if replan_k is not None:
         cmd.extend(["--replan-k", str(replan_k)])
+    # Forward the prediction horizon only when set; a non-predict family must NOT
+    # see the flag (run_episode rejects --predict-horizon for those).
+    if predict_horizon is not None:
+        cmd.extend(["--predict-horizon", str(predict_horizon)])
     cmd.append("--traffic" if traffic else "--no-traffic")
     # Forward the user's ORIGINAL speed flags verbatim (the child re-validates):
     # a named regime, else a both-set override pair, else nothing.
@@ -260,6 +266,7 @@ def _run_one_episode(
     speed_regime: str | None,
     speed_min_override: float | None,
     speed_max_override: float | None,
+    predict_horizon: int | None,
     repo_root: Path,
 ) -> EpisodeResult:
     """Launch one `python -m runners.run_episode` subprocess for a single seed."""
@@ -273,6 +280,7 @@ def _run_one_episode(
         speed_regime=speed_regime,
         speed_min_override=speed_min_override,
         speed_max_override=speed_max_override,
+        predict_horizon=predict_horizon,
     )
     # capture_output buffers the child's full stdout/stderr though only the last
     # STDERR_TAIL_LINES are surfaced; that is intentional — we need the tail on
@@ -323,6 +331,7 @@ class RunnerArgs:
     algorithm: str
     world: str
     replan_k: int | None
+    predict_horizon: int | None
     master_seed: int
     num_seeds: int
     jobs: int
@@ -362,6 +371,16 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         help=(
             "Replan cadence for the _replan family (act every k-th step). "
             "Required for those algorithms, forbidden for the rest."
+        ),
+    )
+    parser.add_argument(
+        "--predict-horizon",
+        type=int,
+        default=None,
+        help=(
+            "Prediction lookahead in steps for the predictive D* Lite family "
+            "(d_star_lite_oracle / d_star_lite_predictive). Required for those "
+            "algorithms, forbidden for the rest."
         ),
     )
     parser.add_argument(
@@ -411,6 +430,7 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         algorithm=ns.algorithm,
         world=ns.world,
         replan_k=None if ns.replan_k is None else int(ns.replan_k),
+        predict_horizon=None if ns.predict_horizon is None else int(ns.predict_horizon),
         master_seed=int(ns.master_seed),
         num_seeds=int(ns.num_seeds),
         jobs=int(ns.jobs),
@@ -448,7 +468,7 @@ def main(argv: list[str] | None = None) -> int:
     # a --replan-k handed to a non-replan family, or an out-of-range cadence here —
     # exit 2 like the other up-front checks — rather than failing 50 subprocesses.
     try:
-        build_controller(args.algorithm, args.replan_k)
+        build_controller(args.algorithm, args.replan_k, args.predict_horizon)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -483,7 +503,7 @@ def main(argv: list[str] | None = None) -> int:
     # Partition results by the label, not the bare family name, so each child
     # (which computes the same label) lands in this directory and replan cadences
     # do not collide (a_star_replan_k5 vs a_star_replan_k10).
-    label = algorithm_label(args.algorithm, args.replan_k)
+    label = algorithm_label(args.algorithm, args.replan_k, args.predict_horizon)
     out_dir = episode_out_dir(results_dir_abs, world_stem, label)
     out_dir.mkdir(parents=True, exist_ok=True)  # pre-create once; children won't race on it
 
@@ -521,6 +541,7 @@ def main(argv: list[str] | None = None) -> int:
             speed_regime=args.speed_regime,
             speed_min_override=args.speed_min_override,
             speed_max_override=args.speed_max_override,
+            predict_horizon=args.predict_horizon,
             repo_root=_REPO_ROOT,
         )
 
@@ -555,6 +576,7 @@ def main(argv: list[str] | None = None) -> int:
         "num_seeds": args.num_seeds,
         "algorithm": args.algorithm,
         "replan_k": args.replan_k,
+        "predict_horizon": args.predict_horizon,
         "world": world_for_manifest,
         "world_stem": world_stem,
         "traffic": args.traffic,

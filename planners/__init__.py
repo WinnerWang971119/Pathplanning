@@ -1,9 +1,19 @@
 """arena/planners — pluggable planner adapters for the path-planning comparison study."""
 from planners._types import Controller, Path
-from planners._grid import ALGORITHMS, algorithm_label, build_controller
+from planners._grid import (
+    ALGORITHMS,
+    EXPERIMENTAL_KEYS,
+    PREDICT_FAMILIES,
+    algorithm_label,
+    build_controller,
+)
 from planners.a_star import AStarOnceController, AStarReplanController  # noqa: F401  (registers a_star_once / a_star_replan)
 from planners.dijkstra import DijkstraOnceController, DijkstraReplanController  # noqa: F401  (registers dijkstra_once / dijkstra_replan)
 from planners.d_star_lite import DStarLiteController  # noqa: F401  (registers d_star_lite)
+from planners.d_star_lite_predictive import (  # noqa: F401  (registers d_star_lite_oracle / d_star_lite_predictive)
+    DStarLiteOracleController,
+    DStarLitePredictiveController,
+)
 from planners.dwa import DWAController  # noqa: F401  (registers dwa)
 from planners.apf import APFController  # noqa: F401  (registers apf)
 from planners.rrt import RRTOnceController, RRTReplanController  # noqa: F401  (registers rrt_once / rrt_replan)
@@ -13,6 +23,8 @@ __all__ = [
     "Controller",
     "Path",
     "ALGORITHMS",
+    "EXPERIMENTAL_KEYS",
+    "PREDICT_FAMILIES",
     "algorithm_label",
     "build_controller",
 ]

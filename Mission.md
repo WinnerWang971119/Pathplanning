@@ -252,6 +252,23 @@ pending (the user launches it). See "The obstacle-speed-cap sweep (issue #11)"
 in CLAUDE.md and `docs/plans/2026-06-23-obstacle-speed-sweep.findings.md`. The
 traffic-density stretch goal stays a separate, unbuilt knob._
 
+_Experimental work shipped (Phase 7): a motion-aware D* Lite that stamps each
+obstacle's predicted future footprint into the occupancy grid before the diff, so
+the planner routes behind crossing traffic instead of into where it is about to
+be. The hypothesis is that anticipating obstacle motion, rather than reacting to
+it, is what lowers D* Lite's crash rate in the 0.3–1.5× speed band where ~1/3 of
+obstacles outrun the robot. The strategy is oracle-first: `d_star_lite_oracle`
+(perfect live velocities, a deliberate cheat; capsule geometry) ships as a go/no-go
+ceiling test before a lidar-only estimator is built. The `--predict-horizon` knob,
+the `runners/run_horizon_sweep.py` driver, the headless `runners/plot_horizon_sweep.py`
+plotter, and a render-only prediction overlay all ship; the oracle is EXPERIMENTAL,
+carved out of the canonical-11 scatter. A horizon sweep over `{0, 5, 10, 20}`
+lookahead steps measures whether the oracle clears the margin (≥ 2 seeds better
+than plain `d_star_lite`). The full 50-seed sweep and its go/no-go verdict are the
+user's to launch; the lidar-only variant (`d_star_lite_predictive`) stays unbuilt
+and unregistered until the oracle clears that gate. See "The predictive D* Lite
+family (Phase 7)" in CLAUDE.md._
+
 This is the only phase that produces an *insight* rather than an
 artifact. Everything before it exists to make this comparison rigorous.
 

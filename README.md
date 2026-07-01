@@ -19,31 +19,44 @@ comparison is apples-to-apples.
 
 ```
 pathplanning/
-├── arena/                  # the seeded test environment (Phase 0 + 2)
-│   ├── arena.py            #   Arena: wraps irsim, uniform step() API, --check suite
-│   ├── dynamic.py          #   DynamicObstacle + TrafficSpawner (crossing traffic)
-│   ├── arena_v1.yaml       #   canonical 50×50 world (walls + 12 pillars)
-│   ├── arena_v2_hard.yaml  #   second 50×50 world (walls relocated)
-│   └── arena_no_path.yaml  #   start boxed in → A* must fail (failure-path fixture)
-├── planners/               # pluggable planner adapters (Phase 6)
-│   ├── _types.py           #   Controller protocol (reset + act) + Path type
-│   ├── _grid.py            #   shared grid substrate + lidar fold + ALGORITHMS registry
-│   ├── a_star.py           #   a_star_once / a_star_replan
-│   ├── dijkstra.py         #   dijkstra_once / dijkstra_replan (A* with a zero heuristic)
-│   └── d_star_lite.py      #   d_star_lite (incremental; rejects --replan-k)
-├── runners/                # experiment harness (Phase 1 + 3)
-│   ├── run_episode.py      #   one planner × one seed × one world → metrics + trace
-│   └── run_experiment.py   #   one planner × the canonical 50 seeds → batch + manifest
-├── results/                # generated metrics/traces (gitignored except .gitkeep)
-├── docs/plans/             # per-phase implementation plans
-├── manual.py               # standalone demo: naive go-to-goal
-├── manual_obstacle.py      # standalone demo: reactive lidar avoidance
-├── manual_astar.py         # standalone demo: A* planner + waypoint follower
-├── test.py                 # standalone demo: minimal irsim "hello world"
-├── *.yaml                  # demo worlds (robot_world, obstacle, obstacle_harder)
-├── tests/                  # A* edge-case world fixtures (inputs, not pytest files)
-├── Mission.md              # the research plan (phases 0–7)
-└── requirements.txt        # irsim, numpy, pyyaml
+├── arena/                    # the seeded test environment (Phase 0 + 2)
+│   ├── arena.py              #   Arena: wraps irsim, uniform step() API, --check suite
+│   ├── dynamic.py            #   DynamicObstacle + TrafficSpawner (crossing traffic)
+│   ├── speed_regimes.py      #   obstacle-speed band table + CLI helpers (stdlib only)
+│   ├── arena_v1.yaml         #   canonical 50×50 world (walls + 12 pillars)
+│   ├── arena_v2_hard.yaml    #   second 50×50 world (walls relocated)
+│   └── arena_no_path.yaml    #   start boxed in → A* must fail (failure-path fixture)
+├── planners/                 # pluggable planner adapters (Phase 6 + 7)
+│   ├── _types.py             #   Controller protocol (reset + act) + Path type
+│   ├── _grid.py              #   shared grid substrate + lidar fold + ALGORITHMS registry
+│   ├── _predict.py           #   motion-prediction substrate (Track, trackers, stamp geometry)
+│   ├── a_star.py             #   a_star_once / a_star_replan
+│   ├── dijkstra.py           #   dijkstra_once / dijkstra_replan (A* with a zero heuristic)
+│   ├── d_star_lite.py        #   d_star_lite (incremental; rejects --replan-k)
+│   ├── dwa.py                #   dwa (reactive Dynamic Window Approach)
+│   ├── apf.py                #   apf (reactive artificial potential fields)
+│   ├── rrt.py                #   rrt_once / rrt_replan
+│   ├── rrt_star.py           #   rrt_star_once / rrt_star_replan
+│   └── d_star_lite_predictive.py  # d_star_lite_oracle / d_star_lite_predictive (experimental)
+├── runners/                  # experiment harness (Phase 1 + 3 + 5)
+│   ├── run_episode.py        #   one planner × one seed × one world → metrics + trace
+│   ├── run_experiment.py     #   one planner × the canonical 50 seeds → batch + manifest
+│   ├── run_all.py            #   all 11 canonical planners → the plotter's input
+│   ├── plot.py               #   read-only plotter → summary.csv + 7 comparison charts
+│   ├── run_speed_sweep.py    #   one planner set × the 4 obstacle-speed regimes
+│   ├── plot_speed_sweep.py   #   failure-rate / median-time vs speed-cap charts
+│   ├── run_horizon_sweep.py  #   predictive keys × prediction horizons {0,5,10,20}
+│   └── plot_horizon_sweep.py #   failure-rate / median-time vs horizon charts
+├── results/                  # generated metrics/traces (gitignored except .gitkeep)
+├── docs/plans/               # per-phase implementation plans + findings
+├── manual.py                 # standalone demo: naive go-to-goal
+├── manual_obstacle.py        # standalone demo: reactive lidar avoidance
+├── manual_astar.py           # standalone demo: A* planner + waypoint follower
+├── test.py                   # standalone demo: minimal irsim "hello world"
+├── *.yaml                    # demo worlds (robot_world, obstacle, obstacle_harder)
+├── tests/                    # A* edge-case world fixtures (inputs, not pytest files)
+├── Mission.md                # the research plan (phases 0–7)
+└── requirements.txt          # irsim, numpy, pyyaml, matplotlib
 ```
 
 The single-file demos (`test.py`, `manual*.py`) are self-contained and don't
@@ -64,7 +77,8 @@ Windows + PowerShell. A `.venv/` is already provisioned at the repo root.
 pip install -r requirements.txt
 ```
 
-Dependencies: `irsim`, `numpy`, `pyyaml`. There is no separate build step.
+Dependencies: `irsim`, `numpy`, `pyyaml`, `matplotlib`. There is no separate
+build step.
 
 ---
 
@@ -82,7 +96,11 @@ python -m runners.run_episode --algorithm a_star_once --seed 42 --world arena/ar
 # 3. Run A* against all 50 canonical seeds
 python -m runners.run_experiment --algorithm a_star_once --world arena/arena_v1.yaml
 
-# Results land under results/arena_v1/a_star_once/
+# 4. Run all 11 canonical planners, then chart the comparison
+python -m runners.run_all  --world arena/arena_v1.yaml
+python -m runners.plot     --world arena/arena_v1.yaml
+
+# Results land under results/arena_v1/<label>/ ; charts under results/arena_v1/plots/
 ```
 
 ---
@@ -108,9 +126,44 @@ follows them with a heading-gated speed schedule. All tuning knobs are the
 
 ---
 
+## The planner families
+
+Thirteen controllers are registered. Eleven are **canonical** (they land on the
+headline scatter); two are **experimental** (motion-aware, excluded from the
+canonical comparison). Pick one with `--algorithm <key>`.
+
+| Key | Family | Notes |
+| --- | --- | --- |
+| `a_star_once` | grid A* | Plans once on the static grid, follows it forever. |
+| `a_star_replan` | grid A* | Re-searches the lidar-folded grid every K acts. Needs `--replan-k`. |
+| `dijkstra_once` | grid Dijkstra | A* with a zero heuristic (same machinery). |
+| `dijkstra_replan` | grid Dijkstra | Needs `--replan-k`. |
+| `d_star_lite` | incremental D* Lite | Hand-rolled Koenig–Likhachev; rejects `--replan-k`. |
+| `dwa` | reactive | Dynamic Window Approach (velocity output, no global plan). |
+| `apf` | reactive | Khatib artificial potential fields (velocity output, no global plan). |
+| `rrt_once` | sampling RRT | Plans once on the static grid. |
+| `rrt_replan` | sampling RRT | Re-grows on the lidar fold every K acts. Needs `--replan-k`. |
+| `rrt_star_once` | sampling RRT* | Adds choose-parent + rewire. |
+| `rrt_star_replan` | sampling RRT* | Needs `--replan-k`. |
+| `d_star_lite_oracle` | predictive (experimental) | Stamps each obstacle's predicted future footprint using **perfect** velocities (the motion-aware ceiling). Needs `--predict-horizon`. |
+| `d_star_lite_predictive` | predictive (experimental) | Same stamp, velocities **estimated from lidar** (frame-differencing). Needs `--predict-horizon`. |
+
+The `_replan` families (`a_star_replan`, `dijkstra_replan`, `rrt_replan`,
+`rrt_star_replan`) require `--replan-k`; every other key rejects it. The
+predictive keys require `--predict-horizon` and reject `--replan-k`. The
+reactive (`dwa`, `apf`) and `_once` planners are expected to stall or crash in
+the traffic world — that is the experimental signal, not a bug.
+
+The predictive family is documented in
+`docs/plans/2026-06-27-predictive-d-star-lite.md` and its findings (the oracle
+confirms motion-awareness helps; the v1 lidar estimator does not yet) in
+`docs/plans/2026-06-27-predictive-d-star-lite.findings.md`.
+
+---
+
 ## The experiment harness
 
-Three layers, each usable from the command line.
+Each layer is usable from the command line.
 
 ### 1. Arena — the seeded environment
 
@@ -124,21 +177,22 @@ population of straight-line crossing traffic.
 # Visible smoke loop — drive the world and watch the render window
 python arena/arena.py arena/arena_v1.yaml --render
 
-# Headless verification suite (55 checks, TC1–TC52 + TC-CLI/TC-FWD; ~50 min)
+# Headless verification suite (68 checks, TC1–TC64 + TC-CLI/TC-FWD; ~50 min)
 python arena/arena.py arena/arena_v1.yaml --check
 ```
 
 `--check` is the health gate for the whole harness. It covers the Arena API,
-the episode runner, the traffic substrate, the batch runner, and the planner
-family end-to-end. All 55 PASS means the harness is healthy. (With neither flag,
-it defaults to `--check`.)
+the episode runner, the traffic substrate, the batch runner, every planner
+family end-to-end, the obstacle-speed sweep, and the predictive (motion-aware)
+family. All 68 PASS means the harness is healthy. (With neither flag, it
+defaults to `--check`.)
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `yaml_path` (positional) | required | World YAML, e.g. `arena/arena_v1.yaml`. |
 | `--seed N` | 42 | Master seed for the smoke/check run. |
 | `--render` | off | Interactive smoke loop in a visible window. |
-| `--check` | (default) | Run the headless TC1–TC52 + TC-CLI/TC-FWD verification suite. |
+| `--check` | (default) | Run the headless TC1–TC64 + TC-CLI/TC-FWD verification suite. |
 
 ### 2. `run_episode` — one planner, one seed
 
@@ -155,6 +209,9 @@ python -m runners.run_episode --algorithm a_star_once --seed 42 --world arena/ar
 | `--seed N` | required | Episode seed. |
 | `--world PATH` | required | World YAML. |
 | `--replan-k N` | none | Replan cadence; required for the `_replan` family, forbidden otherwise. |
+| `--predict-horizon N` | none | Lookahead in steps (T = N × 0.1 s); required for the predictive family, forbidden otherwise. |
+| `--speed-regime {slow,matched,current,fast}` | `current` | Obstacle-speed band (factor of robot top speed). |
+| `--speed-min-factor` / `--speed-max-factor` | none | Raw off-menu band; mutually exclusive with `--speed-regime`. |
 | `--render` | off | Open the irsim render window. |
 | `--results-dir DIR` | `results` | Override the output directory. |
 | `--traffic` / `--no-traffic` | traffic on | Toggle Phase 2 crossing traffic. |
@@ -178,7 +235,9 @@ python -m runners.run_experiment --algorithm a_star_once --world arena/arena_v1.
 | --- | --- | --- |
 | `--algorithm NAME` | required | Registered planner. |
 | `--world PATH` | required | World YAML. |
-| `--replan-k N` | none | Replan cadence; required for the `_replan` family, forbidden otherwise. Forwarded to each episode and recorded in the manifest. |
+| `--replan-k N` | none | Replan cadence; required for the `_replan` family. Forwarded to each episode and recorded in the manifest. |
+| `--predict-horizon N` | none | Prediction horizon (steps); required for the predictive family. Forwarded + recorded in the manifest. |
+| `--speed-regime` / `--speed-min-factor` / `--speed-max-factor` | `current` | Obstacle-speed band; recorded in the manifest. |
 | `--master-seed N` | 20260605 | Master seed the 50 episode seeds derive from. |
 | `--num-seeds N` | 50 | Run a prefix of the canonical stream (prefix-stable). |
 | `--jobs N` | 1 | `1` = sequential. `N>1` = up to N concurrent subprocesses. |
@@ -190,7 +249,25 @@ Result bytes are identical at any `--jobs` value; only `wallclock_per_step`
 (a Mission.md "freebie" metric) is perturbed by contention. Produce headline
 wall-clock numbers with `--jobs 1`.
 
-### 4. The obstacle-speed-cap sweep
+### 4. `run_all` + `plot` — the whole canonical comparison
+
+`runners/run_all.py` runs all 11 canonical planners against the canonical seed
+stream in one shot: a parallel bulk pass into `results/<world_stem>/<label>/`,
+then a serial wallclock mini-pass into
+`results/__wallclock__/<world_stem>/<label>/` for a clean per-step wall-clock.
+`runners/plot.py` is the read-only plotter: it reads those JSONs and writes a
+`summary.csv` plus the seven comparison charts as PNGs into
+`results/<world_stem>/plots/` (gitignored).
+
+```powershell
+python -m runners.run_all --world arena/arena_v1.yaml          # produce the data (long run)
+python -m runners.plot    --world arena/arena_v1.yaml          # chart it (read-only, no irsim)
+python -m runners.plot    --selfcheck                          # plotter's headless fixture suite
+```
+
+See "The Phase 5 plotter and batch driver" in `CLAUDE.md` for the seven charts.
+
+### 5. The obstacle-speed-cap sweep
 
 `runners/run_speed_sweep.py` runs a planner set across all four
 dynamic-obstacle speed bands so you can see how the obstacle-speed cap drives
@@ -207,8 +284,8 @@ python -m runners.plot_speed_sweep --world arena/arena_v1.yaml --algorithms focu
 The four regimes are factors of robot top speed: `slow` 0.3–0.7, `matched`
 0.3–1.0, `current` 0.3–1.5 (the Mission baseline), `fast` 0.5–2.0. Pass
 `--algorithms all` for the full 11-planner picture (~3× the episode count, more
-in wall time as the replan families add per-replan cost). The driver
-writes one per-regime subtree per planner under
+in wall time as the replan families add per-replan cost). The driver writes one
+per-regime subtree per planner under
 `results/speed_<regime>/<world_stem>/<label>/`; the plotter writes
 `failure_rate_vs_cap.png`, `median_time_vs_cap.png`, and a
 `speed_sweep_summary.csv` into `results/<world_stem>/speed_sweep_plots/`.
@@ -222,6 +299,27 @@ single `run_episode` / `run_experiment` run (default `current` is byte-identical
 to the prior baseline), with raw `--speed-min-factor` / `--speed-max-factor`
 overrides for off-menu bands.
 
+### 6. The prediction-horizon sweep (motion-aware D* Lite)
+
+`runners/run_horizon_sweep.py` runs the predictive keys
+(`d_star_lite_oracle` and `d_star_lite_predictive`) across the prediction
+horizons `{0, 5, 10, 20}` steps (T = steps × 0.1 s; `h0` is the plain
+`d_star_lite` baseline). `runners/plot_horizon_sweep.py` charts failure rate and
+median time vs horizon, with the oracle (perfect-velocity ceiling) and lidar
+(estimated) lines together.
+
+```powershell
+python -m runners.run_horizon_sweep  --world arena/arena_v1.yaml
+python -m runners.plot_horizon_sweep --world arena/arena_v1.yaml
+python -m runners.plot_horizon_sweep --selfcheck      # headless fixture suite (no irsim)
+```
+
+The driver writes label dirs `results/<world_stem>/<key>_h<steps>/`; the plotter
+writes `failure_rate_vs_horizon.png`, `median_time_vs_horizon.png`, and
+`horizon_sweep_summary.csv` into `results/<world_stem>/horizon_sweep_plots/`. A
+single horizon-bearing run is also available directly via `run_episode` /
+`run_experiment --predict-horizon`.
+
 ---
 
 ## Results layout
@@ -230,14 +328,16 @@ Output is partitioned by world stem so the same seed against two different
 worlds never clobbers itself:
 
 ```
-results/<world_stem>/<algorithm>/
+results/<world_stem>/<label>/
 ├── <seed>.json          # 7-field metrics, one object per episode
 ├── <seed>.trace.jsonl   # per-step trace (only written on planning success)
 └── _manifest.json       # provenance receipt (run_experiment only)
 ```
 
 `<world_stem>` is `Path(--world).stem`, so `arena/arena_v1.yaml` →
-`results/arena_v1/`. `results/` is gitignored except for `.gitkeep`.
+`results/arena_v1/`. `<label>` is the algorithm key, with the replan cadence or
+prediction horizon folded in (`a_star_replan_k5`, `d_star_lite_oracle_h10`).
+`results/` is gitignored except for `.gitkeep`.
 
 **Metrics JSON** (`<seed>.json`) — 7 fields:
 
@@ -259,15 +359,8 @@ state with a sentinel `action=[0.0, 0.0]`.
 
 **Manifest** (`_manifest.json`) — `master_seed`, `num_seeds`,
 `derived_seeds`, per-episode `{seed, exit_code, status}` in derivation order,
-and a best-effort `git_sha`. No timestamps, so it is byte-reproducible.
-
-`runners/run_all.py` runs all 11 canonical planners against the canonical seed
-stream in one shot (a parallel bulk pass into `results/<world_stem>/<label>/`,
-then a serial wallclock mini-pass into `results/__wallclock__/<world_stem>/<label>/`
-for a clean per-step wall-clock). `runners/plot.py` is the read-only plotter: it
-reads those JSONs and writes a `summary.csv` plus the seven comparison charts as
-PNGs into `results/<world_stem>/plots/` (gitignored). See "The Phase 5 plotter and
-batch driver" in `CLAUDE.md`.
+the cadence/horizon/speed-regime provenance, and a best-effort `git_sha`. No
+timestamps, so it is byte-reproducible.
 
 ---
 
@@ -286,7 +379,10 @@ cannot be byte-identical across two live runs.
 
 Traffic substreams are derived from the master seed via
 `SeedSequence.spawn(2)` (`traffic_rng` for spawning, `motion_rng` reserved for
-future motion noise), drawn in a fixed order per spawn attempt.
+future motion noise), drawn in a fixed order per spawn attempt. The sampling
+(RRT/RRT*) planners and the lidar motion estimator are likewise fully
+deterministic (a fixed-seed generator / sorted-order reductions), so their
+traces are byte-stable too.
 
 ---
 
@@ -301,6 +397,10 @@ class Controller(Protocol):
 
     def reset(self, world_yaml, initial_snapshot, lidar0, state0) -> None: ...
     def act(self, state, lidar) -> np.ndarray: ...  # (2,1) float [[v],[w]]
+
+    # Optional opt-in truth seam (the predictive oracle uses it):
+    wants_truth: bool = False
+    def observe_truth(self, snapshot) -> None: ...  # called before act() only when wants_truth
 ```
 
 `reset()` builds the static substrate and the t=0 plan (raise `ValueError` /
@@ -311,12 +411,13 @@ calls `reset()` once, then `act()` until the Arena reports done.
 Register the class by self-registering into the `ALGORITHMS` registry: the
 controller module calls `register(name, cls)` from `planners/_grid.py` at import
 (see `a_star.py`), and importing the `planners` package populates the registry.
-The runner builds the instance via `build_controller`. Five planners ship today:
-`a_star_once`, `a_star_replan`, `dijkstra_once`, `dijkstra_replan`, and
-`d_star_lite`. The `_replan` families take a required `--replan-k`; `d_star_lite`
-is the incremental planner (no `_once`/`_replan` split, and it rejects
-`--replan-k`). Mission.md Phase 6 still expects the reactive (DWA, APF) and
-sampling (RRT, RRT*) families.
+The runner builds the instance via `build_controller`. Thirteen keys ship today
+— eleven canonical (`a_star_once`, `a_star_replan`, `dijkstra_once`,
+`dijkstra_replan`, `d_star_lite`, `dwa`, `apf`, `rrt_once`, `rrt_replan`,
+`rrt_star_once`, `rrt_star_replan`) and two experimental, motion-aware keys
+(`d_star_lite_oracle`, `d_star_lite_predictive`) held out of the canonical
+scatter via `EXPERIMENTAL_KEYS`. The `_replan` families take a required
+`--replan-k`; the predictive family takes a required `--predict-horizon`.
 
 ---
 
@@ -348,8 +449,8 @@ Following the phase plan in `Mission.md`:
 | 3 — Reproducibility | done | `runners/run_experiment.py` + manifest |
 | 4 — Metrics | done | per-algorithm aggregation (lands in the plotter's loader) |
 | 5 — Scatter plot | done | `runners/plot.py` + `runners/run_all.py` |
-| 6 — Algorithms | in progress | `planners/` (Controller interface + grid family A*/Dijkstra once+replan + D* Lite landed; reactive DWA/APF, sampling RRT/RRT*, and the 6b K-sweep remain) |
-| 7 — The actual question | pending | the insight the plot produces |
+| 6 — Algorithms | done | `planners/` — grid (A*/Dijkstra once+replan), incremental D* Lite, reactive (DWA/APF), sampling (RRT/RRT*); only the 6b K-sweep is deferred |
+| 7 — The actual question | in progress | the insight the plot produces, plus the experimental motion-aware D* Lite family (oracle confirms motion-awareness helps; the v1 lidar estimator does not yet) |
 
-Phase-by-phase implementation notes live in `docs/plans/`. Per-phase
-architecture and conventions are documented in `CLAUDE.md`.
+Phase-by-phase implementation notes and findings live in `docs/plans/`.
+Per-phase architecture and conventions are documented in `CLAUDE.md`.

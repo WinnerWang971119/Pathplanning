@@ -24,6 +24,19 @@ LIDAR_BEAM_COUNT = 360
 ACTION_SHAPE = (2, 1)
 RENDER_PAUSE_SECONDS = 0.05
 
+# Render-only prediction-overlay styling (T16). Consumed solely by
+# Arena.draw_prediction, which is a hard no-op unless render=True — so none of
+# these touch the headless step/trace pipeline (determinism is unaffected).
+PREDICTION_CELL_COLOR = "tab:orange"   # translucent predicted-footprint cells
+PREDICTION_CELL_ALPHA = 0.25
+PREDICTION_ARROW_COLOR = "red"         # per-track velocity arrows
+PREDICTION_CELL_ZORDER = 5             # above irsim's static/obstacle patches
+PREDICTION_ARROW_ZORDER = 6            # arrows above the cell overlay
+# Visual multiplier (seconds-equivalent) applied to each track's (vx, vy) so a
+# slow 0.3 m/s obstacle's arrow is still legible in a 50 m arena. Debug-only;
+# not load-bearing on any metric or trace.
+VELOCITY_ARROW_SCALE = 3.0
+
 
 # Bootstrap repo root on sys.path so the `from arena.* import ...` below resolve
 # whether this file is run as `python arena/arena.py` (script-mode puts arena/ on
@@ -58,6 +71,10 @@ class EpisodeInfo:
     dynamic_obstacle_count: int
     lidar_status: str
     dynamic_obstacles_sha256: str | None
+    # Live post-_advance() snapshot for THIS tick (same tick as dynamic_obstacles_sha256,
+    # both sourced from self._last_snapshot). () when traffic is off or pre-reset. Distinct
+    # from Arena.initial_dynamic_snapshot, which is the frozen t=0 view from _initial_snapshot.
+    dynamic_obstacles: tuple[DynamicObstacleState, ...]
 
 
 class Arena:
@@ -182,6 +199,15 @@ class Arena:
         self._closed = False
         self._reset_called = False
 
+        # Render-only prediction overlay (T16). `_prediction_artists` holds the
+        # matplotlib artists drawn last tick so draw_prediction can remove them
+        # before drawing the next tick (no frame-to-frame accumulation).
+        # `_prediction_geometry` caches the (resolution, offset_x, offset_y)
+        # cell->world conversion so the YAML is parsed at most once. Both stay
+        # untouched when render=False — the draw path is never entered.
+        self._prediction_artists: list[Any] = []
+        self._prediction_geometry: tuple[float, float, float] | None = None
+
     def reset(self) -> tuple[np.ndarray, np.ndarray, EpisodeInfo]:
         if self._closed:
             raise RuntimeError("Arena is closed")
@@ -246,6 +272,7 @@ class Arena:
             dynamic_obstacle_count=len(self._last_snapshot),
             lidar_status=lidar_status,
             dynamic_obstacles_sha256=self._last_sha256,
+            dynamic_obstacles=self._last_snapshot,
         )
         return state, lidar, info
 
@@ -316,6 +343,7 @@ class Arena:
             dynamic_obstacle_count=len(self._last_snapshot),
             lidar_status=lidar_status,
             dynamic_obstacles_sha256=self._last_sha256,
+            dynamic_obstacles=self._last_snapshot,
         )
 
         done = crashed or timed_out or reached_goal
@@ -358,6 +386,197 @@ class Arena:
         """
         return self._initial_snapshot
 
+    # ------------------------------------------------------------------ #
+    # Render-only prediction overlay (T16)                               #
+    # ------------------------------------------------------------------ #
+
+    def draw_prediction(
+        self,
+        cells: list[tuple[int, int]],
+        tracks: list[Any],
+    ) -> None:
+        """Paint the predictive controller's debug overlay on irsim's axes.
+
+        Strictly render-only and read-only w.r.t. the step/trace pipeline. When
+        ``render=False`` this returns IMMEDIATELY — the draw path is never
+        entered, so headless runs stay byte-identical (the AC11 determinism
+        guard, covered by TC58). It never raises: any failure to locate irsim's
+        matplotlib axes, derive grid geometry, or draw degrades to a no-op so a
+        render run can never crash on the overlay.
+
+        Parameters
+        ----------
+        cells:
+            ``(row, col)`` grid cells of the predicted footprint (the
+            controller's ``last_predicted_cells``). Each is converted to a
+            translucent world-frame square of side ``GRID_RESOLUTION``. May be
+            empty (pre-first-act, horizon 0, or no threats) — drawn as nothing.
+        tracks:
+            Tracked obstacles (the controller's ``last_tracks``); each is read
+            for ``.x, .y, .vx, .vy`` and drawn as a velocity arrow from its
+            position along its velocity. May be empty.
+
+        The previous tick's artists are removed FIRST so the overlay refreshes
+        in place and never accumulates frame-to-frame.
+        """
+        # AC11 hard guard: never enter the draw path when headless.
+        if not self._render:
+            return
+
+        # Always clear the previous tick's overlay first, even when this tick
+        # draws nothing, so a transient empty `cells`/`tracks` does not leave a
+        # stale overlay on screen.
+        self._clear_prediction_artists()
+
+        ax = self._discover_render_axes()
+        if ax is None:
+            return  # irsim axes API differs — degrade to a no-op (never raise).
+
+        try:
+            resolution, offset_x, offset_y = self._prediction_grid_geometry()
+        except Exception:
+            return  # cannot place cells without grid geometry — no-op.
+
+        new_artists: list[Any] = []
+        try:
+            # Lazy, defensive imports: matplotlib is already loaded by irsim in
+            # render mode, but keep these inside the method so module import (and
+            # the `python arena/arena.py` script-mode import order) is untouched.
+            from matplotlib.collections import PatchCollection
+            from matplotlib.patches import Rectangle
+
+            # Translucent predicted-footprint cells, as one PatchCollection so a
+            # single artist covers the whole stamp (cheap to add and remove).
+            patches: list[Rectangle] = []
+            for cell in cells or []:
+                row, col = cell
+                lower_left_x = offset_x + col * resolution
+                lower_left_y = offset_y + row * resolution
+                patches.append(
+                    Rectangle((lower_left_x, lower_left_y), resolution, resolution)
+                )
+            if patches:
+                collection = PatchCollection(
+                    patches,
+                    facecolor=PREDICTION_CELL_COLOR,
+                    edgecolor="none",
+                    alpha=PREDICTION_CELL_ALPHA,
+                    zorder=PREDICTION_CELL_ZORDER,
+                )
+                ax.add_collection(collection)
+                new_artists.append(collection)
+
+            # Per-track velocity arrows, as one quiver (a single artist). The
+            # (vx, vy) vector is scaled into data units so the arrow length is
+            # proportional to speed and legible in the arena.
+            origins_x: list[float] = []
+            origins_y: list[float] = []
+            vectors_x: list[float] = []
+            vectors_y: list[float] = []
+            for track in tracks or []:
+                origins_x.append(float(track.x))
+                origins_y.append(float(track.y))
+                vectors_x.append(float(track.vx) * VELOCITY_ARROW_SCALE)
+                vectors_y.append(float(track.vy) * VELOCITY_ARROW_SCALE)
+            if origins_x:
+                quiver = ax.quiver(
+                    origins_x,
+                    origins_y,
+                    vectors_x,
+                    vectors_y,
+                    angles="xy",
+                    scale_units="xy",
+                    scale=1.0,
+                    color=PREDICTION_ARROW_COLOR,
+                    width=0.004,
+                    zorder=PREDICTION_ARROW_ZORDER,
+                )
+                new_artists.append(quiver)
+        except Exception:
+            # A drawing failure must not crash a render run. Remove anything we
+            # managed to add this tick so nothing leaks, then degrade to a no-op.
+            for artist in new_artists:
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
+            self._prediction_artists = []
+            return
+
+        self._prediction_artists = new_artists
+
+    def _clear_prediction_artists(self) -> None:
+        """Remove the artists draw_prediction added last tick (best-effort)."""
+        for artist in self._prediction_artists:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        self._prediction_artists = []
+
+    def _discover_render_axes(self) -> Any | None:
+        """Best-effort discovery of irsim's matplotlib Axes; None if not found.
+
+        irsim renders through its own ``EnvPlot`` figure/axes. The known path is
+        ``self._env._env_plot.ax``; alternates are tried with ``getattr`` so a
+        future irsim version that moves the attribute degrades to a no-op overlay
+        instead of crashing the render run.
+        """
+        env = getattr(self, "_env", None)
+        if env is None:
+            return None
+        # Primary: the EnvPlot instance's axes.
+        env_plot = getattr(env, "_env_plot", None)
+        ax = getattr(env_plot, "ax", None) if env_plot is not None else None
+        if ax is not None:
+            return ax
+        # Alternate: a direct .ax on the env.
+        ax = getattr(env, "ax", None)
+        if ax is not None:
+            return ax
+        # Last resort: the current pyplot axes, only if a figure already exists
+        # (never create a fresh blank figure as a side effect of discovery).
+        try:
+            import matplotlib.pyplot as plt
+
+            if plt.get_fignums():
+                return plt.gca()
+        except Exception:
+            return None
+        return None
+
+    def _prediction_grid_geometry(self) -> tuple[float, float, float]:
+        """``(resolution, offset_x, offset_y)`` for the cell->world conversion.
+
+        Mirrors how the planner sizes its occupancy grid: ``GRID_RESOLUTION``
+        metres per cell and the world ``offset`` from the YAML (default
+        ``[0, 0]``). Cached after the first call so the YAML is parsed at most
+        once. Reuses the already-loaded ``self._world_model`` when traffic
+        provided it; otherwise lazy-loads it via ``manual_astar`` behind the
+        repo-root ``sys.path`` shim (mirrors the other manual_astar imports in
+        this module so script-mode import order is preserved).
+        """
+        if self._prediction_geometry is not None:
+            return self._prediction_geometry
+
+        world_model = self._world_model
+        if world_model is None:
+            import sys as _sys
+
+            _repo_root = str(Path(__file__).resolve().parent.parent)
+            if _repo_root not in _sys.path:
+                _sys.path.insert(0, _repo_root)
+            from manual_astar import load_world  # type: ignore[import-not-found]
+
+            world_model = load_world(str(self._yaml_path))
+
+        from manual_astar import GRID_RESOLUTION  # type: ignore[import-not-found]
+
+        offset = world_model.offset
+        geometry = (float(GRID_RESOLUTION), float(offset[0]), float(offset[1]))
+        self._prediction_geometry = geometry
+        return geometry
+
     def close(self) -> None:
         if self._closed:
             return
@@ -385,6 +604,7 @@ EXPECTED_EPISODE_INFO_FIELDS = (
     "dynamic_obstacle_count",
     "lidar_status",
     "dynamic_obstacles_sha256",
+    "dynamic_obstacles",
 )
 
 
@@ -3593,6 +3813,1094 @@ def tc_fwd(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure + one su
 
 
 # ---------------------------------------------------------------------------
+# TC53..TC62 — Predictive (motion-aware) D* Lite checks. The pure predictor
+# (TC53..TC56b, TC60, TC61) is in-process (no irsim, no subprocess), mirroring
+# TC46/TC47; the oracle e2e/validation cases (TC57..TC59) and the sweep-plotter
+# selfcheck (TC62) shell `python -m runners.run_episode` / the plotter, mirroring
+# TC15/TC24/TC37/TC-CLI. Every `from planners...` / `from runners...` import sits
+# INSIDE the function body (the script-mode import-order gotcha — see module top).
+# ---------------------------------------------------------------------------
+
+
+def tc53(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure unit; synthesizes its own track/grid
+    """predict_blocked_cells capsule geometry: constant-radius disk train, sorted/deduped, deterministic.
+
+    Builds a tiny OccupancyGrid and one synthetic +x-moving Track, then asserts the
+    capsule stamp is a CONSTANT-radius disk train (the per-step disk cell count does
+    not grow with the lookahead step k), the returned cells are sorted row-major and
+    deduped, and two calls on identical inputs return byte-identical output (AC4).
+    """
+    _ensure_repo_root_on_path()
+    from manual_astar import OccupancyGrid, world_to_grid  # type: ignore[import-not-found]
+    from planners._geometry import iter_disk_cells  # type: ignore[import-not-found]
+    from planners._predict import (  # type: ignore[import-not-found]
+        PREDICT_DT,
+        Track,
+        predict_blocked_cells,
+    )
+
+    # A 5 m x 5 m grid at the harness resolution, origin-aligned (offset 0).
+    grid = OccupancyGrid(
+        cells=np.zeros((80, 80), dtype=bool),
+        resolution=0.1,
+        offset=np.array([0.0, 0.0], dtype=float),
+    )
+    inflation = 0.25
+    horizon_steps = 10
+
+    # One obstacle moving along +x straight down the planned-path corridor.
+    track = Track(id=3, x=1.0, y=4.0, vx=1.0, vy=0.0, radius=0.3)
+    planned_path = [np.array([0.5, 4.0]), np.array([7.5, 4.0])]
+    robot_xy = np.array([0.3, 4.0])
+
+    groups = predict_blocked_cells(
+        [track], planned_path, robot_xy, grid, inflation, horizon_steps, PREDICT_DT,
+        geometry="capsule", exclusion_radius=inflation, corridor_half_width=inflation,
+    )
+    assert len(groups) == 1, (
+        f"TC53: the single corridor-crossing track must produce one stamp group, "
+        f"got {len(groups)}"
+    )
+    key, cells = groups[0]
+    assert key.track_id == track.id, (
+        f"TC53: stamp group key must carry the track id {track.id}, got {key.track_id}"
+    )
+    assert cells, "TC53: the capsule stamp must be non-empty"
+
+    # Sorted row-major + deduped: the returned list equals sorted(set(...)).
+    assert cells == sorted(set(cells)), (
+        "TC53: capsule cells must be sorted row-major and deduplicated"
+    )
+
+    # Constant-radius disk train: recompute each lookahead step's disk via the same
+    # shared planners._geometry.iter_disk_cells scan the predictor now uses (capsule
+    # => r_k is the constant body-aware band radius). The per-step disk cell COUNT
+    # must NOT grow with k (it would for a cone). Distinct k's give distinct centers,
+    # so the union is genuinely a TRAIN of equal-radius disks, not a single disk.
+    base_radius = track.radius + inflation
+    per_step_counts: list[int] = []
+    centers: list[tuple[int, int]] = []
+    for k in range(1, horizon_steps + 1):
+        center_x = track.x + track.vx * k * PREDICT_DT
+        center_y = track.y + track.vy * k * PREDICT_DT
+        disk = set(iter_disk_cells(grid, center_x, center_y, base_radius))
+        per_step_counts.append(len(disk))
+        centers.append(world_to_grid(np.array([center_x, center_y], dtype=float), grid))
+    assert len(set(per_step_counts)) == 1, (
+        f"TC53: capsule per-step disk cell count must be CONSTANT along v (constant "
+        f"radius), got varying counts {per_step_counts}"
+    )
+    assert len(set(centers)) > 1, (
+        f"TC53 setup: the +x track must sweep through distinct disk centers (a train), "
+        f"got centers {set(centers)}"
+    )
+
+    # Determinism (AC4): two calls on identical inputs return byte-identical output.
+    groups_again = predict_blocked_cells(
+        [track], planned_path, robot_xy, grid, inflation, horizon_steps, PREDICT_DT,
+        geometry="capsule", exclusion_radius=inflation, corridor_half_width=inflation,
+    )
+    assert groups_again == groups, (
+        "TC53: predict_blocked_cells must be deterministic — two identical calls "
+        "produced differing output"
+    )
+
+
+def tc54(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure unit; synthesizes its own track/grid
+    """predict_blocked_cells cone widening + exclusion zone + non-intersecting gate.
+
+    Same synthetic setup as TC53 with geometry="cone": the per-step disk radius GROWS
+    with the lookahead step (the cone stamp strictly supersets the capsule stamp for the
+    same track/horizon), NO stamped cell lies within exclusion_radius of the robot (AC5),
+    and a track that does NOT cross the planned-path corridor is dropped by the gate.
+    """
+    _ensure_repo_root_on_path()
+    from manual_astar import OccupancyGrid  # type: ignore[import-not-found]
+    from planners._predict import (  # type: ignore[import-not-found]
+        CONE_GROWTH_PER_STEP,
+        PREDICT_DT,
+        Track,
+        predict_blocked_cells,
+    )
+
+    grid = OccupancyGrid(
+        cells=np.zeros((100, 100), dtype=bool),
+        resolution=0.1,
+        offset=np.array([0.0, 0.0], dtype=float),
+    )
+    inflation = 0.25
+    horizon_steps = 10
+    assert CONE_GROWTH_PER_STEP > 0.0, (
+        "TC54 setup: CONE_GROWTH_PER_STEP must be positive for the cone to widen"
+    )
+
+    track = Track(id=3, x=1.0, y=5.0, vx=1.0, vy=0.0, radius=0.3)
+    planned_path = [np.array([0.5, 5.0]), np.array([9.5, 5.0])]
+    robot_xy = np.array([0.3, 5.0])
+
+    cap_groups = predict_blocked_cells(
+        [track], planned_path, robot_xy, grid, inflation, horizon_steps, PREDICT_DT,
+        geometry="capsule", exclusion_radius=inflation, corridor_half_width=inflation,
+    )
+    cone_groups = predict_blocked_cells(
+        [track], planned_path, robot_xy, grid, inflation, horizon_steps, PREDICT_DT,
+        geometry="cone", exclusion_radius=inflation, corridor_half_width=inflation,
+    )
+    assert len(cap_groups) == 1 and len(cone_groups) == 1, (
+        f"TC54: both geometries must stamp the corridor-crossing track "
+        f"(capsule={len(cap_groups)}, cone={len(cone_groups)})"
+    )
+    cap_cells = set(cap_groups[0][1])
+    cone_cells = set(cone_groups[0][1])
+
+    # Cone widens with k => its stamp strictly supersets the capsule's for the same
+    # track/horizon (the radius grows, never shrinks).
+    assert cap_cells <= cone_cells, (
+        "TC54: the cone stamp must SUPERSET the capsule stamp (radius grows with step)"
+    )
+    assert len(cone_cells) > len(cap_cells), (
+        f"TC54: the cone stamp must be STRICTLY larger than the capsule stamp "
+        f"(cone={len(cone_cells)}, capsule={len(cap_cells)})"
+    )
+
+    # Robot exclusion zone (AC5): no stamped cell's center lies within
+    # exclusion_radius of the robot, for either geometry.
+    exclusion_sq = inflation * inflation
+    resolution = grid.resolution
+    offset_x, offset_y = float(grid.offset[0]), float(grid.offset[1])
+    for label, cells in (("capsule", cap_cells), ("cone", cone_cells)):
+        for row, col in cells:
+            cell_x = offset_x + (col + 0.5) * resolution
+            cell_y = offset_y + (row + 0.5) * resolution
+            dx = cell_x - float(robot_xy[0])
+            dy = cell_y - float(robot_xy[1])
+            assert dx * dx + dy * dy > exclusion_sq, (
+                f"TC54: {label} stamped cell ({row},{col}) lies within the robot "
+                f"exclusion radius {inflation} of {tuple(robot_xy)} (AC5 violated)"
+            )
+
+    # Gate: a track that never crosses the corridor is dropped. Place it far above
+    # the path and moving further away (no [0, T] intersection with the corridor).
+    away = Track(id=4, x=5.0, y=12.0, vx=0.0, vy=2.0, radius=0.3)
+    away_groups = predict_blocked_cells(
+        [away], planned_path, robot_xy, grid, inflation, horizon_steps, PREDICT_DT,
+        geometry="cone", exclusion_radius=inflation, corridor_half_width=inflation,
+    )
+    assert away_groups == [], (
+        f"TC54: a track that never intersects the planned-path corridor must be "
+        f"dropped by the gate, got {len(away_groups)} group(s)"
+    )
+
+
+def tc55(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure unit; synthesizes its own tracks/grid
+    """Predicted-conflict gate: divergent-now-collide-later crosser stamped; receding dropped.
+
+    The gate is geometric over [0, T], NOT an instantaneous closing-course test. Proof:
+    a shallow-angle FAST crosser that is RECEDING from the robot at t=0 (an instantaneous
+    closing-rate gate would drop it) yet whose capsule crosses the planned-path corridor
+    within the horizon IS stamped (finite time-to-conflict). A track moving directly away
+    from the corridor (genuinely receding) is NOT stamped.
+    """
+    _ensure_repo_root_on_path()
+    from manual_astar import OccupancyGrid  # type: ignore[import-not-found]
+    from planners._predict import (  # type: ignore[import-not-found]
+        PREDICT_DT,
+        Track,
+        predict_blocked_cells,
+    )
+
+    grid = OccupancyGrid(
+        cells=np.zeros((200, 200), dtype=bool),
+        resolution=0.1,
+        offset=np.array([0.0, 0.0], dtype=float),
+    )
+    inflation = 0.25
+    horizon_steps = 20
+    # Robot at (2,5); a long corridor along +x toward (16,5).
+    planned_path = [np.array([2.0, 5.0]), np.array([16.0, 5.0])]
+    robot_xy = np.array([2.0, 5.0])
+
+    # Divergent-now-collide-later: far ahead at (11, 1.5), moving up-and-forward. The
+    # closing rate to the ROBOT is strictly positive (it is moving AWAY from the robot
+    # now — an instantaneous-heading/closing-course gate would drop it), yet its capsule
+    # sweeps up into the corridor band within the horizon (a finite TTC).
+    crosser = Track(id=1, x=11.0, y=1.5, vx=3.0, vy=2.5, radius=0.3)
+    los_x = crosser.x - float(robot_xy[0])
+    los_y = crosser.y - float(robot_xy[1])
+    closing_rate = (los_x * crosser.vx + los_y * crosser.vy) / float(
+        np.hypot(los_x, los_y)
+    )
+    assert closing_rate > 0.0, (
+        f"TC55 setup: the crosser must be RECEDING from the robot at t=0 (closing "
+        f"rate must be > 0 so an instantaneous-course gate would drop it), got "
+        f"{closing_rate:.4f}"
+    )
+    crosser_groups = predict_blocked_cells(
+        [crosser], planned_path, robot_xy, grid, inflation, horizon_steps, PREDICT_DT,
+        geometry="capsule", exclusion_radius=inflation, corridor_half_width=inflation,
+    )
+    assert len(crosser_groups) == 1, (
+        f"TC55: the divergent-now-collide-later crosser must be stamped by the "
+        f"geometric gate, got {len(crosser_groups)} group(s)"
+    )
+    key, cells = crosser_groups[0]
+    assert isinstance(key.ttc_steps, int) and 1 <= key.ttc_steps <= horizon_steps, (
+        f"TC55: the crosser must carry a finite time-to-conflict in [1, {horizon_steps}], "
+        f"got {key.ttc_steps}"
+    )
+    assert cells, "TC55: a gated crosser must stamp at least one cell"
+
+    # Receding: directly away from the corridor (above the path, moving further up).
+    # Its footprint never reaches the corridor, so the gate drops it.
+    receding = Track(id=2, x=9.0, y=12.0, vx=0.0, vy=3.0, radius=0.3)
+    receding_groups = predict_blocked_cells(
+        [receding], planned_path, robot_xy, grid, inflation, horizon_steps, PREDICT_DT,
+        geometry="capsule", exclusion_radius=inflation, corridor_half_width=inflation,
+    )
+    assert receding_groups == [], (
+        f"TC55: a clearly receding track must NOT be stamped, got "
+        f"{len(receding_groups)} group(s)"
+    )
+
+
+def tc56(yaml_path: str, seed: int) -> None:
+    """Settle-time bounded peel: a map-sealing stamp is peeled farthest-future-first.
+
+    Drives the oracle controller's settle-time fail-open peel directly (after an
+    in-process reset() against the real world YAML — no irsim, no subprocess; mirrors
+    TC46). The re-architected peel lives in ``_settle_and_extract``, not a per-tick
+    ``_peel``: the FULL predicted stamp is committed into ``self._cells`` first
+    (mimicking act()'s fold -> diff -> update_cells commit), then ``_settle_and_extract``
+    settles with that full stamp, finds the grid sealed (the base settle returns None
+    because ``g(start)`` is infinite), and peels the farthest-future (least-imminent)
+    group — un-stamping its cells and re-settling — until a path re-exists. The peel
+    receives two threat-ordered groups: a tiny, harmless MOST-IMMINENT group (smallest
+    TTC) and a farthest-future group that is a full grid-spanning wall whose stamp SEALS
+    the robot from the goal. The wall must be peeled (un-stamped) and the most-imminent
+    group retained, with ``self._cells`` mutated in place and never rebound.
+
+    The imminent group also SHARES one wall-column cell with the wall group, so the
+    peel must keep that shared cell stamped (a retained group still needs it) while
+    un-stamping the rest of the wall -- exercising ``_unstamp_group``'s subtlest
+    property (a cell present in both a dropped and a kept group survives the peel).
+    """
+    _ensure_repo_root_on_path()
+    from manual_astar import world_to_grid  # type: ignore[import-not-found]
+    from planners import build_controller  # type: ignore[import-not-found]
+    from planners._predict import ThreatKey  # type: ignore[import-not-found]
+    from planners.d_star_lite import DStarLiteController  # type: ignore[import-not-found]
+
+    controller = build_controller("d_star_lite_oracle", None, predict_horizon=10)
+    raw = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8"))
+    start = raw["robot"]["state"]
+    state0 = np.array(
+        [float(start[0]), float(start[1]), float(start[2]) if len(start) > 2 else 0.0],
+        dtype=np.float64,
+    )
+    nan_lidar = np.full((LIDAR_BEAM_COUNT,), np.nan, dtype=np.float64)
+    controller.reset(yaml_path, (), nan_lidar, state0)
+
+    grid = controller._grid
+    robot_cell = world_to_grid(state0[:2], grid)
+    goal_cell = world_to_grid(controller._goal_xy, grid)
+    rows = controller._cells.shape[0]
+
+    # Most-imminent group (ttc=1): a single harmless cell off the robot's route.
+    imminent_cell = (robot_cell[0] + 5, robot_cell[1] + 3)
+    # Farthest-future group (ttc=9): a full vertical wall between start and goal. With
+    # no corner-cutting (the search forbids diagonal squeezes), a complete column seals
+    # the grid.
+    wall_col = (robot_cell[1] + goal_cell[1]) // 2
+    wall_cells = [(r, wall_col) for r in range(rows)]
+
+    # Shared-cell-across-groups case: pick a stamp-only cell (currently False in the
+    # static grid) in the wall column and place it in BOTH the imminent (kept) group
+    # and the wall (dropped) group. The peel must NOT un-stamp this cell, because a
+    # retained group still needs it -- this exercises _unstamp_group's subtlest
+    # property (a cell present in both a dropped and a kept group survives the peel).
+    shared_row = next(r for r in range(rows) if not controller._cells[r, wall_col])
+    shared_cell = (shared_row, wall_col)
+
+    # Threat order: most-imminent first (ttc=1), farthest-future last (ttc=9). The peel
+    # drops from the END (least-imminent first). The imminent group also carries the
+    # shared wall cell so it must stay stamped after the wall group is dropped.
+    groups = [
+        (ThreatKey(1, 1), [imminent_cell, shared_cell]),
+        (ThreatKey(9, 2), wall_cells),
+    ]
+
+    # Mimic act()'s per-tick commit: store the un-stamped fold and the threat-ordered
+    # groups, then OR the FULL stamp (both groups) into self._cells IN PLACE, reporting
+    # the newly-flipped cells through move_start + update_cells so the search sees the
+    # seal. self._cells is mutated, never rebound (grid-ownership invariant).
+    controller._last_fold = controller._cells.copy()
+    controller._pending_groups = groups
+    cells_obj = controller._cells  # capture identity to prove no rebind below.
+    changed: list[tuple[int, int]] = []
+    for _key, group_cells in groups:
+        for cell in group_cells:
+            row, col = cell
+            if not controller._cells[row, col]:
+                controller._cells[row, col] = True
+                changed.append(cell)
+    controller._search.move_start(robot_cell)
+    controller._search.update_cells(sorted(changed))
+
+    # The full stamp must seal the grid: the BASE settle (bypassing the peel override)
+    # returns None exactly when g(start) is infinite. If this passes vacuously the wall
+    # did not actually disconnect start from goal and the peel test would be meaningless.
+    assert DStarLiteController._settle_and_extract(controller, state0[:2]) is None, (
+        "TC56 setup: the full stamp must seal the grid (the base settle must find no "
+        "path before the peel runs)"
+    )
+
+    # The override peel: drop the farthest-future group until a path re-exists.
+    result = controller._settle_and_extract(state0[:2])
+    assert result is not None, (
+        "TC56: the settle-time peel must restore a path by dropping the sealing wall"
+    )
+    # The farthest-future sealing wall is peeled away: every stamp-only wall cell (one
+    # that was False in the un-stamped fold) is restored to False -- EXCEPT the cell
+    # shared with the retained imminent group, which must survive (asserted below).
+    assert all(
+        not controller._cells[r, wall_col]
+        for r in range(rows)
+        if not controller._last_fold[r, wall_col] and r != shared_row
+    ), (
+        "TC56: the farthest-future sealing wall must be peeled (un-stamped) so a path "
+        "to the goal re-exists"
+    )
+    # The most-imminent group is retained (still stamped after the peel).
+    assert bool(controller._cells[imminent_cell]), (
+        "TC56: the most-imminent group must be retained after the peel"
+    )
+    # Shared-cell-across-groups: the wall cell that ALSO belongs to the retained
+    # imminent group must NOT be un-stamped -- a dropped group may never erase a cell a
+    # kept group still needs. (The rest of the wall column IS peeled, asserted above.)
+    assert bool(controller._cells[shared_cell]) is True, (
+        "TC56: a cell shared between the dropped wall group and the retained imminent "
+        "group must survive the peel (not be un-stamped)"
+    )
+    # Grid-ownership invariant: self._cells is mutated in place, never rebound.
+    assert controller._cells is cells_obj, (
+        "TC56: the peel must mutate self._cells in place, never rebind it"
+    )
+
+
+def tc56b(yaml_path: str, seed: int) -> None:
+    """Genuine dead-end: settle-time peel-to-zero stays None; act() does NOT raise (AC6).
+
+    Two complementary checks against the oracle controller (in-process reset() on the
+    real world YAML; no irsim, no subprocess):
+
+    (a) A genuine static dead-end — a full vertical wall that is part of the un-stamped
+        FOLD (not a stamp). ``_unstamp_group`` refuses to erase a real fold obstacle, so
+        even peeling every predicted group leaves the grid sealed and
+        ``_settle_and_extract`` returns None: the controller keeps its last valid
+        follower instead of raising. Built from a crafted MID-episode dead-end fold,
+        avoiding arena_no_path.yaml whose sealed START would raise at reset().
+
+    (b) Full-pipeline non-raise through act() under a dense stationary prediction. Because
+        act() re-folds memorylessly, the pure static fold stays solvable, so a prediction
+        seal is always peelable — this exercises the peel-SUCCESS path and proves act()
+        returns a valid finite (2,1) action with a follower. The genuine-dead-end (None)
+        assertion lives in (a); (b) does NOT assert follower identity (a successful peel
+        may legitimately rebuild it). A FRESH controller is used for each check so (a)'s
+        mutated grid never leaks into (b).
+    """
+    _ensure_repo_root_on_path()
+    from arena.dynamic import DynamicObstacleState  # type: ignore[import-not-found]
+    from manual_astar import world_to_grid  # type: ignore[import-not-found]
+    from planners import build_controller  # type: ignore[import-not-found]
+    from planners._predict import ThreatKey  # type: ignore[import-not-found]
+
+    raw = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8"))
+    start = raw["robot"]["state"]
+    state0 = np.array(
+        [float(start[0]), float(start[1]), float(start[2]) if len(start) > 2 else 0.0],
+        dtype=np.float64,
+    )
+    nan_lidar = np.full((LIDAR_BEAM_COUNT,), np.nan, dtype=np.float64)
+
+    # --- (a) Direct dead-end: the wall is a REAL fold obstacle, so the peel cannot
+    #         erase it and the grid stays sealed even after peeling to zero. ---
+    controller = build_controller("d_star_lite_oracle", None, predict_horizon=10)
+    controller.reset(yaml_path, (), nan_lidar, state0)
+
+    grid = controller._grid
+    robot_cell = world_to_grid(state0[:2], grid)
+    goal_cell = world_to_grid(controller._goal_xy, grid)
+    rows = controller._cells.shape[0]
+    wall_col = (robot_cell[1] + goal_cell[1]) // 2
+
+    # Seal the grid with a full column that is part of the FOLD: mutate self._cells and
+    # snapshot it into _last_fold so the wall is NOT stamp-only — _unstamp_group refuses
+    # to erase a real fold obstacle (self._last_fold[row, col] is True there).
+    for r in range(rows):
+        controller._cells[r, wall_col] = True
+    controller._last_fold = controller._cells.copy()
+    # A single harmless off-route pending group: the peel will try to drop it, but it is
+    # not the wall, so the wall survives and the grid stays sealed at zero stamp.
+    controller._pending_groups = [
+        (ThreatKey(1, 1), [(robot_cell[0] + 5, robot_cell[1] + 3)])
+    ]
+    controller._search.move_start(robot_cell)
+    controller._search.update_cells([(r, wall_col) for r in range(rows)])
+
+    assert controller._settle_and_extract(state0[:2]) is None, (
+        "TC56b(a): a genuine fold dead-end (a real-obstacle wall) must leave "
+        "_settle_and_extract returning None even after peeling every predicted group"
+    )
+
+    # --- (b) Full pipeline: act() under a dense stationary prediction must not raise.
+    #         A FRESH controller, so (a)'s sealed grid never leaks in. ---
+    controller_b = build_controller("d_star_lite_oracle", None, predict_horizon=10)
+    controller_b.reset(yaml_path, (), nan_lidar, state0)
+    assert controller_b._follower is not None, (
+        "TC56b(b) setup: reset() must build a follower"
+    )
+
+    dense = tuple(
+        DynamicObstacleState(id=i, x=24.0, y=float(2 + i), vx=0.0, vy=0.0, radius=0.3)
+        for i in range(20)
+    )
+    controller_b.observe_truth(dense)
+    action = controller_b.act(state0, nan_lidar)
+    assert action.shape == (2, 1), (
+        f"TC56b(b): act() must return a (2,1) action under a dense prediction, got "
+        f"shape {action.shape}"
+    )
+    assert bool(np.all(np.isfinite(action))), (
+        "TC56b(b): act() must return a finite action under a dense prediction"
+    )
+    assert controller_b._follower is not None, (
+        "TC56b(b): act() must keep a valid follower (the peelable seal re-solves)"
+    )
+
+
+def tc57(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """d_star_lite_oracle_h0 trace == plain d_star_lite trace (byte-identical, AC2).
+
+    Runs both algorithms on the SAME seed/world through the runner subprocess, in BOTH
+    --no-traffic and traffic-on regimes (4 runs total), into a temp results dir. The
+    zero-horizon oracle stamps nothing, so its trace must be byte-identical to plain
+    d_star_lite in each regime — proving --predict-horizon 0 is a true no-op baseline.
+    """
+    repo_root = _ensure_repo_root_on_path()
+    seed_value = "57"
+    world_stem = Path(yaml_path).stem
+
+    def _run(algorithm: str, td: str, traffic_flag: str, extra: list[str]) -> None:
+        r = subprocess.run(
+            [
+                sys.executable, "-m", "runners.run_episode",
+                "--algorithm", algorithm,
+                "--seed", seed_value,
+                "--world", yaml_path,
+                traffic_flag,
+                "--results-dir", td,
+                *extra,
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert r.returncode == 0, (
+            f"TC57 {algorithm} ({traffic_flag}) runner exit {r.returncode}; "
+            f"stderr={r.stderr[-400:]}"
+        )
+
+    for traffic_flag in ("--no-traffic", "--traffic"):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            _run("d_star_lite", td, traffic_flag, [])
+            _run("d_star_lite_oracle", td, traffic_flag, ["--predict-horizon", "0"])
+
+            plain_jsonl = (
+                Path(td) / world_stem / "d_star_lite" / f"{seed_value}.trace.jsonl"
+            )
+            oracle_jsonl = (
+                Path(td) / world_stem / "d_star_lite_oracle_h0" / f"{seed_value}.trace.jsonl"
+            )
+            assert plain_jsonl.exists(), (
+                f"TC57 ({traffic_flag}): plain d_star_lite trace missing at {plain_jsonl}"
+            )
+            assert oracle_jsonl.exists(), (
+                f"TC57 ({traffic_flag}): oracle_h0 trace missing at {oracle_jsonl} "
+                f"(label must be 'd_star_lite_oracle_h0')"
+            )
+            assert filecmp.cmp(str(plain_jsonl), str(oracle_jsonl), shallow=False), (
+                f"TC57 ({traffic_flag}): d_star_lite_oracle_h0 trace differs from plain "
+                f"d_star_lite — zero-horizon stamping is not a true no-op (AC2 broken)"
+            )
+
+
+def tc58(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """d_star_lite_oracle traffic-on e2e + determinism (AC3).
+
+    Runs d_star_lite_oracle --predict-horizon 10 traffic-on to a terminal state, asserts
+    every trace line carries the 8-key schema (incl. dynamic_obstacles_sha256), and that
+    two same-seed runs produce byte-identical trace JSONL. NOTE: the oracle peel makes
+    this the slowest predictive TC; kept to one horizon (10) and one seed pair.
+
+    PERFORMANCE GATE: this case is also a de-facto guard on the oracle's per-tick
+    cost. The shipped PredictiveDStarLiteController runs NO per-tick reachability
+    probe: the per-tick hook only stamps the predicted footprint onto the fold, and
+    reachability is answered at settle-time by _settle_and_extract reusing the D*
+    Lite search's own g(start) values (the settle-time fail-open peel), which fires
+    only when the follower finishes or its committed segment is blocked. That keeps
+    per-tick cost near baseline (~16 ms/tick), so a full non-zero-horizon traffic
+    episode terminates well within the 600 s per-run wall. The byte-for-byte
+    zero-horizon no-op (AC2) is independently proven fast by TC57.
+    """
+    repo_root = _ensure_repo_root_on_path()
+    seed_value = "58"
+    horizon = "10"
+    world_stem = Path(yaml_path).stem
+    cmd = [
+        sys.executable, "-m", "runners.run_episode",
+        "--algorithm", "d_star_lite_oracle",
+        "--predict-horizon", horizon,
+        "--seed", seed_value,
+        "--world", yaml_path,
+        "--traffic",  # default; stated explicitly
+    ]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_a, \
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_b:
+        for td in (td_a, td_b):
+            r = subprocess.run(
+                [*cmd, "--results-dir", td],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            assert r.returncode == 0, (
+                f"TC58 oracle traffic runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+            )
+
+        out_a = Path(td_a) / world_stem / f"d_star_lite_oracle_h{horizon}"
+        out_b = Path(td_b) / world_stem / f"d_star_lite_oracle_h{horizon}"
+        json_a = out_a / f"{seed_value}.json"
+        jsonl_a = out_a / f"{seed_value}.trace.jsonl"
+        jsonl_b = out_b / f"{seed_value}.trace.jsonl"
+        assert json_a.exists(), (
+            f"TC58: metrics JSON missing at {json_a} (label must be "
+            f"'d_star_lite_oracle_h{horizon}')"
+        )
+        assert jsonl_a.exists() and jsonl_b.exists(), (
+            f"TC58: trace JSONLs missing: a={jsonl_a.exists()}, b={jsonl_b.exists()}"
+        )
+
+        # The episode RAN to completion (no runner fault): t=0 planning succeeded.
+        metrics = json.loads(json_a.read_text(encoding="utf-8"))
+        assert metrics["planner_error"] is None, (
+            f"TC58: d_star_lite_oracle must plan successfully at t=0; "
+            f"planner_error={metrics['planner_error']}"
+        )
+
+        lines = jsonl_a.read_text(encoding="utf-8").splitlines()
+        assert lines, "TC58: oracle traffic trace JSONL is empty"
+        for idx, raw in enumerate(lines):
+            rec = json.loads(raw)
+            assert isinstance(rec, dict), f"TC58: trace line {idx} is not an object"
+            assert "dynamic_obstacles_sha256" in rec, (
+                f"TC58: trace line {idx} missing dynamic_obstacles_sha256 with traffic "
+                f"on; keys={sorted(rec)}"
+            )
+            assert len(rec) == 8, (
+                f"TC58: trace line {idx} must have 8 keys with traffic on, got "
+                f"{len(rec)}: {sorted(rec)}"
+            )
+
+        assert filecmp.cmp(str(jsonl_a), str(jsonl_b), shallow=False), (
+            "TC58: two same-seed oracle traffic runs produced differing trace JSONL; "
+            "predictive determinism through the runner is broken"
+        )
+
+
+def tc59(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — subprocess exit codes
+    """--predict-horizon validation: required for the predict family, rejected elsewhere.
+
+    Asserts (via subprocess exit codes, mirroring TC-CLI/TC37) that --predict-horizon is
+    REQUIRED for d_star_lite_oracle (omitting it -> exit 2), REJECTED for a non-predict
+    family (a_star_once --predict-horizon 5 -> exit 2), and that --replan-k is REJECTED
+    for d_star_lite_oracle (-> exit 2); each rejected run writes NO <seed>.json. A valid
+    oracle run (horizon 0, the fast no-op path) writes to the d_star_lite_oracle_h0
+    label dir, and algorithm_label folds a non-zero horizon into `_h<steps>` (pure).
+    """
+    repo_root = _ensure_repo_root_on_path()
+    seed_value = "59"
+    world_stem = Path(yaml_path).stem
+
+    def _run(extra: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            r = subprocess.run(
+                [
+                    sys.executable, "-m", "runners.run_episode",
+                    "--algorithm", extra[0],
+                    "--seed", seed_value,
+                    "--world", yaml_path,
+                    "--no-traffic",
+                    "--results-dir", td,
+                    *extra[1:],
+                ],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            # Capture whether any <seed>.json leaked, while td is still alive.
+            r.stray_json = list(Path(td).rglob(f"{seed_value}.json"))  # type: ignore[attr-defined]
+            return r
+
+    # (a) predict family WITHOUT --predict-horizon -> exit 2, no JSON.
+    r_missing = _run(["d_star_lite_oracle"], timeout=120)
+    assert r_missing.returncode == 2, (
+        f"TC59: d_star_lite_oracle without --predict-horizon must exit 2, got "
+        f"{r_missing.returncode}; stderr={r_missing.stderr[-400:]}"
+    )
+    assert not r_missing.stray_json, (  # type: ignore[attr-defined]
+        f"TC59: a rejected run must write no <seed>.json, found {r_missing.stray_json}"  # type: ignore[attr-defined]
+    )
+
+    # (b) non-predict family WITH --predict-horizon -> exit 2, no JSON.
+    r_forbidden = _run(["a_star_once", "--predict-horizon", "5"], timeout=120)
+    assert r_forbidden.returncode == 2, (
+        f"TC59: a_star_once with --predict-horizon must exit 2, got "
+        f"{r_forbidden.returncode}; stderr={r_forbidden.stderr[-400:]}"
+    )
+    assert not r_forbidden.stray_json, (  # type: ignore[attr-defined]
+        f"TC59: a rejected run must write no <seed>.json, found {r_forbidden.stray_json}"  # type: ignore[attr-defined]
+    )
+
+    # (c) predict family WITH --replan-k -> exit 2, no JSON.
+    r_replan = _run(
+        ["d_star_lite_oracle", "--predict-horizon", "10", "--replan-k", "5"],
+        timeout=120,
+    )
+    assert r_replan.returncode == 2, (
+        f"TC59: d_star_lite_oracle with --replan-k must exit 2, got "
+        f"{r_replan.returncode}; stderr={r_replan.stderr[-400:]}"
+    )
+    assert not r_replan.stray_json, (  # type: ignore[attr-defined]
+        f"TC59: a rejected run must write no <seed>.json, found {r_replan.stray_json}"  # type: ignore[attr-defined]
+    )
+
+    # (d) a valid oracle run writes to the d_star_lite_oracle_h<steps> label dir.
+    # Use --predict-horizon 0 here: it is the true no-op fast path (the predictive
+    # hook returns [] before any tracker/peel, so this run is as fast as plain
+    # d_star_lite, ~80 s) yet still lands in the `_h0` label dir, proving the
+    # `_h<steps>` naming end-to-end through the runner. A NON-ZERO horizon run is
+    # avoided here on purpose — the oracle's per-tick reachability peel makes a full
+    # episode drive far too slow for a `--check` case; the non-zero label folding is
+    # covered purely below and the non-zero traffic e2e is TC58's job.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        r_ok = subprocess.run(
+            [
+                sys.executable, "-m", "runners.run_episode",
+                "--algorithm", "d_star_lite_oracle",
+                "--predict-horizon", "0",
+                "--seed", seed_value,
+                "--world", yaml_path,
+                "--no-traffic",
+                "--results-dir", td,
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert r_ok.returncode == 0, (
+            f"TC59: a valid oracle run must exit 0, got {r_ok.returncode}; "
+            f"stderr={r_ok.stderr[-400:]}"
+        )
+        json_path = (
+            Path(td) / world_stem / "d_star_lite_oracle_h0" / f"{seed_value}.json"
+        )
+        assert json_path.exists(), (
+            f"TC59: a valid oracle run must write to the d_star_lite_oracle_h0 label "
+            f"dir; missing {json_path}"
+        )
+
+    # (e) PURE: a NON-ZERO horizon folds into the `_h<steps>` label (no episode).
+    # algorithm_label owns the label folding; assert it directly so the non-zero
+    # naming is covered without a slow drive.
+    from planners import algorithm_label  # type: ignore[import-not-found]
+    assert algorithm_label("d_star_lite_oracle", None, 10) == "d_star_lite_oracle_h10", (
+        "TC59: algorithm_label must fold a non-zero --predict-horizon into "
+        "'d_star_lite_oracle_h10'"
+    )
+    assert algorithm_label("d_star_lite_oracle", None, 0) == "d_star_lite_oracle_h0", (
+        "TC59: algorithm_label must fold --predict-horizon 0 into "
+        "'d_star_lite_oracle_h0'"
+    )
+
+
+def tc60(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — drives a short in-process Arena
+    """Truth seam + tick alignment: EpisodeInfo.dynamic_obstacles + observe_truth (AC10).
+
+    1) EpisodeInfo.dynamic_obstacles is () when traffic is off / pre-reset, and a length-20
+       tuple of DynamicObstacleState when traffic is on post-reset.
+    2) Tick alignment: driving an Arena (traffic on) a few steps as the runner does, the
+       snapshot the oracle observes before each act(state, lidar) equals the
+       info.dynamic_obstacles from the SAME reset()/step() call that produced that
+       state/lidar (no off-by-one).
+    3) A non-oracle controller (plain d_star_lite) never has observe_truth called: its
+       wants_truth flag is falsey.
+    """
+    _ensure_repo_root_on_path()
+    from arena.dynamic import (  # type: ignore[import-not-found]
+        DynamicObstacleState,
+        TARGET_POPULATION,
+    )
+    from planners import build_controller  # type: ignore[import-not-found]
+
+    # --- (1a) traffic OFF, pre-reset and post-reset: dynamic_obstacles is (). ---
+    arena_off = Arena(yaml_path, seed=3, traffic=False)
+    try:
+        _, _, info_off = arena_off.reset()
+        assert info_off.dynamic_obstacles == (), (
+            f"TC60: traffic-off post-reset dynamic_obstacles must be (), got "
+            f"{info_off.dynamic_obstacles!r}"
+        )
+    finally:
+        arena_off.close()
+
+    # --- (3) wants_truth flags: oracle opts in, plain D* Lite does not. ---
+    oracle = build_controller("d_star_lite_oracle", None, predict_horizon=5)
+    plain = build_controller("d_star_lite", None)
+    assert getattr(oracle, "wants_truth", False), (
+        "TC60: d_star_lite_oracle must set wants_truth=True (opts into observe_truth)"
+    )
+    assert not getattr(plain, "wants_truth", False), (
+        "TC60: plain d_star_lite must have a falsey wants_truth (observe_truth is "
+        "never called for it)"
+    )
+
+    # --- (1b) traffic ON: post-reset dynamic_obstacles is a length-20 tuple of state. ---
+    arena_on = Arena(yaml_path, seed=3, traffic=True)
+    try:
+        state0, lidar0, info0 = arena_on.reset()
+        assert isinstance(info0.dynamic_obstacles, tuple), (
+            "TC60: traffic-on dynamic_obstacles must be a tuple"
+        )
+        assert len(info0.dynamic_obstacles) == TARGET_POPULATION, (
+            f"TC60: traffic-on dynamic_obstacles must have {TARGET_POPULATION} entries, "
+            f"got {len(info0.dynamic_obstacles)}"
+        )
+        for entry in info0.dynamic_obstacles:
+            assert isinstance(entry, DynamicObstacleState), (
+                f"TC60: dynamic_obstacles entries must be DynamicObstacleState, got "
+                f"{type(entry).__name__}"
+            )
+
+        # --- (2) tick alignment, mimicking the runner loop. ---
+        oracle.reset(yaml_path, arena_on.initial_dynamic_snapshot, lidar0, state0)
+        observed: list[tuple] = []
+        original_observe = oracle.observe_truth
+
+        def _spy(snapshot: tuple) -> None:
+            observed.append(snapshot)
+            original_observe(snapshot)
+
+        oracle.observe_truth = _spy  # type: ignore[method-assign]
+
+        state, lidar, current_info = state0, lidar0, info0
+        steps_driven = 0
+        for _ in range(4):
+            # `current_info` is the EpisodeInfo from the SAME call that produced
+            # `state`/`lidar` (reset() at t=0, the same step() thereafter).
+            info_for_this_state = current_info
+            oracle.observe_truth(current_info.dynamic_obstacles)
+            assert observed[-1] == info_for_this_state.dynamic_obstacles, (
+                f"TC60: tick misalignment at step {steps_driven} — the snapshot the "
+                f"oracle observed is not the one tick-aligned with its state/lidar"
+            )
+            action = oracle.act(state, lidar)
+            state, lidar, done, current_info = arena_on.step(action)
+            steps_driven += 1
+            if done:
+                break
+        assert steps_driven >= 2, (
+            f"TC60: the alignment drive must cover at least 2 steps, got {steps_driven}"
+        )
+    finally:
+        arena_on.close()
+
+
+def tc61(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure import + set algebra
+    """run_all tolerates experimental keys (AC8).
+
+    Importing planners + runners.run_all must not raise, and run_all's canonical-set
+    assertion must hold as set(_CANONICAL_ORDER) == set(ALGORITHMS) - EXPERIMENTAL_KEYS
+    (the experimental predictive keys are carved out of the canonical-11 study set).
+    """
+    _ensure_repo_root_on_path()
+    import planners  # type: ignore[import-not-found]
+    from planners._grid import EXPERIMENTAL_KEYS  # type: ignore[import-not-found]
+    import runners.run_all as run_all  # type: ignore[import-not-found]
+
+    expected = set(planners.ALGORITHMS) - set(EXPERIMENTAL_KEYS)
+    canonical = set(run_all._CANONICAL_ORDER)
+    assert canonical == expected, (
+        f"TC61: run_all._CANONICAL_ORDER must equal ALGORITHMS minus EXPERIMENTAL_KEYS; "
+        f"missing={expected - canonical}, extra={canonical - expected}"
+    )
+    # The experimental keys must be excluded from the canonical set (carve-out holds).
+    assert not (canonical & set(EXPERIMENTAL_KEYS)), (
+        f"TC61: experimental keys must not appear in _CANONICAL_ORDER, found "
+        f"{canonical & set(EXPERIMENTAL_KEYS)}"
+    )
+
+
+def tc62(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — subprocess selfcheck
+    """plot_horizon_sweep --selfcheck passes with no irsim (AC9).
+
+    Runs `python -m runners.plot_horizon_sweep --selfcheck` as a subprocess (its
+    synthetic-fixture suite builds everything in a TemporaryDirectory — no irsim, no
+    real episodes) and asserts exit code 0.
+    """
+    repo_root = _ensure_repo_root_on_path()
+    r = subprocess.run(
+        [sys.executable, "-m", "runners.plot_horizon_sweep", "--selfcheck"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert r.returncode == 0, (
+        f"TC62: plot_horizon_sweep --selfcheck must exit 0, got {r.returncode}; "
+        f"stdout={r.stdout[-400:]} stderr={r.stderr[-400:]}"
+    )
+
+
+def tc63(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """d_star_lite_predictive (lidar) traffic-on e2e + determinism.
+
+    The lidar-fed, Mission-faithful predictive variant: it estimates obstacle
+    velocities from frame-to-frame lidar clustering (no truth seam — wants_truth=False)
+    and stamps a WIDENING cone (geometry="cone") to absorb that estimation noise.
+    Runs d_star_lite_predictive --predict-horizon 10 traffic-on to a terminal state,
+    asserts every trace line carries the 8-key schema (incl. dynamic_obstacles_sha256),
+    and that two same-seed runs produce byte-identical trace JSONL. NOTE: kept to one
+    horizon (10) and one seed pair (mirrors TC58's oracle e2e).
+
+    PERFORMANCE GATE: like the oracle (TC58), the lidar variant shares the settle-time
+    fail-open peel — no per-tick reachability probe. The per-tick hook only runs the
+    LidarTracker + cone stamp; reachability is answered at settle-time by
+    _settle_and_extract reusing the D* Lite search's own g(start) values, which fires
+    only when the follower finishes or its committed segment is blocked. That keeps
+    per-tick cost near baseline, so a full non-zero-horizon traffic episode terminates
+    well within the 600 s per-run wall.
+    """
+    repo_root = _ensure_repo_root_on_path()
+    seed_value = "63"
+    horizon = "10"
+    world_stem = Path(yaml_path).stem
+    cmd = [
+        sys.executable, "-m", "runners.run_episode",
+        "--algorithm", "d_star_lite_predictive",
+        "--predict-horizon", horizon,
+        "--seed", seed_value,
+        "--world", yaml_path,
+        "--traffic",  # default; stated explicitly
+    ]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_a, \
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_b:
+        for td in (td_a, td_b):
+            r = subprocess.run(
+                [*cmd, "--results-dir", td],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            assert r.returncode == 0, (
+                f"TC63 predictive traffic runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+            )
+
+        out_a = Path(td_a) / world_stem / f"d_star_lite_predictive_h{horizon}"
+        out_b = Path(td_b) / world_stem / f"d_star_lite_predictive_h{horizon}"
+        json_a = out_a / f"{seed_value}.json"
+        jsonl_a = out_a / f"{seed_value}.trace.jsonl"
+        jsonl_b = out_b / f"{seed_value}.trace.jsonl"
+        assert json_a.exists(), (
+            f"TC63: metrics JSON missing at {json_a} (label must be "
+            f"'d_star_lite_predictive_h{horizon}')"
+        )
+        assert jsonl_a.exists() and jsonl_b.exists(), (
+            f"TC63: trace JSONLs missing: a={jsonl_a.exists()}, b={jsonl_b.exists()}"
+        )
+
+        # The episode RAN to completion (no runner fault): t=0 planning succeeded.
+        metrics = json.loads(json_a.read_text(encoding="utf-8"))
+        assert metrics["planner_error"] is None, (
+            f"TC63: d_star_lite_predictive must plan successfully at t=0; "
+            f"planner_error={metrics['planner_error']}"
+        )
+
+        lines = jsonl_a.read_text(encoding="utf-8").splitlines()
+        assert lines, "TC63: predictive traffic trace JSONL is empty"
+        for idx, raw in enumerate(lines):
+            rec = json.loads(raw)
+            assert isinstance(rec, dict), f"TC63: trace line {idx} is not an object"
+            assert "dynamic_obstacles_sha256" in rec, (
+                f"TC63: trace line {idx} missing dynamic_obstacles_sha256 with traffic "
+                f"on; keys={sorted(rec)}"
+            )
+            assert len(rec) == 8, (
+                f"TC63: trace line {idx} must have 8 keys with traffic on, got "
+                f"{len(rec)}: {sorted(rec)}"
+            )
+
+        assert filecmp.cmp(str(jsonl_a), str(jsonl_b), shallow=False), (
+            "TC63: two same-seed predictive traffic runs produced differing trace JSONL; "
+            "predictive determinism through the runner is broken"
+        )
+
+
+def tc64(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure in-process; fixed synthetic fixture
+    """LidarTracker determinism across a multi-frame cluster-count change.
+
+    Drives a LidarTracker over a >=4-frame synthetic lidar fixture WHERE THE CLUSTER
+    COUNT CHANGES between frames (one obstacle for 3 frames, a 2nd appears, the 1st
+    leaves), twice on fresh instances. This exercises the association-stability hazard
+    — the danger that a changing cluster population reorders or mis-associates tracks
+    and silently desyncs the velocity estimate — not just a single 2-frame diff.
+
+    In-process only (NO irsim, NO subprocess). The fixture is fully fixed (no RNG), so
+    the case is self-deterministic regardless of the `seed` arg, which is ignored. The
+    grid is all-free (80x80 cells at 0.5 m, offset (-10,-10)) so the static occupancy
+    subtracts nothing — this case targets determinism + association, not static
+    subtraction.
+
+    Asserts:
+      1. Determinism (binding): the two list[list[Track]] sequences are byte-identical
+         via dataclasses.astuple comparison.
+      2. The cluster count genuinely changed across frames (per-frame counts ==
+         [1, 1, 1, 2, 1], an enter then a leave).
+      3. The first frame has zero velocity (no prior) and a +x-moving obstacle yields a
+         non-zero, correctly-signed velocity after the second frame (the estimator is
+         actually frame-differencing, not returning zeros).
+    """
+    import math
+
+    _ensure_repo_root_on_path()
+    from manual_astar import OccupancyGrid  # type: ignore[import-not-found]
+    from planners._predict import PREDICT_DT, LidarTracker, Track  # type: ignore[import-not-found]
+
+    def make_grid() -> OccupancyGrid:
+        """An all-free 40x40 m grid (offset (-10,-10)) so nothing is subtracted."""
+        rows = cols = 80
+        cells = np.zeros((rows, cols), dtype=bool)
+        return OccupancyGrid(
+            cells=cells, resolution=0.5, offset=np.array([-10.0, -10.0], dtype=float)
+        )
+
+    def ray_disk_range(
+        bearing: float, center: tuple[float, float], radius: float
+    ) -> float | None:
+        """Nearest forward hit range of a beam from the origin against a disk."""
+        dx, dy = math.cos(bearing), math.sin(bearing)
+        cx, cy = center
+        d_dot_c = dx * cx + dy * cy
+        disc = d_dot_c * d_dot_c - (cx * cx + cy * cy - radius * radius)
+        if disc < 0.0:
+            return None
+        t = d_dot_c - math.sqrt(disc)
+        return t if t > 0.0 else None
+
+    def synth_lidar(
+        bearings: np.ndarray, disks: list[tuple[tuple[float, float], float]]
+    ) -> np.ndarray:
+        """Synthesize a scan (robot at origin, theta=0) hitting the given disks."""
+        ranges = np.full(bearings.shape[0], np.nan, dtype=float)
+        for i, bearing in enumerate(bearings):
+            best: float | None = None
+            for center, radius in disks:
+                r = ray_disk_range(float(bearing), center, radius)
+                if r is not None and (best is None or r < best):
+                    best = r
+            if best is not None:
+                ranges[i] = best
+        return ranges
+
+    def run_sequence(
+        bearings: np.ndarray,
+        frames: list[list[tuple[tuple[float, float], float]]],
+    ) -> list[list[Track]]:
+        grid = make_grid()
+        tracker = LidarTracker(grid, bearings)
+        state = np.array([0.0, 0.0, 0.0], dtype=float)
+        out: list[list[Track]] = []
+        for disks in frames:
+            lidar = synth_lidar(bearings, disks)
+            tracks = tracker.update(snapshot=(), state=state, lidar=lidar, dt=PREDICT_DT)
+            out.append(tracks)
+        return out
+
+    # Slightly under 2*pi (math.pi * 0.999) so WrapTo2Pi does not collapse the scan to
+    # a single ray (gotcha-lidar-wraptopi-collapses-2pi).
+    bearings = np.linspace(-math.pi, math.pi * 0.999, 180)
+    radius = 0.4
+
+    # Obstacle A is on-axis and moves +x in 0.15 m straight-line steps (=> ~1.5 m/s,
+    # vy~0 by symmetry of the visible near arc). Obstacle B appears in frame 4; A
+    # leaves in frame 5, so the cluster count walks 1 -> 1 -> 1 -> 2 -> 1.
+    a0 = (5.0, 0.0)
+    a1 = (5.15, 0.0)
+    a2 = (5.30, 0.0)
+    a3 = (5.45, 0.0)
+    b = (3.0, -3.0)
+
+    frames: list[list[tuple[tuple[float, float], float]]] = [
+        [(a0, radius)],                 # frame 1: 1 cluster
+        [(a1, radius)],                 # frame 2: 1 cluster
+        [(a2, radius)],                 # frame 3: 1 cluster
+        [(a3, radius), (b, radius)],    # frame 4: 2 clusters (B appears)
+        [(b, radius)],                  # frame 5: 1 cluster (A leaves)
+    ]
+
+    seq1 = run_sequence(bearings, frames)
+    seq2 = run_sequence(bearings, frames)
+
+    # 1. Determinism (binding): two fresh-instance runs byte-identical.
+    tup1 = [[dataclasses.astuple(t) for t in frame] for frame in seq1]
+    tup2 = [[dataclasses.astuple(t) for t in frame] for frame in seq2]
+    assert tup1 == tup2, (
+        "TC64: two fresh LidarTracker runs over the same 5-frame fixture diverged; "
+        "the estimator/association is non-deterministic"
+    )
+
+    # 2. The cluster count actually changed across frames (enter/leave exercised, not a
+    #    static count) — fail loud with the observed counts if not.
+    counts = [len(frame) for frame in seq1]
+    assert counts == [1, 1, 1, 2, 1], (
+        f"TC64: fixture did not exercise a cluster-count change; per-frame track counts "
+        f"were {counts}, expected [1, 1, 1, 2, 1]"
+    )
+
+    # 3a. The first frame has no prior, so its velocity estimate must be exactly zero.
+    frame1 = seq1[0]
+    assert len(frame1) == 1, f"TC64: expected 1 track in frame 1, got {len(frame1)}"
+    assert frame1[0].vx == 0.0 and frame1[0].vy == 0.0, (
+        f"TC64: first-frame velocity must be (0, 0) with no prior, got "
+        f"({frame1[0].vx}, {frame1[0].vy})"
+    )
+
+    # 3b. After the obstacle moves +x, the estimate must be non-zero and correctly
+    #     signed — proving the estimator is differencing, not returning zeros.
+    frame2 = seq1[1]
+    assert len(frame2) == 1, f"TC64: expected 1 track in frame 2, got {len(frame2)}"
+    track_a = frame2[0]
+    assert track_a.vx > 0.5 and abs(track_a.vy) < 0.2, (
+        f"TC64: a +x-moving obstacle must yield vx>0.5 and |vy|<0.2 (estimator is "
+        f"frame-differencing), got vx={track_a.vx:.4f} vy={track_a.vy:.4f}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI runner — --check (default) or --render. See module docstring above.
 # ---------------------------------------------------------------------------
 
@@ -3654,6 +4962,19 @@ def _run_checks(yaml_path: str, seed: int) -> int:
         ("TC52: non-baseline determinism across a despawn/refill cycle", tc52),
         ("TC-CLI: speed-flag CLI rejection (exit 2, no JSON)", tc_cli),
         ("TC-FWD: run_experiment flag forwarding + manifest provenance", tc_fwd),
+        ("TC53: predict_blocked_cells capsule geometry (disk train, sorted, deterministic)", tc53),
+        ("TC54: predict_blocked_cells cone widening + exclusion zone + gate drop", tc54),
+        ("TC55: predicted-conflict gate (divergent-now-collide-later crosser)", tc55),
+        ("TC56: threat-ordered bounded peel (farthest-future-first, imminent retained)", tc56),
+        ("TC56b: peel-to-zero still unsolvable — act() does not raise", tc56b),
+        ("TC57: d_star_lite_oracle_h0 trace == plain d_star_lite (byte-identical)", tc57),
+        ("TC58: d_star_lite_oracle traffic-on e2e + determinism", tc58),
+        ("TC59: --predict-horizon validation (exit 2; label dir)", tc59),
+        ("TC60: dynamic_obstacles truth seam + tick alignment", tc60),
+        ("TC61: run_all tolerates experimental keys (canonical carve-out)", tc61),
+        ("TC62: plot_horizon_sweep --selfcheck passes (no irsim)", tc62),
+        ("TC63: d_star_lite_predictive traffic-on e2e + determinism", tc63),
+        ("TC64: LidarTracker determinism across a multi-frame cluster-count change", tc64),
     ]
     failures = 0
     for label, fn in cases:
@@ -3696,7 +5017,7 @@ def _parse_args() -> argparse.Namespace:
     group.add_argument(
         "--check",
         action="store_true",
-        help="Run TC1-TC52 + TC-CLI/TC-FWD headless (55 cases, incl. Phase 2 traffic + Phase 3 batch runner + replanning + D* Lite (incl. deferred-settle) + reactive (DWA/APF) + sampling (RRT/RRT*) families + rrt-local LOS-helper equivalence + the obstacle-speed-cap sweep)",
+        help="Run TC1-TC64 + TC-CLI/TC-FWD headless (68 cases, incl. Phase 2 traffic + Phase 3 batch runner + replanning + D* Lite (incl. deferred-settle) + reactive (DWA/APF) + sampling (RRT/RRT*) families + rrt-local LOS-helper equivalence + the obstacle-speed-cap sweep + the predictive (motion-aware) D* Lite family, incl. the lidar frame-differencing estimator)",
     )
     return parser.parse_args()
 
