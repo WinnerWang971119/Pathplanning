@@ -23,6 +23,7 @@ CLI (once the chart layer lands):
         [--replan-k <int>]      # default 5; cadence used to build replan labels
         [--charts a1,a3,...]    # default all of a1,a3,a4,b1,b2,b3,b4
         [--out-dir <dir>]       # default <results-dir>/<world_stem>/plots/
+        [--filter|--no-filter]  # apply the degenerate-seed sidecar if fresh (default on; issue #9)
         [--selfcheck]           # run the self-check suite (T5) instead of plotting
 
 Outputs (once the chart layer lands):
@@ -41,7 +42,7 @@ import csv
 import json
 import statistics
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 # Make the repo root importable so `from planners import algorithm_label` resolves
@@ -50,6 +51,20 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+# The degenerate-seed filter core (issue #9). This module is STDLIB-ONLY — it
+# imports nothing from `planners`/irsim/matplotlib — so importing it at module
+# top keeps `import runners.plot` headless (AC12, verified by the AC12 subprocess
+# check). These five names are the whole read-side contract: read the sidecar,
+# verify it is fresh + covers the plotted labels, know its filename, and quote the
+# criterion id in the A1 footnote.
+from runners._seed_filter import (  # noqa: E402 — must follow the sys.path shim above
+    CRITERION_ID,
+    SEED_FILTER_NAME,
+    read_seed_filter,
+    sidecar_covers,
+    sidecar_is_fresh,
+)
 
 # `algorithm_label` (from `planners`) and `episode_out_dir` (from
 # `runners._layout`) are imported LAZILY inside the functions that use them, NOT
@@ -168,22 +183,31 @@ class AlgoSummary:
     `wallclock_from_subtree`); when that subtree is absent the tuple is empty and
     the flag is False, so B3 (built later) can fall back to the bulk dir's
     wallclock with a caveat. `failure_rate` is NaN when no episodes are present.
+
+    Degenerate-seed filter (issue #9): `n_present`/`n_*`/`failure_rate` are the
+    HEADLINE (filtered) values — every dropped degenerate seed this algorithm
+    saw is removed (a degenerate seed is a crash, so each drop removes 1 present
+    + 1 crash). `n_present_raw`/`failure_rate_raw` keep the pre-drop values for
+    the summary.csv audit trail. When nothing is dropped they are equal.
+    `per_seed` stays COMPLETE so B1 still renders the dropped seeds.
     """
 
     label: str                          # results dir label, e.g. "a_star_replan_k5"
     display: str                        # legend name, e.g. "A* replan (K=5)"
     family: str                         # "grid" | "incremental" | "reactive" | "sampling"
-    n_present: int                      # roster size counted (ok + runner_error); the chart denominator
-    n_success: int
+    n_present: int                      # FILTERED roster size (raw minus this algo's dropped seeds); the chart denominator
+    n_success: int                      # counts below are FILTERED (dropped seeds removed; a degenerate seed is always a crash)
     n_crash: int
     n_timeout: int
     n_planner_error: int
     n_dnf: int                          # episodes the batch killed at the wallclock wall (manifest status=runner_error, no JSON)
-    failure_rate: float                 # (crash+timeout+planner_error+dnf)/n_present; NaN if n_present == 0
-    times: tuple[float, ...]            # successful time_to_goal values
-    path_lengths: tuple[float, ...]     # path_length over successes
+    failure_rate: float                 # FILTERED (crash+timeout+planner_error+dnf)/n_present; NaN if n_present == 0
+    n_present_raw: int                  # pre-drop present count (== n_present when nothing dropped); summary.csv audit column
+    failure_rate_raw: float             # pre-drop failure rate over n_present_raw; NaN if n_present_raw == 0
+    times: tuple[float, ...]            # successful time_to_goal values (unfiltered — dropped seeds are crashes, never successes)
+    path_lengths: tuple[float, ...]     # path_length over successes (unfiltered, same reason)
     wallclocks: tuple[float, ...]       # wallclock_per_step from the __wallclock__ subtree (empty if absent)
-    per_seed: dict[int, str]            # seed -> outcome (for the B1 heatmap)
+    per_seed: dict[int, str]            # seed -> outcome, COMPLETE incl. dropped seeds (for the B1 heatmap)
     median_time: float                  # median of times; NaN if n_success == 0
     mean_time: float                    # mean of times; NaN if n_success == 0
     wallclock_from_subtree: bool        # True iff wallclocks came from the __wallclock__ subtree
@@ -198,11 +222,26 @@ class WorldResults:
     `_manifest.json` was found, otherwise the sorted union of every numeric stem
     actually present on disk. `manifest_seed_order` records which of the two
     happened so a later chart can caveat a fallback ordering.
+
+    Degenerate-seed filter (issue #9): `degenerate_seeds` is the dropped set
+    intersected with `seed_order` (excluded from every numeric stat but still
+    drawn, marked, on B1); `n_dropped` is its length; `filter_status` is how the
+    drop was decided ("applied"/"stale"/"indeterminate"/"absent"/"off"), used by
+    the A1 footnote; `filter_missing_labels` names the required labels the sidecar
+    could not find (the A1 footnote's "missing:" list in the indeterminate case).
+    The loader fills `degenerate_seeds`/`n_dropped` from its `dropped_seeds`
+    argument; `main` sets `filter_status`/`filter_missing_labels` from the sidecar
+    checks (via `dataclasses.replace`). The three status fields default to the
+    unfiltered values so the sweep plotters, which never filter, are unaffected.
     """
 
     summaries: tuple[AlgoSummary, ...]
     seed_order: tuple[int, ...]
     manifest_seed_order: bool           # True iff seed_order came from a manifest's derived_seeds
+    degenerate_seeds: tuple[int, ...] = ()   # dropped seeds ∩ seed_order (issue #9); () when unfiltered
+    filter_status: str = "off"               # "applied"|"stale"|"indeterminate"|"absent"|"off"
+    n_dropped: int = 0                       # len(degenerate_seeds)
+    filter_missing_labels: tuple[str, ...] = ()  # sidecar's missing_labels (A1 footnote, indeterminate case)
 
 
 # --- Loader (AC2 / AC3 / AC9 / AC11) ----------------------------------------
@@ -355,6 +394,7 @@ def _finalize_summary(
     acc: _AlgoAccumulator,
     wallclocks: tuple[float, ...],
     wallclock_from_subtree: bool,
+    dropped_seeds: frozenset[int] = frozenset(),
 ) -> AlgoSummary:
     """Freeze an accumulator into an immutable AlgoSummary with the derived stats.
 
@@ -362,22 +402,65 @@ def _finalize_summary(
     denominator is zero (n_present == 0 / n_success == 0). NaN is the chosen
     "no data" sentinel everywhere in this module so the dtype stays float and
     downstream charts can drop NaNs uniformly.
+
+    `dropped_seeds` is the degenerate-seed set (issue #9). The RAW counts are the
+    pre-drop tally (`n_present_raw`/`failure_rate_raw`); the headline
+    `n_present`/`n_*`/`failure_rate` fields are the FILTERED tally with every
+    dropped seed this accumulator actually saw removed. A degenerate seed is a
+    crash, so each drop removes 1 present + 1 crash (i.e. 1 present + 1 failure);
+    the general per-outcome decrement below is defensive. `per_seed`, `times`, and
+    `path_lengths` stay COMPLETE (B1 still renders the dropped seeds; dropped seeds
+    are never successes so the success stats never move). With `dropped_seeds`
+    empty every filtered value equals its raw value (AC13) — which is exactly how
+    the sweep plotters, which call this without the argument, keep working.
     """
-    n_failed = acc.n_crash + acc.n_timeout + acc.n_planner_error + acc.n_dnf
-    failure_rate = (n_failed / acc.n_present) if acc.n_present > 0 else float("nan")
+    # Raw (pre-drop) tally — the summary.csv audit columns.
+    n_present_raw = acc.n_present
+    n_failed_raw = acc.n_crash + acc.n_timeout + acc.n_planner_error + acc.n_dnf
+    failure_rate_raw = (n_failed_raw / n_present_raw) if n_present_raw > 0 else float("nan")
+
+    # Filtered tally: drop each degenerate seed this algorithm actually has a
+    # per-seed outcome for. `per_seed` only carries PRESENT seeds, so a dropped
+    # seed absent from this algorithm (partial data) is a natural no-op here.
+    n_present = n_present_raw
+    n_success = acc.n_success
+    n_crash = acc.n_crash
+    n_timeout = acc.n_timeout
+    n_planner_error = acc.n_planner_error
+    n_dnf = acc.n_dnf
+    for seed in dropped_seeds:
+        outcome = acc.per_seed.get(seed)
+        if outcome is None:
+            continue
+        n_present -= 1
+        if outcome == "success":
+            n_success -= 1
+        elif outcome == "crash":
+            n_crash -= 1
+        elif outcome == "timeout":
+            n_timeout -= 1
+        elif outcome == "planner_error":
+            n_planner_error -= 1
+        elif outcome == "dnf":
+            n_dnf -= 1
+
+    n_failed = n_crash + n_timeout + n_planner_error + n_dnf
+    failure_rate = (n_failed / n_present) if n_present > 0 else float("nan")
     median_time = statistics.median(acc.times) if acc.times else float("nan")
     mean_time = statistics.fmean(acc.times) if acc.times else float("nan")
     return AlgoSummary(
         label=label,
         display=display,
         family=family,
-        n_present=acc.n_present,
-        n_success=acc.n_success,
-        n_crash=acc.n_crash,
-        n_timeout=acc.n_timeout,
-        n_planner_error=acc.n_planner_error,
-        n_dnf=acc.n_dnf,
+        n_present=n_present,
+        n_success=n_success,
+        n_crash=n_crash,
+        n_timeout=n_timeout,
+        n_planner_error=n_planner_error,
+        n_dnf=n_dnf,
         failure_rate=failure_rate,
+        n_present_raw=n_present_raw,
+        failure_rate_raw=failure_rate_raw,
         times=tuple(acc.times),
         path_lengths=tuple(acc.path_lengths),
         wallclocks=wallclocks,
@@ -504,6 +587,7 @@ def load_world_results(
     *,
     replan_k: int = DEFAULT_REPLAN_K,
     expected: int = DEFAULT_EXPECTED_SEEDS,
+    dropped_seeds: frozenset[int] = frozenset(),
 ) -> WorldResults:
     """Load every canonical algorithm's episodes for one world into summaries.
 
@@ -529,6 +613,15 @@ def load_world_results(
     The B1 heatmap's seed-column order comes from the first manifest found (any
     label's `derived_seeds`); absent any manifest it falls back to the sorted
     union of every numeric stem present.
+
+    `dropped_seeds` (issue #9) is the degenerate-seed set to exclude from the
+    FILTERED per-algorithm counts (`n_present`/`failure_rate`/`n_*`); it is passed
+    straight through to `_finalize_summary`. `WorldResults.degenerate_seeds` is set
+    to `dropped_seeds ∩ seed_order` (and `n_dropped` to its length); `per_seed`
+    stays complete so B1 still marks those seeds. `main` decides `dropped_seeds`
+    from the sidecar and later stamps `filter_status`/`filter_missing_labels` onto
+    the returned `WorldResults` via `dataclasses.replace`. The default empty set is
+    a true no-op (AC13), so callers that never filter get the raw numbers.
     """
     # Deferred to here so a bare `import runners.plot` stays headless (AC1):
     # importing `planners` pulls irsim, which selects a matplotlib backend
@@ -589,6 +682,7 @@ def load_world_results(
                 acc=acc,
                 wallclocks=wallclocks,
                 wallclock_from_subtree=wallclock_from_subtree,
+                dropped_seeds=dropped_seeds,
             )
         )
 
@@ -599,10 +693,15 @@ def load_world_results(
         seed_order = tuple(sorted(seen_seeds))
         from_manifest = False
 
+    # Degenerate seeds actually present in this world's shared stream (issue #9).
+    degenerate_seeds = tuple(sorted(set(dropped_seeds) & set(seed_order)))
+
     return WorldResults(
         summaries=tuple(summaries),
         seed_order=seed_order,
         manifest_seed_order=from_manifest,
+        degenerate_seeds=degenerate_seeds,
+        n_dropped=len(degenerate_seeds),
     )
 
 
@@ -619,6 +718,9 @@ SUMMARY_CSV_COLUMNS = (
     "n_planner_error",
     "n_dnf",
     "failure_rate",
+    "n_present_raw",
+    "failure_rate_raw",
+    "n_dropped",
     "median_time",
     "mean_time",
 )
@@ -629,7 +731,11 @@ def write_summary_csv(summaries: tuple[AlgoSummary, ...] | list[AlgoSummary], ou
 
     One row per algorithm, in CANONICAL order. NaN floats (no episodes / no
     successes) are written as the literal "nan" by csv, which is the documented
-    "no data" marker.
+    "no data" marker. The degenerate-seed filter (issue #9) adds three audit
+    columns after `failure_rate`: `n_present_raw`/`failure_rate_raw` (the pre-drop
+    values) and per-row `n_dropped` (this algorithm's dropped count, i.e.
+    `n_present_raw - n_present`, so `n_present + n_dropped == n_present_raw`).
+    Without a filter they are the raw values with `n_dropped == 0` (AC9/AC13).
     """
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -649,6 +755,9 @@ def write_summary_csv(summaries: tuple[AlgoSummary, ...] | list[AlgoSummary], ou
                     summary.n_planner_error,
                     summary.n_dnf,
                     summary.failure_rate,
+                    summary.n_present_raw,
+                    summary.failure_rate_raw,
+                    summary.n_present_raw - summary.n_present,
                     summary.median_time,
                     summary.mean_time,
                 ]
@@ -700,6 +809,36 @@ def _algorithm_color_map(summaries, plt) -> dict[str, tuple]:
     return color_map
 
 
+def _filter_status_footnote(results: WorldResults) -> str:
+    """One-line A1 footnote describing how the degenerate-seed filter (issue #9)
+    was applied. Pinned to A1 only (the headline scatter), never the other
+    figures. Derived purely from `WorldResults` so the chart signature stays
+    `(results, plt, out_dir)`. Never raises.
+    """
+    status = results.filter_status
+    if status == "applied":
+        return (
+            f"filter: applied - {results.n_dropped} degenerate seed(s) dropped "
+            f"(criterion {CRITERION_ID}); failure rates are CONDITIONAL on "
+            f"non-degenerate seeds; raw full-set rates in summary.csv (failure_rate_raw)"
+        )
+    if status == "stale":
+        return (
+            "filter: STALE, ignored - re-run runners.filter_seeds; "
+            "showing unfiltered full-set failure rates"
+        )
+    if status == "indeterminate":
+        missing = ", ".join(results.filter_missing_labels) or "(unnamed)"
+        return (
+            "filter present but indeterminate - nothing dropped; "
+            f"missing: {missing}"
+        )
+    if status == "off":
+        return "filter: off - showing unfiltered full-set failure rates"
+    # "absent" (and any unexpected value) — no sidecar in play.
+    return "filter: absent - showing unfiltered full-set failure rates"
+
+
 # --- Chart stubs (filled by T2/T3) ------------------------------------------
 
 # Each chart function takes the loaded WorldResults, the pyplot module, and the
@@ -717,6 +856,11 @@ def _chart_a1(results: WorldResults, plt, out_dir: Path) -> Path:
     diamond at the MEDIAN. A 0-success algorithm has no dots and NaN mean/median;
     it is represented by an annotation at its failure_rate row and never raises.
     "Down-left wins" (low time, low failure).
+
+    When the degenerate-seed filter (issue #9) is applied, the plotted
+    `failure_rate` is CONDITIONAL (degenerate seeds excluded); a bottom-left
+    figure footnote states that, the drop count + criterion, and where the raw
+    full-set rates live (summary.csv). The footnote is on A1 only.
     """
     color_map = _algorithm_color_map(results.summaries, plt)
 
@@ -873,6 +1017,20 @@ def _chart_a1(results: WorldResults, plt, out_dir: Path) -> Path:
         fontsize=8,
         title_fontsize=9,
         borderaxespad=0.0,
+    )
+
+    # Degenerate-seed filter status footnote (issue #9) — pinned to A1 only. It
+    # states the drop count + criterion (or the stale/absent/off/indeterminate
+    # reason) and flags that the plotted rates are conditional when applied.
+    fig.text(
+        0.01,
+        0.005,
+        _filter_status_footnote(results),
+        fontsize=8,
+        color="#555555",
+        ha="left",
+        va="bottom",
+        style="italic",
     )
 
     fig.tight_layout()
@@ -1176,7 +1334,7 @@ def _chart_b1(results: WorldResults, plt, out_dir: Path) -> Path:
 
     # Overlay each failure cell as a flat-colored unit rectangle. imshow centres
     # cell (row, col) on integer coords, so the patch spans [col-0.5, col+0.5].
-    from matplotlib.patches import Rectangle
+    from matplotlib.patches import Patch, Rectangle
 
     for row, col, color in failure_cells:
         ax.add_patch(
@@ -1187,6 +1345,27 @@ def _chart_b1(results: WorldResults, plt, out_dir: Path) -> Path:
                 facecolor=color,
                 edgecolor="none",
                 zorder=3,
+            )
+        )
+
+    # Degenerate-seed columns (issue #9): the filter culled these seeds from every
+    # numeric stat, but B1 still renders them (their real per_seed outcome shows
+    # through). Mark the whole column with a hatched, black-edged full-height
+    # overlay so a culled seed reads as visually distinct from a counted crash.
+    degenerate_cols = [
+        col_of_seed[seed] for seed in results.degenerate_seeds if seed in col_of_seed
+    ]
+    for col in degenerate_cols:
+        ax.add_patch(
+            Rectangle(
+                (col - 0.5, -0.5),
+                1.0,
+                max(n_rows, 1),
+                facecolor="none",
+                edgecolor="#000000",
+                hatch="////",
+                linewidth=1.0,
+                zorder=4,
             )
         )
 
@@ -1237,6 +1416,16 @@ def _chart_b1(results: WorldResults, plt, out_dir: Path) -> Path:
             label="absent (no entry)",
         )
     )
+    if results.degenerate_seeds:
+        # Hatched swatch matching the full-height degenerate-column overlay above.
+        failure_handles.append(
+            Patch(
+                facecolor="none",
+                edgecolor="#000000",
+                hatch="////",
+                label="degenerate (filtered)",
+            )
+        )
     failure_legend = ax.legend(
         handles=failure_handles,
         title="failure / absent",
@@ -1645,9 +1834,9 @@ CHART_DISPATCH = {
 }
 
 
-# --- Self-check (T5) --------------------------------------------------------
+# --- Self-check (T5 + issue #9) ---------------------------------------------
 #
-# The suite below runs TC-P1..TC-P11 against synthetic result trees built in a
+# The suite below runs TC-P1..TC-P16 against synthetic result trees built in a
 # TemporaryDirectory — no irsim, no real episodes. Each TC is a plain function
 # that asserts its invariants; `_run_selfcheck_suite` catches per-TC exceptions
 # so one failure never aborts the rest, prints a PASS/FAIL line each, and returns
@@ -1656,8 +1845,12 @@ CHART_DISPATCH = {
 # `derived_seeds` (and, for the DNF roster TC, an `episodes` list), and is
 # parametrizable so each TC can inject the edge cases (0-success algos, short
 # seed counts, malformed JSON, decoy files, a `__wallclock__` subtree, a
-# wallclock-killed roster). Charts are rendered through the real chart functions
-# under the headless Agg backend selected by `ensure_matplotlib()`.
+# wallclock-killed roster). TC-P12..TC-P16 (issue #9) additionally write a
+# `_seed_filter.json` sidecar via `_write_seed_filter_sidecar` and assert the
+# drop/stale/absent/off/indeterminate paths through the data layer (reconstructed
+# summaries + `WorldResults.degenerate_seeds`), never by inspecting a PNG. Charts
+# are rendered through the real chart functions under the headless Agg backend
+# selected by `ensure_matplotlib()`.
 
 # The 7 metric fields run_episode writes (mirrors runners/run_episode.py:78-84).
 _SELFCHECK_METRIC_KEYS = (
@@ -1891,7 +2084,120 @@ def _build_full_fixture(
         )
 
 
-# --- The test cases (TC-P1 .. TC-P10) ---------------------------------------
+def _build_filter_tree(
+    results_root: Path,
+    world_stem: str,
+    *,
+    seeds: list[int],
+    degenerate_seed: int,
+    replan_k: int = DEFAULT_REPLAN_K,
+) -> list[str]:
+    """Write the 11 canonical label dirs for the degenerate-seed filter TCs.
+
+    `degenerate_seed` CRASHES in every algorithm (so dropping it removes exactly
+    1 present + 1 crash from each), every other seed SUCCEEDS, and each dir's
+    `_manifest.json` carries `derived_seeds == seeds`. Returns the 11 labels in
+    CANONICAL order (also the plotter's `_plotted_labels(replan_k)` output).
+    """
+    from planners import algorithm_label
+
+    labels: list[str] = []
+    for name, default_k, default_h, _family, _display in CANONICAL:
+        effective_k = replan_k if default_k is not None else None
+        label = algorithm_label(name, effective_k, default_h)
+        labels.append(label)
+        outcomes = ["crash" if seed == degenerate_seed else "success" for seed in seeds]
+        _write_algo_tree(
+            results_root=results_root,
+            world_stem=world_stem,
+            label=label,
+            seeds=list(seeds),
+            outcomes=outcomes,
+            derived_seeds=list(seeds),
+        )
+    return labels
+
+
+def _write_seed_filter_sidecar(
+    *,
+    results_root: Path,
+    world_stem: str,
+    required_labels: list[str],
+    seed_order: list[int],
+    dropped_seeds: list[int],
+    consulted: list[tuple[str, int]],
+    global_status: str = "ok",
+    missing_labels: list[str] | None = None,
+    absent_files: list[str] | None = None,
+    replan_k: int = DEFAULT_REPLAN_K,
+    predict_horizon: int = 10,
+) -> Path:
+    """Write a `_seed_filter.json` sidecar at `<results_root>/<world_stem>/`.
+
+    Hashes each `consulted` (label, seed) metrics file AS IT EXISTS NOW (so a
+    later mutation trips `sidecar_is_fresh`), records `absent_files` verbatim
+    (they must genuinely be absent for the sidecar to read fresh), and uses
+    `seed_order` as the recorded roster (which must equal the first canonical
+    label's manifest `derived_seeds`). Returns the sidecar path. The write-side
+    `_seed_filter` symbols are imported here (test-only) rather than at module top
+    to keep the runtime top-level import to the read-side contract.
+    """
+    from runners._seed_filter import (
+        SCHEMA_VERSION,
+        PlannerEvidence,
+        SeedFilter,
+        SeedVerdictRow,
+        file_sha256,
+        write_seed_filter,
+    )
+
+    world_dir = results_root / world_stem
+    consulted_hashes: dict[str, str] = {}
+    for label, seed in consulted:
+        digest = file_sha256(world_dir / label / f"{seed}.json")
+        assert digest is not None, f"consulted fixture file {label}/{seed}.json must exist"
+        consulted_hashes[f"{label}/{seed}.json"] = digest
+
+    dropped = set(dropped_seeds)
+    rows = tuple(
+        SeedVerdictRow(
+            seed=seed,
+            verdict="degenerate" if seed in dropped else "kept",
+            planners=(PlannerEvidence(label=required_labels[0], status="instant_crash" if seed in dropped else "survived", crash_step=1 if seed in dropped else None),),
+        )
+        for seed in seed_order
+    )
+
+    obj = SeedFilter(
+        schema_version=SCHEMA_VERSION,
+        criterion_id=CRITERION_ID,
+        world_stem=world_stem,
+        window_seconds=4.0,
+        step_time=0.1,
+        window_steps=40,
+        replan_k=replan_k,
+        predict_horizon=predict_horizon,
+        traffic=True,
+        speed_regime="current",
+        speed_min_factor=0.3,
+        speed_max_factor=1.5,
+        required_labels=tuple(required_labels),
+        roster_is_canonical=True,
+        git_sha=None,
+        global_status=global_status,
+        missing_labels=tuple(missing_labels or ()),
+        seed_order=tuple(seed_order),
+        dropped_seeds=tuple(sorted(dropped)),
+        rows=rows,
+        consulted_hashes=consulted_hashes,
+        absent_files=tuple(absent_files or ()),
+    )
+    sidecar_path = world_dir / SEED_FILTER_NAME
+    write_seed_filter(obj, sidecar_path)
+    return sidecar_path
+
+
+# --- The test cases (TC-P1 .. TC-P16) ---------------------------------------
 #
 # Each returns a short detail string on success and raises AssertionError (with a
 # message) on failure. `_run_selfcheck_suite` turns that into the PASS/FAIL line.
@@ -2371,7 +2677,294 @@ def _tc_p11_dnf_roster(tmp: Path) -> str:
     return "roster: n_total=5, n_dnf=2, n_success=2, failure_rate=3/5; 404/505 marked dnf"
 
 
-# Ordered registry of the 11 test cases. Each entry is (id, callable).
+def _tc_p12_filter_applied(tmp: Path) -> str:
+    """TC-P12: a fresh, covering, global-'ok' sidecar drops one degenerate seed everywhere.
+
+    Data-layer assertions only (mirroring TC-P6, never inspecting a PNG): the
+    dropped seed leaves every algorithm's FILTERED `n_present`/`failure_rate` and
+    the A3 count layer (`n_crash`), the pre-drop values survive as
+    `n_present_raw`/`failure_rate_raw`, `per_seed` stays complete for B1, and
+    `WorldResults.degenerate_seeds`/`n_dropped` name the culled seed.
+    """
+    results_root = tmp / "tc_p12"
+    world_stem = "arena_v1"
+    seeds = [11, 22, 33, 44, 55]
+    degenerate = 33
+    labels = _build_filter_tree(results_root, world_stem, seeds=seeds, degenerate_seed=degenerate)
+
+    # Consult the degenerate seed's metrics in every canonical label (what the
+    # real filter reads to decide degeneracy), hashed fresh into the sidecar.
+    _write_seed_filter_sidecar(
+        results_root=results_root,
+        world_stem=world_stem,
+        required_labels=labels,
+        seed_order=seeds,
+        dropped_seeds=[degenerate],
+        consulted=[(label, degenerate) for label in labels],
+    )
+
+    plotted = _plotted_labels(DEFAULT_REPLAN_K)
+    status, dropped, missing = _decide_seed_filter(
+        results_dir=str(results_root),
+        world_stem=world_stem,
+        plotted_labels=plotted,
+        apply_filter=True,
+    )
+    assert status == "applied", f"a fresh+covering ok sidecar must apply, got {status!r}"
+    assert dropped == frozenset({degenerate}), f"must drop the declared seed, got {dropped}"
+    assert missing == (), "an applied filter has no missing labels"
+
+    results = load_world_results(
+        str(results_root), world_stem, replan_k=DEFAULT_REPLAN_K, dropped_seeds=dropped
+    )
+    assert results.degenerate_seeds == (degenerate,), \
+        f"degenerate_seeds must hold the dropped seed, got {results.degenerate_seeds}"
+    assert results.n_dropped == 1, f"n_dropped must be 1, got {results.n_dropped}"
+
+    n_seeds = len(seeds)
+    for summary in results.summaries:
+        assert summary.n_present == n_seeds - 1, \
+            f"{summary.label}: filtered n_present must be {n_seeds - 1}, got {summary.n_present}"
+        assert summary.n_crash == 0, \
+            f"{summary.label}: the dropped crash must leave the A3 layer, got n_crash={summary.n_crash}"
+        assert abs(summary.failure_rate - 0.0) < 1e-9, \
+            f"{summary.label}: filtered failure_rate must be 0, got {summary.failure_rate}"
+        assert summary.n_present_raw == n_seeds, \
+            f"{summary.label}: n_present_raw must be {n_seeds}, got {summary.n_present_raw}"
+        assert abs(summary.failure_rate_raw - 1.0 / n_seeds) < 1e-9, \
+            f"{summary.label}: failure_rate_raw must be 1/{n_seeds}, got {summary.failure_rate_raw}"
+        assert summary.per_seed.get(degenerate) == "crash", \
+            f"{summary.label}: per_seed must keep the degenerate seed's real outcome"
+    return f"1 degenerate seed dropped from every algo; raw preserved (fr_raw=1/{n_seeds})"
+
+
+def _tc_p13_filter_stale(tmp: Path) -> str:
+    """TC-P13: a mutated hash, a reappeared absent file, or an uncovered label set
+    each yields no drop, filter_status='stale', a stderr reason, and still renders."""
+    import contextlib
+    import io
+
+    plt = ensure_matplotlib()
+    plotted = _plotted_labels(DEFAULT_REPLAN_K)
+    seeds = [11, 22, 33, 44, 55]
+    degenerate = 33
+
+    def _decide_capturing(root: Path):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            status, dropped, missing = _decide_seed_filter(
+                results_dir=str(root),
+                world_stem="arena_v1",
+                plotted_labels=plotted,
+                apply_filter=True,
+            )
+        return status, dropped, missing, stderr.getvalue()
+
+    # (a) A consulted metrics file mutated after the sidecar was written.
+    root_a = tmp / "tc_p13a"
+    labels = _build_filter_tree(root_a, "arena_v1", seeds=seeds, degenerate_seed=degenerate)
+    _write_seed_filter_sidecar(
+        results_root=root_a, world_stem="arena_v1", required_labels=labels,
+        seed_order=seeds, dropped_seeds=[degenerate],
+        consulted=[(label, degenerate) for label in labels],
+    )
+    (root_a / "arena_v1" / labels[0] / f"{degenerate}.json").write_text(
+        json.dumps(_make_record("timeout"), sort_keys=True), encoding="utf-8"
+    )
+    status, dropped, _missing, msg = _decide_capturing(root_a)
+    assert status == "stale" and dropped == frozenset(), \
+        f"a mutated consulted hash must go stale with no drop, got {status!r}/{dropped}"
+    assert "hash changed" in msg and "STALE" in msg, \
+        f"the stale warning must name the changed hash, stderr was: {msg!r}"
+
+    # (b) A recorded-absent file that now exists.
+    root_b = tmp / "tc_p13b"
+    labels = _build_filter_tree(root_b, "arena_v1", seeds=seeds, degenerate_seed=degenerate)
+    _write_seed_filter_sidecar(
+        results_root=root_b, world_stem="arena_v1", required_labels=labels,
+        seed_order=seeds, dropped_seeds=[degenerate],
+        consulted=[(label, degenerate) for label in labels],
+        absent_files=[f"{labels[0]}/9999.json"],
+    )
+    (root_b / "arena_v1" / labels[0] / "9999.json").write_text(
+        json.dumps(_make_record("success", time_to_goal=5.0), sort_keys=True), encoding="utf-8"
+    )
+    status, dropped, _missing, msg = _decide_capturing(root_b)
+    assert status == "stale" and dropped == frozenset(), \
+        f"a reappeared absent file must go stale, got {status!r}/{dropped}"
+    assert "now exists" in msg, f"the warning must name the reappeared file, stderr was: {msg!r}"
+
+    # (c) The plotted label set is not covered by required_labels.
+    root_c = tmp / "tc_p13c"
+    labels = _build_filter_tree(root_c, "arena_v1", seeds=seeds, degenerate_seed=degenerate)
+    from runners._seed_filter import build_required_labels
+
+    required_k7 = build_required_labels(10, 7, "canonical")
+    _write_seed_filter_sidecar(
+        results_root=root_c, world_stem="arena_v1", required_labels=required_k7,
+        seed_order=seeds, dropped_seeds=[degenerate],
+        consulted=[(labels[0], degenerate)],
+        replan_k=7,
+    )
+    status, dropped, _missing, msg = _decide_capturing(root_c)
+    assert status == "stale" and dropped == frozenset(), \
+        f"an uncovered label set must go stale, got {status!r}/{dropped}"
+    assert "not covered" in msg, f"the warning must name the coverage miss, stderr was: {msg!r}"
+
+    # Charts still render on a stale (unfiltered) load.
+    results = replace(
+        load_world_results(str(root_c), "arena_v1", replan_k=DEFAULT_REPLAN_K),
+        filter_status="stale",
+    )
+    out_dir = tmp / "tc_p13_out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    png = _chart_a1(results, plt, out_dir)
+    assert png.is_file() and png.stat().st_size > 0, "A1 must still render on a stale filter"
+    return "mutated-hash / reappeared-absent / uncovered-labels each stale, no drop, still renders"
+
+
+def _tc_p14_absent_vs_no_filter(tmp: Path) -> str:
+    """TC-P14: absent-sidecar and --no-filter are byte-identical + numeric==raw, n_dropped==0 (AC13)."""
+    root = tmp / "tc_p14"
+    world_stem = "arena_v1"
+    seeds = [11, 22, 33, 44, 55]
+    _build_filter_tree(root, world_stem, seeds=seeds, degenerate_seed=33)
+    # NO sidecar written: the "absent" path.
+    plotted = _plotted_labels(DEFAULT_REPLAN_K)
+
+    status_absent, dropped_absent, _ = _decide_seed_filter(
+        results_dir=str(root), world_stem=world_stem, plotted_labels=plotted, apply_filter=True,
+    )
+    status_off, dropped_off, _ = _decide_seed_filter(
+        results_dir=str(root), world_stem=world_stem, plotted_labels=plotted, apply_filter=False,
+    )
+    assert status_absent == "absent" and dropped_absent == frozenset(), \
+        f"no sidecar must read absent with no drop, got {status_absent!r}/{dropped_absent}"
+    assert status_off == "off" and dropped_off == frozenset(), \
+        f"--no-filter must read off with no drop, got {status_off!r}/{dropped_off}"
+
+    results_absent = load_world_results(
+        str(root), world_stem, replan_k=DEFAULT_REPLAN_K, dropped_seeds=dropped_absent
+    )
+    results_off = load_world_results(
+        str(root), world_stem, replan_k=DEFAULT_REPLAN_K, dropped_seeds=dropped_off
+    )
+
+    assert results_absent.n_dropped == 0 and results_off.n_dropped == 0, "no drop expected"
+    for summary in results_absent.summaries:
+        assert summary.n_present == summary.n_present_raw, "n_present must equal raw when unfiltered"
+        fr, fr_raw = summary.failure_rate, summary.failure_rate_raw
+        both_nan = fr != fr and fr_raw != fr_raw
+        assert both_nan or abs(fr - fr_raw) < 1e-12, "failure_rate must equal raw when unfiltered"
+
+    # Byte-identical output: the two runs' summary.csv are identical bytes.
+    out_a = tmp / "tc_p14_absent.csv"
+    out_b = tmp / "tc_p14_off.csv"
+    write_summary_csv(results_absent.summaries, out_a)
+    write_summary_csv(results_off.summaries, out_b)
+    assert out_a.read_bytes() == out_b.read_bytes(), \
+        "absent-sidecar and --no-filter summary.csv must be byte-identical (AC13)"
+    return "absent==off byte-identical; numeric==raw; n_dropped==0"
+
+
+def _tc_p15_summary_csv_columns(tmp: Path) -> str:
+    """TC-P15: summary.csv carries n_present_raw / failure_rate_raw / n_dropped, filtered + unfiltered."""
+    import csv as _csv
+
+    root = tmp / "tc_p15"
+    world_stem = "arena_v1"
+    seeds = [11, 22, 33, 44, 55]
+    degenerate = 33
+    _build_filter_tree(root, world_stem, seeds=seeds, degenerate_seed=degenerate)
+    n_seeds = len(seeds)
+
+    # The three audit columns must sit immediately after failure_rate.
+    fr_index = SUMMARY_CSV_COLUMNS.index("failure_rate")
+    assert SUMMARY_CSV_COLUMNS[fr_index + 1: fr_index + 4] == (
+        "n_present_raw", "failure_rate_raw", "n_dropped"
+    ), f"the 3 audit columns must follow failure_rate, got {SUMMARY_CSV_COLUMNS}"
+
+    # Filtered run.
+    results = load_world_results(
+        str(root), world_stem, replan_k=DEFAULT_REPLAN_K, dropped_seeds=frozenset({degenerate})
+    )
+    filtered_csv = tmp / "tc_p15_filtered.csv"
+    write_summary_csv(results.summaries, filtered_csv)
+    with open(filtered_csv, newline="", encoding="utf-8") as fh:
+        rows = list(_csv.DictReader(fh))
+    assert rows, "the filtered CSV must have rows"
+    for row in rows:
+        assert int(row["n_present"]) == n_seeds - 1, f"filtered n_present must be {n_seeds - 1}"
+        assert int(row["n_present_raw"]) == n_seeds, f"n_present_raw must be {n_seeds}"
+        assert int(row["n_dropped"]) == 1, "n_dropped must be 1"
+        assert abs(float(row["failure_rate"]) - 0.0) < 1e-9, "filtered failure_rate must be 0"
+        assert abs(float(row["failure_rate_raw"]) - 1.0 / n_seeds) < 1e-9, "failure_rate_raw must be 1/n"
+
+    # Unfiltered run: raw == filtered, n_dropped == 0.
+    results_u = load_world_results(str(root), world_stem, replan_k=DEFAULT_REPLAN_K)
+    unfiltered_csv = tmp / "tc_p15_unfiltered.csv"
+    write_summary_csv(results_u.summaries, unfiltered_csv)
+    with open(unfiltered_csv, newline="", encoding="utf-8") as fh:
+        rows_u = list(_csv.DictReader(fh))
+    for row in rows_u:
+        assert int(row["n_present"]) == int(row["n_present_raw"]), "unfiltered n_present must equal raw"
+        assert int(row["n_dropped"]) == 0, "unfiltered n_dropped must be 0"
+        assert float(row["failure_rate"]) == float(row["failure_rate_raw"]), \
+            "unfiltered failure_rate must equal raw"
+    return "summary.csv: n_present_raw/failure_rate_raw/n_dropped correct for filtered + unfiltered"
+
+
+def _tc_p16_filter_indeterminate(tmp: Path) -> str:
+    """TC-P16: a fresh, covering, global-'indeterminate' sidecar drops nothing; footnote confesses."""
+    plt = ensure_matplotlib()
+    root = tmp / "tc_p16"
+    world_stem = "arena_v1"
+    seeds = [11, 22, 33, 44, 55]
+    labels = _build_filter_tree(root, world_stem, seeds=seeds, degenerate_seed=33)
+
+    # required_labels = all13 (11 canonical + 2 experimental). The experimental
+    # dirs are absent on disk, so the recorded absent_files stay absent (still
+    # fresh) and the two labels surface as missing.
+    from runners._seed_filter import build_required_labels
+
+    required = build_required_labels(10, DEFAULT_REPLAN_K, "all13")
+    missing = [required[-2], required[-1]]  # d_star_lite_oracle_h10, d_star_lite_predictive_h10
+    _write_seed_filter_sidecar(
+        results_root=root, world_stem=world_stem, required_labels=required,
+        seed_order=seeds, dropped_seeds=[],
+        consulted=[(labels[0], seeds[0])],
+        global_status="indeterminate",
+        missing_labels=missing,
+        absent_files=[f"{missing[0]}/{seeds[0]}.json", f"{missing[1]}/{seeds[0]}.json"],
+    )
+
+    plotted = _plotted_labels(DEFAULT_REPLAN_K)
+    status, dropped, missing_out = _decide_seed_filter(
+        results_dir=str(root), world_stem=world_stem, plotted_labels=plotted, apply_filter=True,
+    )
+    assert status == "indeterminate", f"an indeterminate sidecar must not apply, got {status!r}"
+    assert dropped == frozenset(), "indeterminate must drop nothing"
+    assert set(missing_out) == set(missing), f"missing labels must surface, got {missing_out}"
+
+    results = replace(
+        load_world_results(str(root), world_stem, replan_k=DEFAULT_REPLAN_K, dropped_seeds=dropped),
+        filter_status=status,
+        filter_missing_labels=missing_out,
+    )
+    assert results.n_dropped == 0, "indeterminate leaves n_dropped 0"
+
+    # The A1 footnote confesses + names the missing labels; the render must not raise.
+    footnote = _filter_status_footnote(results)
+    assert "indeterminate" in footnote and missing[0] in footnote, \
+        f"the A1 footnote must confess indeterminate + name a missing label, got {footnote!r}"
+    out_dir = tmp / "tc_p16_out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    png = _chart_a1(results, plt, out_dir)
+    assert png.is_file() and png.stat().st_size > 0, "A1 must render on an indeterminate filter"
+    return "indeterminate sidecar: no drop, footnote names missing labels, renders"
+
+
+# Ordered registry of the 16 test cases. Each entry is (id, callable).
 _SELFCHECK_CASES = (
     ("TC-P1", _tc_p1_classify_precedence),
     ("TC-P2", _tc_p2_loader_over_tree),
@@ -2384,17 +2977,23 @@ _SELFCHECK_CASES = (
     ("TC-P9", _tc_p9_wallclock_source),
     ("TC-P10", _tc_p10_run_all_canonical),
     ("TC-P11", _tc_p11_dnf_roster),
+    ("TC-P12", _tc_p12_filter_applied),
+    ("TC-P13", _tc_p13_filter_stale),
+    ("TC-P14", _tc_p14_absent_vs_no_filter),
+    ("TC-P15", _tc_p15_summary_csv_columns),
+    ("TC-P16", _tc_p16_filter_indeterminate),
 )
 
 
 def run_selfcheck() -> int:
-    """Run the plotter's self-check suite (TC-P1..TC-P11). Return 0 if all pass, else 1.
+    """Run the plotter's self-check suite (TC-P1..TC-P16). Return 0 if all pass, else 1.
 
     Builds every fixture inside a single TemporaryDirectory (each TC namespaces its
     own subdir), runs each TC in isolation so one failure never aborts the rest,
-    prints a per-TC PASS/FAIL line, and ends with an "N/11 passed" summary. No
-    irsim, no real episodes — synthetic JSON trees only. Charts are rendered
-    through the real chart functions under the headless Agg backend.
+    prints a per-TC PASS/FAIL line, and ends with an "N/16 passed" summary. No
+    irsim, no real episodes — synthetic JSON trees only (TC-P12..TC-P16 add a
+    `_seed_filter.json` sidecar). Charts are rendered through the real chart
+    functions under the headless Agg backend.
     """
     import tempfile
 
@@ -2430,6 +3029,7 @@ class PlotArgs:
     charts: tuple[str, ...]
     out_dir: str | None
     selfcheck: bool
+    filter: bool                        # apply a fresh+covering degenerate-seed sidecar (default True; --no-filter disables)
 
 
 def _parse_charts(raw: str) -> tuple[str, ...]:
@@ -2490,6 +3090,20 @@ def _parse_args(argv: list[str] | None) -> PlotArgs:
         action="store_true",
         help="Run the self-check suite instead of plotting.",
     )
+    filter_group = parser.add_mutually_exclusive_group()
+    filter_group.add_argument(
+        "--filter",
+        dest="filter",
+        action="store_true",
+        help="Apply a fresh, covering degenerate-seed sidecar if present (default; issue #9).",
+    )
+    filter_group.add_argument(
+        "--no-filter",
+        dest="filter",
+        action="store_false",
+        help="Ignore any degenerate-seed sidecar; chart the full seed set.",
+    )
+    parser.set_defaults(filter=True)
     ns = parser.parse_args(argv)
     try:
         charts = _parse_charts(ns.charts)
@@ -2504,6 +3118,7 @@ def _parse_args(argv: list[str] | None) -> PlotArgs:
         charts=charts,
         out_dir=ns.out_dir,
         selfcheck=bool(ns.selfcheck),
+        filter=bool(ns.filter),
     )
 
 
@@ -2512,6 +3127,79 @@ def _resolve_out_dir(args: PlotArgs, world_stem: str) -> Path:
     if args.out_dir is not None:
         return Path(args.out_dir).resolve()
     return Path(args.results_dir).resolve() / world_stem / PLOTS_DIR_NAME
+
+
+# --- Degenerate-seed filter (issue #9) --------------------------------------
+
+def _plotted_labels(replan_k: int) -> list[str]:
+    """The results-dir labels `load_world_results` will actually load for the
+    CANONICAL set, derived the SAME way (via `algorithm_label`) so the sidecar
+    coverage check (`sidecar_covers`) tests the exact label strings the plotter
+    charts. Imports `planners` lazily (like `load_world_results`), so it never
+    runs at module import — `import runners.plot` stays headless.
+    """
+    from planners import algorithm_label
+
+    labels: list[str] = []
+    for name, default_k, default_h, _family, _display in CANONICAL:
+        effective_k = replan_k if default_k is not None else None
+        labels.append(algorithm_label(name, effective_k, default_h))
+    return labels
+
+
+def _decide_seed_filter(
+    *,
+    results_dir: str,
+    world_stem: str,
+    plotted_labels: list[str],
+    apply_filter: bool,
+) -> tuple[str, frozenset[int], tuple[str, ...]]:
+    """Decide how the degenerate-seed filter (issue #9) applies to this plot run.
+
+    Returns `(filter_status, dropped_seeds, missing_labels)`:
+      - `--no-filter` (apply_filter False)         -> ("off", ∅, ())
+      - no readable sidecar                         -> ("absent", ∅, ())
+      - sidecar not fresh OR not covering           -> ("stale", ∅, ()) + loud stderr
+      - fresh + covering, global "ok"               -> ("applied", set(dropped_seeds), ())
+      - fresh + covering, global "indeterminate"    -> ("indeterminate", ∅, missing_labels)
+      - fresh + covering, any other global          -> ("indeterminate", ∅, missing_labels)
+
+    Never partial-applies and never raises: a `read_seed_filter` that returns
+    `None` (absent/unreadable/schema mismatch) degrades to "absent"; any
+    freshness OR coverage miss degrades to "stale" with a stderr warning naming
+    every failing reason (AC8). Only a fresh, covering, "ok" sidecar drops seeds.
+    """
+    if not apply_filter:
+        return "off", frozenset(), ()
+
+    results_root = Path(results_dir).resolve()
+    sidecar_path = results_root / world_stem / SEED_FILTER_NAME
+    obj = read_seed_filter(sidecar_path)
+    if obj is None:
+        return "absent", frozenset(), ()
+
+    fresh, reasons = sidecar_is_fresh(obj, results_root)
+    covers = sidecar_covers(obj, plotted_labels)
+    if not fresh or not covers:
+        problems = list(reasons)
+        if not covers:
+            problems.append(
+                "plotted label set not covered by sidecar required_labels "
+                f"(plotted={plotted_labels})"
+            )
+        print(
+            "warning: seed filter sidecar is STALE, ignoring (re-run "
+            f"runners.filter_seeds): {'; '.join(problems)}",
+            file=sys.stderr,
+        )
+        return "stale", frozenset(), ()
+
+    if obj.global_status == "ok":
+        return "applied", frozenset(obj.dropped_seeds), ()
+
+    # "indeterminate" (or any non-"ok" status): fresh + covering, but the filter
+    # itself determined nothing droppable. No drop; surface its missing labels.
+    return "indeterminate", frozenset(), tuple(obj.missing_labels)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2540,16 +3228,37 @@ def main(argv: list[str] | None = None) -> int:
 
     plt = ensure_matplotlib()
 
+    # Decide the degenerate-seed drop (issue #9) BEFORE loading so the filtered
+    # counts land in every chart. The sidecar must be fresh AND cover the exact
+    # label set we are about to load; otherwise no seed is dropped.
+    plotted_labels = _plotted_labels(args.replan_k)
+    filter_status, dropped_seeds, missing_labels = _decide_seed_filter(
+        results_dir=args.results_dir,
+        world_stem=world_stem,
+        plotted_labels=plotted_labels,
+        apply_filter=args.filter,
+    )
+
     results = load_world_results(
         args.results_dir,
         world_stem,
         replan_k=args.replan_k,
         expected=DEFAULT_EXPECTED_SEEDS,
+        dropped_seeds=dropped_seeds,
+    )
+    # Stamp how the drop was decided onto the frozen result (the loader filled
+    # degenerate_seeds/n_dropped from dropped_seeds; these two are main's call).
+    results = replace(
+        results,
+        filter_status=filter_status,
+        filter_missing_labels=missing_labels,
     )
 
-    # "No readable data at all" => every algorithm came back empty. There is
-    # nothing to plot or summarize, so exit non-zero with a clear message (AC11).
-    if all(summary.n_present == 0 for summary in results.summaries):
+    # "No readable data at all" => every algorithm came back empty ON DISK. Test
+    # the RAW (pre-filter) count so an all-degenerate world (every seed dropped)
+    # does not misreport as "no readable JSONs" — nothing to plot or summarize, so
+    # exit non-zero with a clear message (AC11).
+    if all(summary.n_present_raw == 0 for summary in results.summaries):
         print(
             f"error: nothing to plot - no readable episode JSONs under "
             f"{Path(args.results_dir).resolve() / world_stem}",
