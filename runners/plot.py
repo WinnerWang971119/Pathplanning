@@ -3178,10 +3178,18 @@ def _decide_seed_filter(
     if obj is None:
         return "absent", frozenset(), ()
 
+    # A sidecar built for a different world must never apply here: every world
+    # shares the same 50 seeds, so a mis-placed sidecar would otherwise re-hash
+    # its own (unchanged) files, pass freshness, and drop the wrong world's seeds.
+    world_matches = obj.world_stem == world_stem
     fresh, reasons = sidecar_is_fresh(obj, results_root)
     covers = sidecar_covers(obj, plotted_labels)
-    if not fresh or not covers:
+    if not world_matches or not fresh or not covers:
         problems = list(reasons)
+        if not world_matches:
+            problems.append(
+                f"sidecar world_stem {obj.world_stem!r} does not match the plotted world {world_stem!r}"
+            )
         if not covers:
             problems.append(
                 "plotted label set not covered by sidecar required_labels "
