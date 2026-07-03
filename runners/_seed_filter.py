@@ -366,6 +366,8 @@ def _read_roster_seeds(canonical_labels: Sequence[str], world_dir: Path) -> list
                 manifest = json.load(fh)
         except (OSError, json.JSONDecodeError):
             continue
+        if not isinstance(manifest, dict):
+            continue
         derived = manifest.get("derived_seeds")
         if isinstance(derived, list):
             # Coerce to int so the roster comparison is symmetric with
