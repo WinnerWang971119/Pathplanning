@@ -46,7 +46,8 @@ pathplanning/
 │   ├── run_speed_sweep.py    #   one planner set × the 4 obstacle-speed regimes
 │   ├── plot_speed_sweep.py   #   failure-rate / median-time vs speed-cap charts
 │   ├── run_horizon_sweep.py  #   predictive keys × prediction horizons {0,5,10,20}
-│   └── plot_horizon_sweep.py #   failure-rate / median-time vs horizon charts
+│   ├── plot_horizon_sweep.py #   failure-rate / median-time vs horizon charts
+│   └── filter_seeds.py       #   flags degenerate seeds (every planner dies instantly)
 ├── results/                  # generated metrics/traces (gitignored except .gitkeep)
 ├── docs/plans/               # per-phase implementation plans + findings
 ├── manual.py                 # standalone demo: naive go-to-goal
@@ -320,6 +321,31 @@ writes `failure_rate_vs_horizon.png`, `median_time_vs_horizon.png`, and
 single horizon-bearing run is also available directly via `run_episode` /
 `run_experiment --predict-horizon`.
 
+### 7. The degenerate-seed filter
+
+`runners/filter_seeds.py` reads a world's result tree and flags any canonical
+seed where every required planner crashed within the first 4 s of sim time —
+a spawn no planner could have dodged — so `plot.py` can drop it from the
+headline `failure_rate`. It is read-only and post-hoc: it never re-runs an
+episode.
+
+```powershell
+# Default required set is all 13 (11 canonical + the 2 predictive keys at h10).
+# Produce the two experimental dirs first if they don't already exist:
+python -m runners.run_experiment --algorithm d_star_lite_oracle --predict-horizon 10 --world arena/arena_v1.yaml
+python -m runners.run_experiment --algorithm d_star_lite_predictive --predict-horizon 10 --world arena/arena_v1.yaml
+
+python -m runners.filter_seeds --world arena/arena_v1.yaml
+python -m runners.filter_seeds --selfcheck    # headless fixture suite (no irsim)
+```
+
+Without those two experimental dirs, the default `--planners all13` returns
+`indeterminate` (exit 3) naming the missing labels — a loud no-op, not a
+silent one. Pass `--planners canonical` to filter on the 11 canonical
+planners only, skipping the two `run_experiment` calls above. `runners/plot.py`
+then reads the resulting `_seed_filter.json` sidecar automatically (pass
+`--no-filter` to ignore it).
+
 ---
 
 ## Results layout
@@ -361,6 +387,16 @@ state with a sentinel `action=[0.0, 0.0]`.
 `derived_seeds`, per-episode `{seed, exit_code, status}` in derivation order,
 the cadence/horizon/speed-regime provenance, and a best-effort `git_sha`. No
 timestamps, so it is byte-reproducible.
+
+**Degenerate-seed sidecar** (`_seed_filter.json`, world-level — a sibling of
+the label dirs, written by `runners/filter_seeds.py`) — records which seeds
+had every required planner crash within the first 4 s of sim time. `plot.py`
+drops those seeds from the headline `failure_rate` and the numeric
+per-algorithm stats (a CONDITIONAL rate, on non-degenerate seeds only);
+`summary.csv` always keeps the pre-drop `failure_rate_raw` and `n_dropped`
+alongside it, so the excluded seeds stay auditable. See "The degenerate-seed
+filter (issue #9)" in `CLAUDE.md` for the full criterion and the freshness
+contract that guards it.
 
 ---
 
