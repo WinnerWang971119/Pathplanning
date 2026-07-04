@@ -458,11 +458,17 @@ REPLAN_FAMILIES = frozenset(
 # Predictive (motion-aware) D* Lite families. They take a --predict-horizon
 # (int steps) and label their results with _h<steps>. They are NOT in
 # REPLAN_FAMILIES, so the existing "--replan-k not allowed" branch rejects
-# --replan-k for them. Both are EXPERIMENTAL: run_all's canonical-set assertion
-# tolerates them via EXPERIMENTAL_KEYS, so they never land on the canonical-11
-# scatter.
+# --replan-k for them.
 PREDICT_FAMILIES = frozenset({"d_star_lite_oracle", "d_star_lite_predictive"})
-EXPERIMENTAL_KEYS = PREDICT_FAMILIES
+
+# EXPERIMENTAL_KEYS is a STRICT SUBSET of PREDICT_FAMILIES: d_star_lite_predictive
+# is now a full canonical study planner (run at h10 by run_all and charted on the
+# main plots), so only the d_star_lite_oracle cheat stays carved out of the
+# canonical set. Both predict families still take --predict-horizon and label with
+# _h<steps> (that is PREDICT_FAMILIES, unchanged); membership here is ONLY about the
+# canonical-set carve-out, not the horizon/label machinery. run_all's canonical-set
+# assertion tolerates the oracle via this set, so it never lands on the canonical scatter.
+EXPERIMENTAL_KEYS = frozenset({"d_star_lite_oracle"})
 
 
 def register(name: str, cls: type) -> None:

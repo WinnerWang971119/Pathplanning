@@ -4634,7 +4634,8 @@ def tc61(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure import + s
 
     Importing planners + runners.run_all must not raise, and run_all's canonical-set
     assertion must hold as set(_CANONICAL_ORDER) == set(ALGORITHMS) - EXPERIMENTAL_KEYS
-    (the experimental predictive keys are carved out of the canonical-11 study set).
+    (the experimental d_star_lite_oracle key is carved out of the canonical study set;
+    d_star_lite_predictive is now canonical).
     """
     _ensure_repo_root_on_path()
     import planners  # type: ignore[import-not-found]

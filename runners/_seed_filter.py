@@ -14,8 +14,9 @@ top, so even a *lazy* `from runners.run_all import canonical_planner_set` pulls
 irsim the moment it runs. This module therefore imports NOTHING from
 `planners`, `runners.run_all`, `arena.*`, `irsim`, `numpy`, or `matplotlib` —
 stdlib only (`json`, `hashlib`, `sys`, `dataclasses`, `pathlib`, `typing`). The
-11 canonical planner names and the replan-family `_k<K>` fold are hand-mirrored
-below as `_CANONICAL_ORDER` / `_REPLAN_FAMILIES`; a subprocess test in
+12 canonical planner names, the replan-family `_k<K>` fold, and the canonical
+predict-family `_h<H>` fold (`d_star_lite_predictive`) are hand-mirrored below as
+`_CANONICAL_ORDER` / `_REPLAN_FAMILIES` / `_PREDICT_CANONICAL`; a subprocess test in
 `filter_seeds.py --selfcheck` (where importing `planners` is permitted) asserts
 they stay in sync with the real registry (AC15).
 
@@ -58,7 +59,7 @@ SeedVerdict = str     # "degenerate"    | "kept"     | "indeterminate"
 
 # --- Required-label construction (CR7 / AC15) --------------------------------
 
-# Frozen mirror of `run_all._CANONICAL_ORDER` (the 11 canonical planner keys, in
+# Frozen mirror of `run_all._CANONICAL_ORDER` (the 12 canonical planner keys, in
 # `run_all`'s hand-listed order). Must NOT be imported from `run_all` per the
 # headless-import discipline above; AC15's subprocess parity test is what keeps
 # this copy honest against registry drift.
@@ -68,6 +69,7 @@ _CANONICAL_ORDER: tuple[str, ...] = (
     "dijkstra_once",
     "dijkstra_replan",
     "d_star_lite",
+    "d_star_lite_predictive",
     "dwa",
     "apf",
     "rrt_once",
@@ -82,34 +84,49 @@ _REPLAN_FAMILIES = frozenset(
     {"a_star_replan", "dijkstra_replan", "rrt_replan", "rrt_star_replan"}
 )
 
+# The canonical predict-family keys — folded with `_h<predict_horizon>` the same
+# way `planners._grid.algorithm_label` folds a PREDICT_FAMILIES key. Only
+# d_star_lite_predictive is canonical (h10); d_star_lite_oracle stays experimental
+# and is appended separately by `build_required_labels` under the "all13" set.
+_PREDICT_CANONICAL = frozenset({"d_star_lite_predictive"})
+
+
+def _canonical_label(name: str, replan_k: int, predict_horizon: int) -> str:
+    """Results-dir label for a canonical-order key — mirrors `algorithm_label`.
+
+    Folds `_k<replan_k>` for a replan family, `_h<predict_horizon>` for the
+    canonical predict family (d_star_lite_predictive), else the bare key.
+    """
+    if name in _REPLAN_FAMILIES:
+        return f"{name}_k{replan_k}"
+    if name in _PREDICT_CANONICAL:
+        return f"{name}_h{predict_horizon}"
+    return name
+
 
 def build_required_labels(predict_horizon: int, replan_k: int, planner_set: str) -> list[str]:
     """Build the list of results-dir labels the filter requires evidence from.
 
     PURE stdlib string logic — no `planners` import (see the module docstring).
-    Rebuilds the 11 canonical labels from `_CANONICAL_ORDER`, folding
-    `_k<replan_k>` for the four replan families (mirroring
-    `planners._grid.algorithm_label`'s fold). When `planner_set == "all13"` the
-    two experimental `_h<predict_horizon>` labels are appended
-    (`d_star_lite_oracle_h<H>`, `d_star_lite_predictive_h<H>`); any other
-    `planner_set` value (in practice `"canonical"`) returns just the 11.
+    Rebuilds the 12 canonical labels from `_CANONICAL_ORDER`, folding
+    `_k<replan_k>` for the four replan families and `_h<predict_horizon>` for the
+    canonical predict family (`d_star_lite_predictive`), mirroring
+    `planners._grid.algorithm_label`'s fold. When `planner_set == "all13"` the one
+    remaining experimental `_h<predict_horizon>` label is appended
+    (`d_star_lite_oracle_h<H>`); any other `planner_set` value (in practice
+    `"canonical"`) returns just the 12.
 
     AC15's subprocess test cross-checks this output against
     `run_all.canonical_planner_set()` labels plus
-    `algorithm_label("d_star_lite_oracle", None, H)` /
-    `algorithm_label("d_star_lite_predictive", None, H)` (where importing
-    `planners` is permitted), so a future registry change fails loud instead of
-    silently checking the wrong labels.
+    `algorithm_label("d_star_lite_oracle", None, H)` (where importing `planners`
+    is permitted), so a future registry change fails loud instead of silently
+    checking the wrong labels.
     """
     labels = [
-        f"{name}_k{replan_k}" if name in _REPLAN_FAMILIES else name
-        for name in _CANONICAL_ORDER
+        _canonical_label(name, replan_k, predict_horizon) for name in _CANONICAL_ORDER
     ]
     if planner_set == "all13":
-        labels += [
-            f"d_star_lite_oracle_h{predict_horizon}",
-            f"d_star_lite_predictive_h{predict_horizon}",
-        ]
+        labels.append(f"d_star_lite_oracle_h{predict_horizon}")
     return labels
 
 
@@ -337,10 +354,13 @@ def read_seed_filter(path: str | Path) -> SeedFilter | None:
 
 # --- Freshness / coverage checks (consumer: plot.py) ---------------------------
 
-def _canonical_order_labels(required_labels: Sequence[str], replan_k: int) -> list[str]:
+def _canonical_order_labels(
+    required_labels: Sequence[str], replan_k: int, predict_horizon: int
+) -> list[str]:
     """The subset of `required_labels` that are canonical-order labels, walked
     in `_CANONICAL_ORDER` sequence (folding `_k<replan_k>` for the replan
-    families, matching `build_required_labels`'s first 11 entries).
+    families and `_h<predict_horizon>` for the canonical predict family, matching
+    `build_required_labels`'s first 12 entries).
 
     Used only to pick the manifest-lookup order for the roster freshness check
     below — the same order `plot.load_world_results` and the plan's "Seed
@@ -348,7 +368,7 @@ def _canonical_order_labels(required_labels: Sequence[str], replan_k: int) -> li
     """
     ordered = []
     for name in _CANONICAL_ORDER:
-        label = f"{name}_k{replan_k}" if name in _REPLAN_FAMILIES else name
+        label = _canonical_label(name, replan_k, predict_horizon)
         if label in required_labels:
             ordered.append(label)
     return ordered
@@ -410,7 +430,7 @@ def sidecar_is_fresh(obj: SeedFilter, results_root: str | Path) -> tuple[bool, l
         if (world_dir / Path(rel_path)).exists():
             reasons.append(f"recorded-absent file now exists: {rel_path}")
 
-    canonical_labels = _canonical_order_labels(obj.required_labels, obj.replan_k)
+    canonical_labels = _canonical_order_labels(obj.required_labels, obj.replan_k, obj.predict_horizon)
     current_roster = _read_roster_seeds(canonical_labels, world_dir)
     if current_roster is None:
         reasons.append("roster manifest not found or unreadable among required labels")

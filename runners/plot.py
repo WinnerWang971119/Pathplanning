@@ -104,21 +104,24 @@ STRAIGHT_LINE_IDEAL_M = 46.0 * (2.0 ** 0.5)   # ~= 65.05 m
 # The algorithm set charted on the scatter, in legend order. Each tuple is
 # (registry name, replan_k or None, predict_horizon or None, family, display).
 # load_world_results() folds the replan_k / predict_horizon into the dir label
-# (a_star_replan_k5) so the label matches the dir run_experiment wrote. These are
-# exactly the 11 canonical Mission planners run_all writes — the same set, and the
-# same order, as run_all._CANONICAL_ORDER. The experimental motion-aware keys
-# (d_star_lite_oracle / d_star_lite_predictive) are EXCLUDED here on purpose: they
-# are held out of run_all's canonical-11 (EXPERIMENTAL_KEYS), so their `_h<steps>`
-# label dirs are never written by the documented run_all -> plot workflow. Charting
-# one here would draw a data-less line on every chart (the headline A1 scatter
-# included). The predictive family's results live on the horizon-sweep charts
-# (`runners.plot_horizon_sweep`), their proper experimental venue.
+# (a_star_replan_k5 / d_star_lite_predictive_h10) so the label matches the dir
+# run_experiment wrote. These are exactly the 12 canonical Mission planners run_all
+# writes — the same set, and the same order, as run_all._CANONICAL_ORDER. The
+# canonical predictive key d_star_lite_predictive folds its canonical horizon (h10)
+# into the label. The one remaining experimental motion-aware key
+# (d_star_lite_oracle) is EXCLUDED here on purpose: it is held out of run_all's
+# canonical set (EXPERIMENTAL_KEYS), so its `_h<steps>` label dir is never written
+# by the documented run_all -> plot workflow. Charting it here would draw a
+# data-less line on every chart (the headline A1 scatter included). The oracle's
+# results live on the horizon-sweep charts (`runners.plot_horizon_sweep`), its
+# proper experimental venue.
 CANONICAL: list[tuple[str, int | None, int | None, str, str]] = [
     ("a_star_once",            None, None, "grid",        "A* once"),
     ("a_star_replan",          5,    None, "grid",        "A* replan (K=5)"),
     ("dijkstra_once",          None, None, "grid",        "Dijkstra once"),
     ("dijkstra_replan",        5,    None, "grid",        "Dijkstra replan (K=5)"),
     ("d_star_lite",            None, None, "incremental", "D* Lite"),
+    ("d_star_lite_predictive", None, 10,   "predictive",  "D* Lite predictive (h10)"),
     ("dwa",                    None, None, "reactive",    "DWA"),
     ("apf",                    None, None, "reactive",    "APF"),
     ("rrt_once",               None, None, "sampling",    "RRT once"),
@@ -797,7 +800,7 @@ def _algorithm_color_map(summaries, plt) -> dict[str, tuple]:
     same label always gets the same color regardless of which subset of
     algorithms a chart draws. Colors are sampled from matplotlib's `tab20`
     qualitative colormap in CANONICAL order (the order the loader produced
-    `summaries`), which keeps the 11 algorithms visually distinct and groups
+    `summaries`), which keeps the 12 algorithms visually distinct and groups
     neighbours (the families are listed contiguously in CANONICAL).
     """
     cmap = plt.get_cmap("tab20")
@@ -2025,7 +2028,7 @@ def _build_full_fixture(
     seeds: list[int],
     replan_k: int = DEFAULT_REPLAN_K,
 ) -> None:
-    """Write an 11-label fixture covering every CANONICAL algorithm.
+    """Write a 12-label fixture covering every CANONICAL algorithm.
 
     Used by the chart-smoke and alignment TCs. Deliberately includes the two edge
     cases the charts must survive: a 0-success algorithm (every seed crashes) and
@@ -2092,11 +2095,11 @@ def _build_filter_tree(
     degenerate_seed: int,
     replan_k: int = DEFAULT_REPLAN_K,
 ) -> list[str]:
-    """Write the 11 canonical label dirs for the degenerate-seed filter TCs.
+    """Write the 12 canonical label dirs for the degenerate-seed filter TCs.
 
     `degenerate_seed` CRASHES in every algorithm (so dropping it removes exactly
     1 present + 1 crash from each), every other seed SUCCEEDS, and each dir's
-    `_manifest.json` carries `derived_seeds == seeds`. Returns the 11 labels in
+    `_manifest.json` carries `derived_seeds == seeds`. Returns the 12 labels in
     CANONICAL order (also the plotter's `_plotted_labels(replan_k)` output).
     """
     from planners import algorithm_label
@@ -2330,7 +2333,7 @@ def _tc_p4_partial_missing(tmp: Path) -> str:
         success_times=[12.0, 18.0],
     )
 
-    # Must NOT raise even though 10 of 11 label dirs are missing.
+    # Must NOT raise even though 11 of 12 label dirs are missing.
     results = load_world_results(str(results_root), world_stem, replan_k=DEFAULT_REPLAN_K)
 
     # Every canonical algorithm still appears in the summaries (count-charts need them).
@@ -2352,7 +2355,7 @@ def _tc_p4_partial_missing(tmp: Path) -> str:
 
 
 def _tc_p5_chart_smoke(tmp: Path) -> str:
-    """TC-P5: render all 7 charts from an 11-label fixture; each PNG must be non-empty."""
+    """TC-P5: render all 7 charts from a 12-label fixture; each PNG must be non-empty."""
     plt = ensure_matplotlib()
 
     results_root = tmp / "tc_p5"
@@ -2382,7 +2385,7 @@ def _tc_p5_chart_smoke(tmp: Path) -> str:
 
 
 def _tc_p6_b1_alignment(tmp: Path) -> str:
-    """TC-P6: B1 matrix is 11 rows x len(seed_order) cols; every row shares the seed->col index."""
+    """TC-P6: B1 matrix is 12 rows x len(seed_order) cols; every row shares the seed->col index."""
     import numpy as np
 
     results_root = tmp / "tc_p6"
@@ -2579,20 +2582,29 @@ def _tc_p10_run_all_canonical(_tmp: Path) -> str:
     from runners.run_all import canonical_planner_set, build_experiment_cmd
 
     planners = canonical_planner_set()
-    assert len(planners) == 11, f"canonical_planner_set must return 11 tuples, got {len(planners)}"
+    assert len(planners) == 12, f"canonical_planner_set must return 12 tuples, got {len(planners)}"
 
     replan_families = {"a_star_replan", "dijkstra_replan", "rrt_replan", "rrt_star_replan"}
     seen_replan = set()
-    for algorithm, replan_k, label in planners:
+    seen_predictive = False
+    for algorithm, replan_k, predict_horizon, label in planners:
         if algorithm in replan_families:
             seen_replan.add(algorithm)
             assert replan_k == 5, f"{algorithm} must carry replan_k=5, got {replan_k}"
+            assert predict_horizon is None, f"{algorithm} must carry predict_horizon=None, got {predict_horizon}"
             assert label.endswith("_k5"), f"{algorithm} label must end _k5, got {label!r}"
+        elif algorithm == "d_star_lite_predictive":
+            seen_predictive = True
+            assert replan_k is None, f"{algorithm} must carry replan_k=None, got {replan_k}"
+            assert predict_horizon == 10, f"{algorithm} must carry predict_horizon=10, got {predict_horizon}"
+            assert label == "d_star_lite_predictive_h10", f"{algorithm} label must be d_star_lite_predictive_h10, got {label!r}"
         else:
             assert replan_k is None, f"{algorithm} must carry replan_k=None, got {replan_k}"
+            assert predict_horizon is None, f"{algorithm} must carry predict_horizon=None, got {predict_horizon}"
             assert not label.endswith("_k5"), f"{algorithm} label must not end _k5, got {label!r}"
     assert seen_replan == replan_families, \
         f"all 4 replan families must appear, missing {replan_families - seen_replan}"
+    assert seen_predictive, "the canonical d_star_lite_predictive must appear in canonical_planner_set"
 
     # build_experiment_cmd: a replan family includes --replan-k 5; a non-replan omits it.
     replan_cmd = build_experiment_cmd(
@@ -2609,7 +2621,20 @@ def _tc_p10_run_all_canonical(_tmp: Path) -> str:
         master_seed=20260605, num_seeds=50, jobs=1, traffic=True, resume=False,
     )
     assert "--replan-k" not in once_cmd, "a non-replan family's command must omit --replan-k"
-    return "11 tuples; 4 replan families k=5/_k5; command builder gates --replan-k"
+    assert "--predict-horizon" not in once_cmd, "a non-predict family's command must omit --predict-horizon"
+
+    # The canonical predictive carries --predict-horizon 10 and no --replan-k.
+    predict_cmd = build_experiment_cmd(
+        "d_star_lite_predictive", None, "arena/arena_v1.yaml", "results",
+        master_seed=20260605, num_seeds=50, jobs=1, traffic=True, resume=False,
+        predict_horizon=10,
+    )
+    assert "--predict-horizon" in predict_cmd, "the canonical predictive command must include --predict-horizon"
+    h_index = predict_cmd.index("--predict-horizon")
+    assert predict_cmd[h_index + 1] == "10", \
+        f"--predict-horizon value must be 10, got {predict_cmd[h_index + 1]!r}"
+    assert "--replan-k" not in predict_cmd, "the predictive command must omit --replan-k"
+    return "12 tuples; 4 replan families k=5/_k5; predictive h10/_h10; command builder gates --replan-k/--predict-horizon"
 
 
 def _tc_p11_dnf_roster(tmp: Path) -> str:
@@ -2922,20 +2947,22 @@ def _tc_p16_filter_indeterminate(tmp: Path) -> str:
     seeds = [11, 22, 33, 44, 55]
     labels = _build_filter_tree(root, world_stem, seeds=seeds, degenerate_seed=33)
 
-    # required_labels = all13 (11 canonical + 2 experimental). The experimental
-    # dirs are absent on disk, so the recorded absent_files stay absent (still
-    # fresh) and the two labels surface as missing.
+    # required_labels = all13 (12 canonical + 1 experimental oracle). Only the
+    # oracle dir is absent on disk (the 12 canonical dirs, incl. the now-canonical
+    # d_star_lite_predictive_h10, were written by _build_filter_tree), so the
+    # recorded absent_file stays absent (still fresh) and the oracle label surfaces
+    # as missing.
     from runners._seed_filter import build_required_labels
 
     required = build_required_labels(10, DEFAULT_REPLAN_K, "all13")
-    missing = [required[-2], required[-1]]  # d_star_lite_oracle_h10, d_star_lite_predictive_h10
+    missing = [required[-1]]  # d_star_lite_oracle_h10 (the only non-canonical required label)
     _write_seed_filter_sidecar(
         results_root=root, world_stem=world_stem, required_labels=required,
         seed_order=seeds, dropped_seeds=[],
         consulted=[(labels[0], seeds[0])],
         global_status="indeterminate",
         missing_labels=missing,
-        absent_files=[f"{missing[0]}/{seeds[0]}.json", f"{missing[1]}/{seeds[0]}.json"],
+        absent_files=[f"{missing[0]}/{seeds[0]}.json"],
     )
 
     plotted = _plotted_labels(DEFAULT_REPLAN_K)

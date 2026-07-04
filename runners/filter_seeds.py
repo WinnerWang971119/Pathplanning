@@ -110,7 +110,7 @@ _CONSENSUS_FIELDS = (
 )
 
 # Effective-value defaults for the consensus fields that post-date a manifest
-# schema change. An OLD manifest (the 11 canonical dirs, pre-issue-#11) predates
+# schema change. An OLD manifest (the canonical dirs, pre-issue-#11) predates
 # `traffic` / the speed band and carries them absent; a NEW manifest records the
 # explicit Mission baseline. Both describe the SAME experiment (an absent speed
 # band is byte-identical to `current`/0.3/1.5, TC50), so consensus resolves each
@@ -589,8 +589,8 @@ def _parse_args(argv: list[str] | None) -> FilterArgs:
         "--planners",
         choices=["all13", "canonical"],
         default="all13",
-        help="Required planner set: all13 (11 canonical + 2 experimental, default) or "
-        "canonical (the 11 only).",
+        help="Required planner set: all13 (12 canonical + 1 experimental oracle, default) or "
+        "canonical (the 12 only).",
     )
     parser.add_argument(
         "--selfcheck",
@@ -1024,10 +1024,11 @@ def _tc_f9_determinism(tmp: Path) -> str:
 
 
 def _tc_f10_canonical_only(tmp: Path) -> str:
-    """TC-F10: --planners canonical on an 11-only tree - required set is the 11; a seed can drop."""
+    """TC-F10: --planners canonical on a 12-canonical tree - required set is the 12; a seed can drop."""
     world_dir = tmp / "tc_f10" / "w"
     required = build_required_labels(10, 5, "canonical")
-    assert len(required) == 11, f"expected 11 canonical labels, got {len(required)}"
+    assert len(required) == 12, f"expected 12 canonical labels, got {len(required)}"
+    assert "d_star_lite_predictive_h10" in required, "the canonical predictive label must be required"
     seed = 40
     _write_manifests_for_labels(world_dir, required, [seed])
     _write_seed_fixture(world_dir, seed, _default_outcomes(required, crash_step=1))
@@ -1036,11 +1037,11 @@ def _tc_f10_canonical_only(tmp: Path) -> str:
         world_stem="w", results_dir=str(tmp / "tc_f10"), replan_k=5, predict_horizon=10,
         window_seconds=DEFAULT_WINDOW_SECONDS, step_time=DEFAULT_STEP_TIME, planners="canonical",
     )
-    assert obj.required_labels == tuple(required), "recorded required_labels must equal the 11"
-    assert len(obj.required_labels) == 11
-    assert seed in obj.dropped_seeds, "a clean all-crash seed on an 11-only tree must still drop"
+    assert obj.required_labels == tuple(required), "recorded required_labels must equal the 12"
+    assert len(obj.required_labels) == 12
+    assert seed in obj.dropped_seeds, "a clean all-crash seed on a 12-canonical tree must still drop"
     assert exit_code == 0
-    return "canonical-only 11-label tree: a seed drops; required_labels recorded as the 11"
+    return "canonical-only 12-label tree: a seed drops; required_labels recorded as the 12"
 
 
 def _tc_f11_freshness_and_posix_keys(tmp: Path) -> str:
@@ -1216,17 +1217,17 @@ def _tc_f14_cross_manifest_consensus(tmp: Path) -> str:
 
 
 def _tc_f15_label_parity(_tmp: Path) -> str:
-    """TC-F15 (AC15, CR7): build_required_labels equals canonical_planner_set() + the 2 experimental labels."""
+    """TC-F15 (AC15, CR7): build_required_labels equals canonical_planner_set() + the 1 experimental oracle label."""
     script = (
         "from runners.filter_seeds import build_required_labels\n"
         "from runners.run_all import canonical_planner_set\n"
         "from planners import algorithm_label\n"
-        "expected = [label for _n, _k, label in canonical_planner_set()] + [\n"
+        "expected = [label for _n, _k, _h, label in canonical_planner_set()] + [\n"
         "    algorithm_label('d_star_lite_oracle', None, 10),\n"
-        "    algorithm_label('d_star_lite_predictive', None, 10),\n"
         "]\n"
         "actual = build_required_labels(10, 5, 'all13')\n"
         "assert actual == expected, (actual, expected)\n"
+        "assert 'd_star_lite_predictive_h10' in expected, expected\n"
         "print('OK')\n"
     )
     result = subprocess.run(
@@ -1238,7 +1239,7 @@ def _tc_f15_label_parity(_tmp: Path) -> str:
     )
     assert result.returncode == 0, f"subprocess failed (exit {result.returncode}): {result.stderr}"
     assert result.stdout.strip() == "OK", f"unexpected output: {result.stdout!r} / {result.stderr!r}"
-    return "build_required_labels(10,5,'all13') matches canonical_planner_set() + the 2 experimental labels"
+    return "build_required_labels(10,5,'all13') matches canonical_planner_set() + the oracle label"
 
 
 # Ordered registry of the self-check cases. Each entry is (id, callable).

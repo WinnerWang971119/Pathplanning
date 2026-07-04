@@ -59,7 +59,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from planners import ALGORITHMS, algorithm_label  # noqa: E402
-from planners._grid import EXPERIMENTAL_KEYS, REPLAN_FAMILIES  # noqa: E402
+from planners._grid import EXPERIMENTAL_KEYS, PREDICT_FAMILIES, REPLAN_FAMILIES  # noqa: E402
 
 
 DEFAULT_MASTER_SEED = 20260605          # canonical experiment stream (matches run_experiment)
@@ -70,6 +70,7 @@ DEFAULT_RESULTS_DIR = "results"
 WALLCLOCK_SUBDIR = "__wallclock__"       # results-dir suffix for the serial pass; the child
                                          # re-inserts <world_stem>/<label> beneath it
 REPLAN_K = 5                             # canonical cadence for every replan family
+PREDICT_HORIZON = 10                     # canonical horizon for the predictive family (d_star_lite_predictive)
 
 # Stable, hand-listed canonical order so the driver is reproducible run to run and
 # the tally line numbering ([bulk i/11]) is deterministic. This is the authoritative
@@ -81,6 +82,7 @@ _CANONICAL_ORDER: tuple[str, ...] = (
     "dijkstra_once",
     "dijkstra_replan",
     "d_star_lite",
+    "d_star_lite_predictive",
     "dwa",
     "apf",
     "rrt_once",
@@ -103,20 +105,24 @@ if set(_CANONICAL_ORDER) != set(ALGORITHMS) - EXPERIMENTAL_KEYS:
     )
 
 
-def canonical_planner_set() -> list[tuple[str, int | None, str]]:
-    """The 11 canonical ``(algorithm, replan_k, label)`` tuples, in canonical order.
+def canonical_planner_set() -> list[tuple[str, int | None, int | None, str]]:
+    """The 12 canonical ``(algorithm, replan_k, predict_horizon, label)`` tuples, in order.
 
     Replan-family keys (``planners._grid.REPLAN_FAMILIES``) carry the canonical
-    cadence ``REPLAN_K``; every other planner carries ``None``. ``label`` is
-    ``algorithm_label(algorithm, replan_k)`` so it matches the results-dir each
-    child writes to (e.g. ``a_star_replan_k5`` vs the bare ``a_star_once``). Pure
-    and side-effect-free — T5's TC-P10 imports and asserts on this directly.
+    cadence ``REPLAN_K``; predict-family keys (``planners._grid.PREDICT_FAMILIES``
+    — here just the canonical ``d_star_lite_predictive``) carry the canonical
+    horizon ``PREDICT_HORIZON``; every other planner carries ``None`` for both.
+    ``label`` is ``algorithm_label(algorithm, replan_k, predict_horizon)`` so it
+    matches the results-dir each child writes to (``a_star_replan_k5`` /
+    ``d_star_lite_predictive_h10`` / the bare ``a_star_once``). Pure and
+    side-effect-free — TC-P10 imports and asserts on this directly.
     """
-    planners: list[tuple[str, int | None, str]] = []
+    planners: list[tuple[str, int | None, int | None, str]] = []
     for algorithm in _CANONICAL_ORDER:
         replan_k = REPLAN_K if algorithm in REPLAN_FAMILIES else None
-        label = algorithm_label(algorithm, replan_k)
-        planners.append((algorithm, replan_k, label))
+        predict_horizon = PREDICT_HORIZON if algorithm in PREDICT_FAMILIES else None
+        label = algorithm_label(algorithm, replan_k, predict_horizon)
+        planners.append((algorithm, replan_k, predict_horizon, label))
     return planners
 
 
@@ -131,14 +137,17 @@ def build_experiment_cmd(
     jobs: int,
     traffic: bool,
     resume: bool,
+    predict_horizon: int | None = None,
 ) -> list[str]:
     """Construct one ``runners.run_experiment`` child command (no execution).
 
     Appends ``--replan-k <k>`` ONLY when ``replan_k`` is not None (the child
-    rejects the flag for non-replan families), ``--traffic`` or ``--no-traffic``
-    per the flag, and ``--resume`` only when requested. Pure so TC-P10 can assert
-    that a replan family's command carries ``--replan-k 5`` and a non-replan
-    family's does not.
+    rejects the flag for non-replan families), ``--predict-horizon <h>`` ONLY when
+    ``predict_horizon`` is not None (the child rejects it for non-predict
+    families), ``--traffic`` or ``--no-traffic`` per the flag, and ``--resume``
+    only when requested. Pure so TC-P10 can assert that a replan family's command
+    carries ``--replan-k 5``, the canonical predictive carries ``--predict-horizon
+    10``, and a bare family carries neither.
     """
     cmd = [
         sys.executable,
@@ -159,6 +168,8 @@ def build_experiment_cmd(
     ]
     if replan_k is not None:
         cmd.extend(["--replan-k", str(replan_k)])
+    if predict_horizon is not None:
+        cmd.extend(["--predict-horizon", str(predict_horizon)])
     cmd.append("--traffic" if traffic else "--no-traffic")
     if resume:
         cmd.append("--resume")
@@ -279,7 +290,7 @@ def _run_pass(
     total = len(planners)
     results: list[PlannerResult] = []
 
-    for index, (algorithm, replan_k, label) in enumerate(planners):
+    for index, (algorithm, replan_k, predict_horizon, label) in enumerate(planners):
         cmd = build_experiment_cmd(
             algorithm,
             replan_k,
@@ -290,6 +301,7 @@ def _run_pass(
             jobs=jobs,
             traffic=args.traffic,
             resume=args.resume,
+            predict_horizon=predict_horizon,
         )
         print(f"[{pass_name} {index + 1}/{total}] {label}: launching", flush=True)
         try:

@@ -37,11 +37,11 @@ pathplanning/
 │   ├── apf.py                #   apf (reactive artificial potential fields)
 │   ├── rrt.py                #   rrt_once / rrt_replan
 │   ├── rrt_star.py           #   rrt_star_once / rrt_star_replan
-│   └── d_star_lite_predictive.py  # d_star_lite_oracle / d_star_lite_predictive (experimental)
+│   └── d_star_lite_predictive.py  # d_star_lite_predictive (canonical, h10) / d_star_lite_oracle (experimental)
 ├── runners/                  # experiment harness (Phase 1 + 3 + 5)
 │   ├── run_episode.py        #   one planner × one seed × one world → metrics + trace
 │   ├── run_experiment.py     #   one planner × the canonical 50 seeds → batch + manifest
-│   ├── run_all.py            #   all 11 canonical planners → the plotter's input
+│   ├── run_all.py            #   all 12 canonical planners → the plotter's input
 │   ├── plot.py               #   read-only plotter → summary.csv + 7 comparison charts
 │   ├── run_speed_sweep.py    #   one planner set × the 4 obstacle-speed regimes
 │   ├── plot_speed_sweep.py   #   failure-rate / median-time vs speed-cap charts
@@ -97,7 +97,7 @@ python -m runners.run_episode --algorithm a_star_once --seed 42 --world arena/ar
 # 3. Run A* against all 50 canonical seeds
 python -m runners.run_experiment --algorithm a_star_once --world arena/arena_v1.yaml
 
-# 4. Run all 11 canonical planners, then chart the comparison
+# 4. Run all 12 canonical planners, then chart the comparison
 python -m runners.run_all  --world arena/arena_v1.yaml
 python -m runners.plot     --world arena/arena_v1.yaml
 
@@ -129,9 +129,10 @@ follows them with a heading-gated speed schedule. All tuning knobs are the
 
 ## The planner families
 
-Thirteen controllers are registered. Eleven are **canonical** (they land on the
-headline scatter); two are **experimental** (motion-aware, excluded from the
-canonical comparison). Pick one with `--algorithm <key>`.
+Thirteen controllers are registered. Twelve are **canonical** (they land on the
+headline scatter, including the lidar-only `d_star_lite_predictive` at h10); one
+is **experimental** (`d_star_lite_oracle`, the perfect-velocity cheat, excluded
+from the canonical comparison). Pick one with `--algorithm <key>`.
 
 | Key | Family | Notes |
 | --- | --- | --- |
@@ -147,7 +148,7 @@ canonical comparison). Pick one with `--algorithm <key>`.
 | `rrt_star_once` | sampling RRT* | Adds choose-parent + rewire. |
 | `rrt_star_replan` | sampling RRT* | Needs `--replan-k`. |
 | `d_star_lite_oracle` | predictive (experimental) | Stamps each obstacle's predicted future footprint using **perfect** velocities (the motion-aware ceiling). Needs `--predict-horizon`. |
-| `d_star_lite_predictive` | predictive (experimental) | Same stamp, velocities **estimated from lidar** (frame-differencing). Needs `--predict-horizon`. |
+| `d_star_lite_predictive` | predictive (canonical, h10) | Same stamp, velocities **estimated from lidar** (frame-differencing). Needs `--predict-horizon`; canonical planner runs at h10. |
 
 The `_replan` families (`a_star_replan`, `dijkstra_replan`, `rrt_replan`,
 `rrt_star_replan`) require `--replan-k`; every other key rejects it. The
@@ -252,7 +253,7 @@ wall-clock numbers with `--jobs 1`.
 
 ### 4. `run_all` + `plot` — the whole canonical comparison
 
-`runners/run_all.py` runs all 11 canonical planners against the canonical seed
+`runners/run_all.py` runs all 12 canonical planners against the canonical seed
 stream in one shot: a parallel bulk pass into `results/<world_stem>/<label>/`,
 then a serial wallclock mini-pass into
 `results/__wallclock__/<world_stem>/<label>/` for a clean per-step wall-clock.
@@ -330,19 +331,18 @@ headline `failure_rate`. It is read-only and post-hoc: it never re-runs an
 episode.
 
 ```powershell
-# Default required set is all 13 (11 canonical + the 2 predictive keys at h10).
-# Produce the two experimental dirs first if they don't already exist:
+# Default required set is all13 (the 12 canonical + the experimental oracle at h10).
+# run_all already produces d_star_lite_predictive_h10; produce the oracle dir too:
 python -m runners.run_experiment --algorithm d_star_lite_oracle --predict-horizon 10 --world arena/arena_v1.yaml
-python -m runners.run_experiment --algorithm d_star_lite_predictive --predict-horizon 10 --world arena/arena_v1.yaml
 
 python -m runners.filter_seeds --world arena/arena_v1.yaml
 python -m runners.filter_seeds --selfcheck    # headless fixture suite (no irsim)
 ```
 
-Without those two experimental dirs, the default `--planners all13` returns
-`indeterminate` (exit 3) naming the missing labels — a loud no-op, not a
-silent one. Pass `--planners canonical` to filter on the 11 canonical
-planners only, skipping the two `run_experiment` calls above. `runners/plot.py`
+Without the experimental oracle dir, the default `--planners all13` returns
+`indeterminate` (exit 3) naming the missing label — a loud no-op, not a
+silent one. Pass `--planners canonical` to filter on the 12 canonical
+planners only, skipping the `run_experiment` call above. `runners/plot.py`
 then reads the resulting `_seed_filter.json` sidecar automatically (pass
 `--no-filter` to ignore it).
 
@@ -448,12 +448,13 @@ Register the class by self-registering into the `ALGORITHMS` registry: the
 controller module calls `register(name, cls)` from `planners/_grid.py` at import
 (see `a_star.py`), and importing the `planners` package populates the registry.
 The runner builds the instance via `build_controller`. Thirteen keys ship today
-— eleven canonical (`a_star_once`, `a_star_replan`, `dijkstra_once`,
-`dijkstra_replan`, `d_star_lite`, `dwa`, `apf`, `rrt_once`, `rrt_replan`,
-`rrt_star_once`, `rrt_star_replan`) and two experimental, motion-aware keys
-(`d_star_lite_oracle`, `d_star_lite_predictive`) held out of the canonical
+— twelve canonical (`a_star_once`, `a_star_replan`, `dijkstra_once`,
+`dijkstra_replan`, `d_star_lite`, `d_star_lite_predictive`, `dwa`, `apf`,
+`rrt_once`, `rrt_replan`, `rrt_star_once`, `rrt_star_replan`) and one
+experimental, motion-aware key (`d_star_lite_oracle`) held out of the canonical
 scatter via `EXPERIMENTAL_KEYS`. The `_replan` families take a required
-`--replan-k`; the predictive family takes a required `--predict-horizon`.
+`--replan-k`; the predictive family takes a required `--predict-horizon` (the
+canonical `d_star_lite_predictive` runs at h10).
 
 ---
 
