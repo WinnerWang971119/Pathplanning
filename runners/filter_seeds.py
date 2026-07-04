@@ -109,6 +109,21 @@ _CONSENSUS_FIELDS = (
     "speed_max_factor",
 )
 
+# Effective-value defaults for the consensus fields that post-date a manifest
+# schema change. An OLD manifest (the 11 canonical dirs, pre-issue-#11) predates
+# `traffic` / the speed band and carries them absent; a NEW manifest records the
+# explicit Mission baseline. Both describe the SAME experiment (an absent speed
+# band is byte-identical to `current`/0.3/1.5, TC50), so consensus resolves each
+# field to its EFFECTIVE value before comparing (see `_effective_consensus_value`)
+# rather than reading `None != "current"` as a mismatch (issue W2). `derived_seeds`
+# and `world_stem` are intentionally NOT here: they have no default and compare raw.
+_CONSENSUS_FIELD_DEFAULTS = {
+    "traffic": _FALLBACK_TRAFFIC,
+    "speed_regime": _FALLBACK_SPEED_REGIME,
+    "speed_min_factor": _FALLBACK_SPEED_MIN_FACTOR,
+    "speed_max_factor": _FALLBACK_SPEED_MAX_FACTOR,
+}
+
 
 # --- Manifest helpers ---------------------------------------------------------
 
@@ -145,6 +160,18 @@ def _find_any_manifest(world_dir: Path, required_labels: list[str]) -> dict | No
     return None
 
 
+def _effective_consensus_value(manifest: dict, field: str):
+    """A consensus field's EFFECTIVE value. Fields that post-date a manifest
+    schema change (`traffic` and the speed band) resolve an absent/None entry to
+    the Mission baseline, so an OLD manifest that predates the field agrees with a
+    NEW one recording the explicit baseline (issue W2 / TC50 byte-identity).
+    `derived_seeds` / `world_stem` have no default and compare raw."""
+    value = manifest.get(field)
+    if value is None and field in _CONSENSUS_FIELD_DEFAULTS:
+        return _CONSENSUS_FIELD_DEFAULTS[field]
+    return value
+
+
 def _check_consensus(
     world_dir: Path,
     required_labels: list[str],
@@ -152,9 +179,11 @@ def _check_consensus(
     base_manifest: dict,
     warnings: list[str],
 ) -> bool:
-    """Every OTHER found required-label manifest must agree with the base on
-    `_CONSENSUS_FIELDS` (CR6). A `git_sha` mismatch is warning-only and never
-    affects the returned bool. Returns True iff no real mismatch was found."""
+    """Every OTHER found required-label manifest must agree with the base on the
+    EFFECTIVE value of `_CONSENSUS_FIELDS` (CR6), so an old manifest whose speed
+    band predates issue #11 matches a new one recording the explicit baseline (W2).
+    A `git_sha` mismatch is warning-only and never affects the returned bool.
+    Returns True iff no real mismatch was found."""
     ok = True
     for label in required_labels:
         if label == base_label:
@@ -162,7 +191,10 @@ def _check_consensus(
         manifest = _read_manifest(world_dir, label)
         if manifest is None:
             continue  # a missing manifest is not a consensus concern here (see missing_labels)
-        mismatched = [f for f in _CONSENSUS_FIELDS if manifest.get(f) != base_manifest.get(f)]
+        mismatched = [
+            f for f in _CONSENSUS_FIELDS
+            if _effective_consensus_value(manifest, f) != _effective_consensus_value(base_manifest, f)
+        ]
         if mismatched:
             warnings.append(
                 f"manifest consensus mismatch: {label!r} disagrees with {base_label!r} on "
@@ -1113,7 +1145,8 @@ def _tc_f13_window_override(tmp: Path) -> str:
 
 
 def _tc_f14_cross_manifest_consensus(tmp: Path) -> str:
-    """TC-F14 (AC14): a real mismatch -> indeterminate + no drop; a git_sha-only mismatch -> ok, warning only."""
+    """TC-F14 (AC14): a real mismatch -> indeterminate + no drop; a git_sha-only mismatch -> ok, warning only;
+    an old-schema (absent speed band) vs new-schema (explicit current baseline) tree -> ok, drops (issue W2)."""
     world_dir = tmp / "tc_f14" / "w"
     required = build_required_labels(10, 5, "canonical")
     seeds = [70, 71]
@@ -1152,7 +1185,34 @@ def _tc_f14_cross_manifest_consensus(tmp: Path) -> str:
     assert obj2.global_status == "ok", f"a git_sha-only mismatch must stay ok, got {obj2.global_status}"
     assert exit_code2 == 0
     assert obj2.dropped_seeds == tuple(seeds), "with real consensus intact, the clean seeds must still drop"
-    return "real field mismatch -> indeterminate/no-drop/exit3; git_sha-only mismatch -> ok/warning/drops"
+
+    # Issue W2: an old-schema manifest (speed band absent, == the current baseline)
+    # must reach consensus with a new-schema one that records current/0.3/1.5.
+    world_dir3 = tmp / "tc_f14c" / "w"
+    _write_manifests_for_labels(world_dir3, required, seeds)  # new schema: current/0.3/1.5
+    old_label = required[2]
+    manifest_path3 = world_dir3 / old_label / MANIFEST_NAME
+    manifest3 = json.loads(manifest_path3.read_text(encoding="utf-8"))
+    for field in ("speed_regime", "speed_min_factor", "speed_max_factor"):
+        del manifest3[field]  # pre-issue-#11 manifest: the keys never existed
+    manifest_path3.write_text(json.dumps(manifest3, sort_keys=True), encoding="utf-8")
+    for seed in seeds:
+        _write_seed_fixture(world_dir3, seed, _default_outcomes(required, crash_step=1))
+
+    obj3, exit_code3 = run_filter(
+        world_stem="w", results_dir=str(tmp / "tc_f14c"), replan_k=5, predict_horizon=10,
+        window_seconds=DEFAULT_WINDOW_SECONDS, step_time=DEFAULT_STEP_TIME, planners="canonical",
+    )
+    assert obj3.global_status == "ok", (
+        f"absent speed band must reach effective-band consensus, got {obj3.global_status}"
+    )
+    assert exit_code3 == 0
+    assert obj3.dropped_seeds == tuple(seeds), "an old-vs-new schema tree must still drop the degenerate seeds"
+
+    return (
+        "real field mismatch -> indeterminate/no-drop/exit3; git_sha-only mismatch -> ok/warning/drops; "
+        "absent-vs-explicit speed band -> ok/drops (W2)"
+    )
 
 
 def _tc_f15_label_parity(_tmp: Path) -> str:
