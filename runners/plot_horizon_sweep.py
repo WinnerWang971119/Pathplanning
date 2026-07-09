@@ -108,13 +108,20 @@ DEFAULT_RESULTS_DIR = "results"
 # motion-aware ceiling; the lidar variant (frame-differencing) is the realizable
 # estimator. The loader/series logic handles a multi-key dict, so both render as
 # separate colored lines on the same axes (a label with no result dir is skipped).
-SWEEP_ALGORITHMS: tuple[str, ...] = ("d_star_lite_oracle", "d_star_lite_predictive")
+SWEEP_ALGORITHMS: tuple[str, ...] = (
+    "d_star_lite_oracle",
+    "d_star_lite_predictive",
+    "dwa_predictive_oracle",
+    "dwa_predictive",
+)
 
 # Display names for the swept predictive keys (kept local so the headless plotter
 # never imports `planners` at module top just to resolve a label).
 ALGO_DISPLAY = {
     "d_star_lite_oracle": "D* Lite (oracle)",
     "d_star_lite_predictive": "D* Lite (predictive)",
+    "dwa_predictive_oracle": "DWA (oracle)",
+    "dwa_predictive": "DWA (predictive)",
 }
 
 # The horizon steps charted by default: 0/5/10/20 steps == 0.0/0.5/1.0/2.0 s.

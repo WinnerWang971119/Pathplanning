@@ -4901,6 +4901,223 @@ def tc64(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure in-process
     )
 
 
+def tc65(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """dwa_predictive[_oracle]_h0 trace == plain dwa (byte-identical, AC2).
+
+    Both space-time DWA variants at horizon 0 delegate straight to vanilla DWA (no
+    tracker update, no space-time layer, base rollout length), so their trace.jsonl
+    must be byte-identical to plain dwa on the same seed — in BOTH --no-traffic and
+    traffic-on regimes. This pins the byte-preserving DWAController refactor (the
+    _evaluate_candidate hook) and the h0 no-op contract.
+    """
+    repo_root = _ensure_repo_root_on_path()
+    seed_value = "65"
+    world_stem = Path(yaml_path).stem
+
+    def _run(algorithm: str, td: str, traffic_flag: str, extra: list) -> None:
+        r = subprocess.run(
+            [
+                sys.executable, "-m", "runners.run_episode",
+                "--algorithm", algorithm, "--seed", seed_value, "--world", yaml_path,
+                traffic_flag, "--results-dir", td, *extra,
+            ],
+            cwd=str(repo_root), capture_output=True, text=True, timeout=600,
+        )
+        assert r.returncode == 0, (
+            f"TC65 {algorithm} ({traffic_flag}) exit {r.returncode}; stderr={r.stderr[-400:]}"
+        )
+
+    for traffic_flag in ("--no-traffic", "--traffic"):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            _run("dwa", td, traffic_flag, [])
+            _run("dwa_predictive_oracle", td, traffic_flag, ["--predict-horizon", "0"])
+            _run("dwa_predictive", td, traffic_flag, ["--predict-horizon", "0"])
+
+            base = Path(td) / world_stem / "dwa" / f"{seed_value}.trace.jsonl"
+            oracle = Path(td) / world_stem / "dwa_predictive_oracle_h0" / f"{seed_value}.trace.jsonl"
+            lidar = Path(td) / world_stem / "dwa_predictive_h0" / f"{seed_value}.trace.jsonl"
+            assert base.exists() and oracle.exists() and lidar.exists(), (
+                f"TC65 ({traffic_flag}): a trace file is missing "
+                f"(base={base.exists()} oracle={oracle.exists()} lidar={lidar.exists()})"
+            )
+            assert filecmp.cmp(str(base), str(oracle), shallow=False), (
+                f"TC65 ({traffic_flag}): dwa_predictive_oracle_h0 trace differs from plain "
+                f"dwa — zero-horizon stamping is not a true no-op (AC2 broken)"
+            )
+            assert filecmp.cmp(str(base), str(lidar), shallow=False), (
+                f"TC65 ({traffic_flag}): dwa_predictive_h0 trace differs from plain dwa "
+                f"(AC2 broken)"
+            )
+
+
+def tc66(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — subprocess exit codes
+    """--predict-horizon validation for the space-time DWA family (AC6).
+
+    dwa_predictive / dwa_predictive_oracle REQUIRE --predict-horizon (omitting it ->
+    exit 2); dwa REJECTS it (exit 2); --replan-k is REJECTED for dwa_predictive
+    (exit 2). Each rejected run writes NO <seed>.json. The pure `_h<steps>` label
+    fold is checked directly.
+    """
+    repo_root = _ensure_repo_root_on_path()
+    seed_value = "66"
+
+    def _run(extra: list) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            r = subprocess.run(
+                [
+                    sys.executable, "-m", "runners.run_episode",
+                    "--algorithm", extra[0], "--seed", seed_value, "--world", yaml_path,
+                    "--no-traffic", "--results-dir", td, *extra[1:],
+                ],
+                cwd=str(repo_root), capture_output=True, text=True, timeout=120,
+            )
+            r.stray_json = list(Path(td).rglob(f"{seed_value}.json"))  # type: ignore[attr-defined]
+            return r
+
+    checks = [
+        (["dwa_predictive"], "dwa_predictive without --predict-horizon"),
+        (["dwa_predictive_oracle"], "dwa_predictive_oracle without --predict-horizon"),
+        (["dwa", "--predict-horizon", "10"], "dwa with --predict-horizon"),
+        (["dwa_predictive", "--predict-horizon", "10", "--replan-k", "5"], "dwa_predictive with --replan-k"),
+    ]
+    for extra, why in checks:
+        r = _run(extra)
+        assert r.returncode == 2, f"TC66: {why} must exit 2, got {r.returncode}; stderr={r.stderr[-300:]}"
+        assert not r.stray_json, f"TC66: {why} (rejected) must write no <seed>.json, found {r.stray_json}"  # type: ignore[attr-defined]
+
+    from planners import algorithm_label  # type: ignore[import-not-found]
+    assert algorithm_label("dwa_predictive", None, 10) == "dwa_predictive_h10", "TC66: label must fold _h10"
+    assert algorithm_label("dwa_predictive_oracle", None, 0) == "dwa_predictive_oracle_h0", "TC66: label must fold _h0"
+
+
+def tc67(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """dwa_predictive & dwa_predictive_oracle traffic-on e2e + determinism (AC3/AC5).
+
+    Each variant at --predict-horizon 10, traffic on, runs to a terminal state with
+    planner_error null (DWA reset never raises), every trace line carrying the 8-key
+    schema (incl. dynamic_obstacles_sha256), and two same-seed runs byte-identical.
+    Exercises the real space-time layer (the tracker + trajectory_conflict) through
+    the runner, per variant.
+    """
+    repo_root = _ensure_repo_root_on_path()
+    seed_value = "67"
+    horizon = "10"
+    world_stem = Path(yaml_path).stem
+
+    for algorithm in ("dwa_predictive", "dwa_predictive_oracle"):
+        label = f"{algorithm}_h{horizon}"
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_a, \
+                tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_b:
+            for td in (td_a, td_b):
+                r = subprocess.run(
+                    [
+                        sys.executable, "-m", "runners.run_episode",
+                        "--algorithm", algorithm, "--predict-horizon", horizon,
+                        "--seed", seed_value, "--world", yaml_path, "--traffic",
+                        "--results-dir", td,
+                    ],
+                    cwd=str(repo_root), capture_output=True, text=True, timeout=600,
+                )
+                assert r.returncode == 0, (
+                    f"TC67 {algorithm} traffic runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+                )
+            out_a = Path(td_a) / world_stem / label
+            out_b = Path(td_b) / world_stem / label
+            json_a = out_a / f"{seed_value}.json"
+            jsonl_a = out_a / f"{seed_value}.trace.jsonl"
+            jsonl_b = out_b / f"{seed_value}.trace.jsonl"
+            assert json_a.exists() and jsonl_a.exists() and jsonl_b.exists(), (
+                f"TC67 {algorithm}: output missing (label must be {label!r})"
+            )
+            metrics = json.loads(json_a.read_text(encoding="utf-8"))
+            assert metrics["planner_error"] is None, (
+                f"TC67 {algorithm}: DWA reset must not raise; planner_error={metrics['planner_error']}"
+            )
+            lines = jsonl_a.read_text(encoding="utf-8").splitlines()
+            assert lines, f"TC67 {algorithm}: traffic trace JSONL is empty"
+            for idx, raw in enumerate(lines):
+                rec = json.loads(raw)
+                assert "dynamic_obstacles_sha256" in rec and len(rec) == 8, (
+                    f"TC67 {algorithm}: trace line {idx} must be 8-key with traffic on, got {sorted(rec)}"
+                )
+            assert filecmp.cmp(str(jsonl_a), str(jsonl_b), shallow=False), (
+                f"TC67 {algorithm}: two same-seed traffic runs produced differing trace JSONL; "
+                f"space-time DWA determinism through the runner is broken"
+            )
+
+
+def tc68(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure in-process, no irsim
+    """trajectory_conflict pure space-time geometry + determinism (AC4).
+
+    A head-on track within the horizon collides at the correct earliest step with a
+    non-positive gap; a receding track does not; a horizon shorter than the meeting
+    keeps a larger min gap than the full horizon; horizon 0 / empty tracks are a
+    no-op (+inf gap); two calls on the same inputs are byte-identical. Pure (builds
+    its own robot trajectory + tracks; no irsim, no subprocess) — mirrors TC53.
+    """
+    _ensure_repo_root_on_path()
+    from planners._predict import Track, trajectory_conflict  # type: ignore[import-not-found]
+
+    dt = 0.1
+    # Robot marches +x at 1 m/s: step k (1-based) is at (0.1*k, 0), 12 steps.
+    robot = np.array([[0.1 * k, 0.0] for k in range(1, 13)], dtype=float)
+    head_on = [Track(id=1, x=1.5, y=0.0, vx=-1.0, vy=0.0, radius=0.3)]
+
+    full = trajectory_conflict(robot, head_on, robot_radius=0.2, horizon_steps=10, dt=dt, margin=0.05)
+    assert full.collides, "TC68: a head-on track within the horizon must collide"
+    assert full.ttc_step is not None and 1 <= full.ttc_step <= 10, (
+        f"TC68: ttc_step out of range: {full.ttc_step}"
+    )
+    assert full.min_gap <= 0.05, f"TC68: a colliding min_gap must be <= margin, got {full.min_gap}"
+
+    # Horizon 3 is before the bodies meet (earliest collision is step 5): no collision.
+    early = trajectory_conflict(robot, head_on, robot_radius=0.2, horizon_steps=3, dt=dt, margin=0.05)
+    assert not early.collides, "TC68: horizon 3 is before the head-on meeting -> no collision yet"
+    assert early.min_gap > full.min_gap, "TC68: the earlier horizon must keep a larger min gap"
+
+    receding = [Track(id=2, x=3.0, y=3.0, vx=1.0, vy=1.0, radius=0.3)]
+    away = trajectory_conflict(robot, receding, robot_radius=0.2, horizon_steps=10, dt=dt, margin=0.05)
+    assert not away.collides and away.ttc_step is None, "TC68: a receding track must not collide"
+    assert away.min_gap > 0.0, "TC68: a non-colliding track must have a positive gap"
+
+    zero = trajectory_conflict(robot, head_on, robot_radius=0.2, horizon_steps=0, dt=dt, margin=0.05)
+    assert not zero.collides and zero.min_gap == float("inf"), "TC68: horizon 0 must be a no-op"
+    empty = trajectory_conflict(robot, [], robot_radius=0.2, horizon_steps=10, dt=dt, margin=0.05)
+    assert not empty.collides and empty.min_gap == float("inf"), "TC68: empty tracks must be a no-op"
+
+    again = trajectory_conflict(robot, head_on, robot_radius=0.2, horizon_steps=10, dt=dt, margin=0.05)
+    assert (full.collides, full.ttc_step, full.min_gap) == (again.collides, again.ttc_step, again.min_gap), (
+        "TC68: trajectory_conflict must be deterministic across identical calls"
+    )
+
+
+def tc69(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure in-process, no irsim
+    """run_all canonical set = 13; the assertion tolerates the DWA oracle carve-out (AC7).
+
+    Importing planners + run_all does not raise (the import-time
+    set(_CANONICAL_ORDER) == set(ALGORITHMS) - EXPERIMENTAL_KEYS assertion holds),
+    dwa_predictive is canonical, dwa_predictive_oracle is experimental (not
+    canonical), and both DWA predict keys are in PREDICT_FAMILIES.
+    """
+    _ensure_repo_root_on_path()
+    from planners import ALGORITHMS, EXPERIMENTAL_KEYS, PREDICT_FAMILIES  # type: ignore[import-not-found]
+    from runners.run_all import _CANONICAL_ORDER, canonical_planner_set  # type: ignore[import-not-found]
+
+    canonical = set(_CANONICAL_ORDER)
+    assert canonical == set(ALGORITHMS) - EXPERIMENTAL_KEYS, (
+        "TC69: _CANONICAL_ORDER must equal registry minus experimental keys"
+    )
+    assert len(canonical_planner_set()) == 13, (
+        f"TC69: canonical set must be 13, got {len(canonical_planner_set())}"
+    )
+    assert "dwa_predictive" in canonical, "TC69: dwa_predictive must be canonical"
+    assert "dwa_predictive_oracle" in EXPERIMENTAL_KEYS, "TC69: dwa_predictive_oracle must be experimental"
+    assert "dwa_predictive_oracle" not in canonical, "TC69: the DWA oracle must not be canonical"
+    assert {"dwa_predictive", "dwa_predictive_oracle"} <= PREDICT_FAMILIES, (
+        "TC69: both DWA predict keys must be in PREDICT_FAMILIES"
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI runner — --check (default) or --render. See module docstring above.
 # ---------------------------------------------------------------------------
@@ -4976,6 +5193,11 @@ def _run_checks(yaml_path: str, seed: int) -> int:
         ("TC62: plot_horizon_sweep --selfcheck passes (no irsim)", tc62),
         ("TC63: d_star_lite_predictive traffic-on e2e + determinism", tc63),
         ("TC64: LidarTracker determinism across a multi-frame cluster-count change", tc64),
+        ("TC65: dwa_predictive[_oracle]_h0 trace == plain dwa (byte-identical)", tc65),
+        ("TC66: --predict-horizon validation for the space-time DWA family (exit 2)", tc66),
+        ("TC67: dwa_predictive/_oracle traffic-on e2e + determinism", tc67),
+        ("TC68: trajectory_conflict pure space-time geometry + determinism", tc68),
+        ("TC69: run_all canonical set == 13 (DWA oracle carve-out tolerated)", tc69),
     ]
     failures = 0
     for label, fn in cases:
@@ -5018,7 +5240,7 @@ def _parse_args() -> argparse.Namespace:
     group.add_argument(
         "--check",
         action="store_true",
-        help="Run TC1-TC64 + TC-CLI/TC-FWD headless (68 cases, incl. Phase 2 traffic + Phase 3 batch runner + replanning + D* Lite (incl. deferred-settle) + reactive (DWA/APF) + sampling (RRT/RRT*) families + rrt-local LOS-helper equivalence + the obstacle-speed-cap sweep + the predictive (motion-aware) D* Lite family, incl. the lidar frame-differencing estimator)",
+        help="Run TC1-TC69 + TC-CLI/TC-FWD headless (73 cases, incl. Phase 2 traffic + Phase 3 batch runner + replanning + D* Lite (incl. deferred-settle) + reactive (DWA/APF) + sampling (RRT/RRT*) families + rrt-local LOS-helper equivalence + the obstacle-speed-cap sweep + the predictive (motion-aware) D* Lite family + the space-time predictive DWA family)",
     )
     return parser.parse_args()
 

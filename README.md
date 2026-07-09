@@ -29,7 +29,7 @@ pathplanning/
 ├── planners/                 # pluggable planner adapters (Phase 6 + 7)
 │   ├── _types.py             #   Controller protocol (reset + act) + Path type
 │   ├── _grid.py              #   shared grid substrate + lidar fold + ALGORITHMS registry
-│   ├── _predict.py           #   motion-prediction substrate (Track, trackers, stamp geometry)
+│   ├── _predict.py           #   motion-prediction substrate (Track, trackers, stamp geometry + space-time conflict)
 │   ├── a_star.py             #   a_star_once / a_star_replan
 │   ├── dijkstra.py           #   dijkstra_once / dijkstra_replan (A* with a zero heuristic)
 │   ├── d_star_lite.py        #   d_star_lite (incremental; rejects --replan-k)
@@ -37,11 +37,12 @@ pathplanning/
 │   ├── apf.py                #   apf (reactive artificial potential fields)
 │   ├── rrt.py                #   rrt_once / rrt_replan
 │   ├── rrt_star.py           #   rrt_star_once / rrt_star_replan
-│   └── d_star_lite_predictive.py  # d_star_lite_predictive (canonical, h10) / d_star_lite_oracle (experimental)
+│   ├── d_star_lite_predictive.py  # d_star_lite_predictive (canonical, h10) / d_star_lite_oracle (experimental)
+│   └── dwa_predictive.py     #   dwa_predictive (canonical, h10) / dwa_predictive_oracle (experimental) — space-time DWA
 ├── runners/                  # experiment harness (Phase 1 + 3 + 5)
 │   ├── run_episode.py        #   one planner × one seed × one world → metrics + trace
 │   ├── run_experiment.py     #   one planner × the canonical 50 seeds → batch + manifest
-│   ├── run_all.py            #   all 12 canonical planners → the plotter's input
+│   ├── run_all.py            #   all 13 canonical planners → the plotter's input
 │   ├── plot.py               #   read-only plotter → summary.csv + 7 comparison charts
 │   ├── run_speed_sweep.py    #   one planner set × the 4 obstacle-speed regimes
 │   ├── plot_speed_sweep.py   #   failure-rate / median-time vs speed-cap charts
@@ -97,7 +98,7 @@ python -m runners.run_episode --algorithm a_star_once --seed 42 --world arena/ar
 # 3. Run A* against all 50 canonical seeds
 python -m runners.run_experiment --algorithm a_star_once --world arena/arena_v1.yaml
 
-# 4. Run all 12 canonical planners, then chart the comparison
+# 4. Run all 13 canonical planners, then chart the comparison
 python -m runners.run_all  --world arena/arena_v1.yaml
 python -m runners.plot     --world arena/arena_v1.yaml
 
@@ -129,10 +130,11 @@ follows them with a heading-gated speed schedule. All tuning knobs are the
 
 ## The planner families
 
-Thirteen controllers are registered. Twelve are **canonical** (they land on the
-headline scatter, including the lidar-only `d_star_lite_predictive` at h10); one
-is **experimental** (`d_star_lite_oracle`, the perfect-velocity cheat, excluded
-from the canonical comparison). Pick one with `--algorithm <key>`.
+Fifteen controllers are registered. Thirteen are **canonical** (they land on the
+headline scatter, including the lidar-only `d_star_lite_predictive` and
+`dwa_predictive` at h10); two are **experimental** (`d_star_lite_oracle` and
+`dwa_predictive_oracle`, the perfect-velocity cheats, excluded from the canonical
+comparison). Pick one with `--algorithm <key>`.
 
 | Key | Family | Notes |
 | --- | --- | --- |
@@ -147,8 +149,10 @@ from the canonical comparison). Pick one with `--algorithm <key>`.
 | `rrt_replan` | sampling RRT | Re-grows on the lidar fold every K acts. Needs `--replan-k`. |
 | `rrt_star_once` | sampling RRT* | Adds choose-parent + rewire. |
 | `rrt_star_replan` | sampling RRT* | Needs `--replan-k`. |
-| `d_star_lite_oracle` | predictive (experimental) | Stamps each obstacle's predicted future footprint using **perfect** velocities (the motion-aware ceiling). Needs `--predict-horizon`. |
+| `d_star_lite_oracle` | predictive (experimental) | Stamps each obstacle's predicted future footprint onto the grid using **perfect** velocities (the motion-aware ceiling). Needs `--predict-horizon`. |
 | `d_star_lite_predictive` | predictive (canonical, h10) | Same stamp, velocities **estimated from lidar** (frame-differencing). Needs `--predict-horizon`; canonical planner runs at h10. |
+| `dwa_predictive` | predictive DWA (canonical, h10) | **Space-time** DWA: forward-simulates each obstacle inside the rollout and checks collision at the matched time (NOT a grid stamp). Velocities **estimated from lidar**. Needs `--predict-horizon`; canonical at h10. |
+| `dwa_predictive_oracle` | predictive DWA (experimental) | Same space-time DWA with **perfect** velocities (the ceiling). Needs `--predict-horizon`. |
 
 The `_replan` families (`a_star_replan`, `dijkstra_replan`, `rrt_replan`,
 `rrt_star_replan`) require `--replan-k`; every other key rejects it. The
@@ -253,7 +257,7 @@ wall-clock numbers with `--jobs 1`.
 
 ### 4. `run_all` + `plot` — the whole canonical comparison
 
-`runners/run_all.py` runs all 12 canonical planners against the canonical seed
+`runners/run_all.py` runs all 13 canonical planners against the canonical seed
 stream in one shot: a parallel bulk pass into `results/<world_stem>/<label>/`,
 then a serial wallclock mini-pass into
 `results/__wallclock__/<world_stem>/<label>/` for a clean per-step wall-clock.
@@ -276,7 +280,7 @@ dynamic-obstacle speed bands so you can see how the obstacle-speed cap drives
 failure rate and time-to-goal. `runners/plot_speed_sweep.py` charts the result.
 
 ```powershell
-# Drive the focus set (a_star_once, d_star_lite, dwa, apf) across the 4 regimes
+# Drive the focus set (a_star_once, d_star_lite, dwa, dwa_predictive, apf) across the 4 regimes
 python -m runners.run_speed_sweep --world arena/arena_v1.yaml --algorithms focus
 
 # Chart it: failure-rate-vs-cap + median-time-vs-cap (x = max-cap factor)
@@ -285,7 +289,7 @@ python -m runners.plot_speed_sweep --world arena/arena_v1.yaml --algorithms focu
 
 The four regimes are factors of robot top speed: `slow` 0.3–0.7, `matched`
 0.3–1.0, `current` 0.3–1.5 (the Mission baseline), `fast` 0.5–2.0. Pass
-`--algorithms all` for the full 11-planner picture (~3× the episode count, more
+`--algorithms all` for the full 13-planner picture (~3× the episode count, more
 in wall time as the replan families add per-replan cost). The driver writes one
 per-regime subtree per planner under
 `results/speed_<regime>/<world_stem>/<label>/`; the plotter writes
@@ -301,12 +305,12 @@ single `run_episode` / `run_experiment` run (default `current` is byte-identical
 to the prior baseline), with raw `--speed-min-factor` / `--speed-max-factor`
 overrides for off-menu bands.
 
-### 6. The prediction-horizon sweep (motion-aware D* Lite)
+### 6. The prediction-horizon sweep (motion-aware planners)
 
-`runners/run_horizon_sweep.py` runs the predictive keys
-(`d_star_lite_oracle` and `d_star_lite_predictive`) across the prediction
-horizons `{0, 5, 10, 20}` steps (T = steps × 0.1 s; `h0` is the plain
-`d_star_lite` baseline). `runners/plot_horizon_sweep.py` charts failure rate and
+`runners/run_horizon_sweep.py` runs the four predictive keys
+(`d_star_lite_oracle`, `d_star_lite_predictive`, `dwa_predictive_oracle`,
+`dwa_predictive`) across the prediction horizons `{0, 5, 10, 20}` steps (T =
+steps × 0.1 s; `h0` is the plain baseline). `runners/plot_horizon_sweep.py` charts failure rate and
 median time vs horizon, with the oracle (perfect-velocity ceiling) and lidar
 (estimated) lines together.
 
@@ -447,11 +451,11 @@ calls `reset()` once, then `act()` until the Arena reports done.
 Register the class by self-registering into the `ALGORITHMS` registry: the
 controller module calls `register(name, cls)` from `planners/_grid.py` at import
 (see `a_star.py`), and importing the `planners` package populates the registry.
-The runner builds the instance via `build_controller`. Thirteen keys ship today
-— twelve canonical (`a_star_once`, `a_star_replan`, `dijkstra_once`,
-`dijkstra_replan`, `d_star_lite`, `d_star_lite_predictive`, `dwa`, `apf`,
-`rrt_once`, `rrt_replan`, `rrt_star_once`, `rrt_star_replan`) and one
-experimental, motion-aware key (`d_star_lite_oracle`) held out of the canonical
+The runner builds the instance via `build_controller`. Fifteen keys ship today
+— thirteen canonical (`a_star_once`, `a_star_replan`, `dijkstra_once`,
+`dijkstra_replan`, `d_star_lite`, `d_star_lite_predictive`, `dwa`, `dwa_predictive`,
+`apf`, `rrt_once`, `rrt_replan`, `rrt_star_once`, `rrt_star_replan`) and two
+experimental, motion-aware keys (`d_star_lite_oracle`, `dwa_predictive_oracle`) held out of the canonical
 scatter via `EXPERIMENTAL_KEYS`. The `_replan` families take a required
 `--replan-k`; the predictive family takes a required `--predict-horizon` (the
 canonical `d_star_lite_predictive` runs at h10).

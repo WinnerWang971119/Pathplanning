@@ -269,6 +269,20 @@ user's to launch; the lidar-only variant (`d_star_lite_predictive`) stays unbuil
 and unregistered until the oracle clears that gate. See "The predictive D* Lite
 family (Phase 7)" in CLAUDE.md._
 
+_Also shipped (Phase 7): a **real** predictive planner that reasons in `(x, y, t)`
+instead of stamping a grid — space-time DWA. Where the D* Lite family paints an
+obstacle's whole future footprint onto the occupancy grid (collapsing the time
+axis), `dwa_predictive` advances each tracked obstacle at constant velocity INSIDE
+the DWA rollout and checks the robot against the obstacle at the matched time step,
+so a candidate that passes behind a crosser is kept and one that would meet it is
+rejected (Missura & Bennewitz ICRA 2019; MDPI Actuators 2025 14(5):207). It reuses
+the D* Lite predictive substrate (trackers + truth seam + `--predict-horizon`) and
+ships oracle-first as a two-layer model: vanilla DWA's present-position clearance as
+a safety floor, plus the space-time layer. `dwa_predictive` (lidar-estimated
+velocities) is promoted to canonical; `dwa_predictive_oracle` (perfect velocities,
+the ceiling) is experimental. See "The space-time predictive DWA family (Phase 7)"
+in CLAUDE.md._
+
 This is the only phase that produces an *insight* rather than an
 artifact. Everything before it exists to make this comparison rigorous.
 

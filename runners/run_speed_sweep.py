@@ -40,10 +40,11 @@ CLI:
         [--traffic|--no-traffic] # crossing traffic, default ON
 
 Planner sets:
-    --algorithms focus (default) — the 4 non-replan planners in FOCUS_SET
-        (a_star_once, d_star_lite, dwa, apf): the static baseline, the incremental
-        planner the hypothesis is about, and the two reactive planners the issue
-        calls out. Every one is non-replan, so replan_k is None.
+    --algorithms focus (default) — the 5 non-replan planners in FOCUS_SET
+        (a_star_once, d_star_lite, dwa, dwa_predictive, apf): the static baseline,
+        the incremental planner the hypothesis is about, the two reactive planners
+        the issue calls out, and the space-time-predictive DWA. dwa_predictive is a
+        predict family (carries --predict-horizon); the rest are non-replan/non-predict.
     --algorithms all — the 11 canonical labels, reused verbatim from
         run_all.canonical_planner_set() (so a registry change cannot desync the
         sweep from the study); the replan families carry --replan-k 5.
@@ -74,7 +75,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from arena.speed_regimes import SPEED_REGIMES  # noqa: E402
-from planners import algorithm_label  # noqa: E402
+from planners import PREDICT_FAMILIES, algorithm_label  # noqa: E402
 from runners._sweep_run import (  # noqa: E402
     SweepJob,
     add_common_sweep_args,
@@ -84,6 +85,7 @@ from runners._sweep_run import (  # noqa: E402
 from runners.run_all import (  # noqa: E402
     DEFAULT_MASTER_SEED,
     DEFAULT_NUM_SEEDS,
+    PREDICT_HORIZON,
     canonical_planner_set,
 )
 
@@ -92,27 +94,39 @@ SPEED_SUBDIR_PREFIX = "speed_"           # results-dir suffix per regime; the ch
                                          # re-inserts <world_stem>/<label> beneath it
 
 # The hypothesis set: the static baseline (a_star_once), the incremental planner
-# the D* Lite hypothesis is about, and the two reactive planners whose degradation
-# the issue calls out. All non-replan, so replan_k is None for each.
-FOCUS_SET: tuple[str, ...] = ("a_star_once", "d_star_lite", "dwa", "apf")
+# the D* Lite hypothesis is about, the two reactive planners whose degradation the
+# issue calls out (dwa, apf), and the space-time-predictive DWA (issue #11: does
+# true (x,y,t) prediction floor the crash rate as the obstacle-speed cap rises?).
+# All non-replan, so replan_k is None; dwa_predictive is a predict family, so it
+# carries the canonical PREDICT_HORIZON (the others carry None).
+FOCUS_SET: tuple[str, ...] = ("a_star_once", "d_star_lite", "dwa", "dwa_predictive", "apf")
 
 
-def focus_planner_set() -> list[tuple[str, int | None, str]]:
-    """The FOCUS_SET as ``(algorithm, replan_k, label)`` tuples, in FOCUS_SET order.
+def focus_planner_set() -> list[tuple[str, int | None, int | None, str]]:
+    """The FOCUS_SET as ``(algorithm, replan_k, predict_horizon, label)`` tuples, in order.
 
-    Every focus planner is non-replan, so ``replan_k`` is ``None`` and
-    ``algorithm_label(algorithm, None)`` is the bare key. Pure and
-    side-effect-free, so it can be asserted on directly.
+    Every focus planner is non-replan, so ``replan_k`` is ``None``. A predict-family
+    focus planner (``dwa_predictive``) carries the canonical ``PREDICT_HORIZON`` and
+    folds ``_h<H>`` into its label; every other carries ``None`` for the horizon and
+    uses its bare key. Pure and side-effect-free, so it can be asserted on directly.
+    The 4-tuple shape matches ``run_all.canonical_planner_set()`` so the two feed the
+    same run loop.
     """
-    return [(algorithm, None, algorithm_label(algorithm, None)) for algorithm in FOCUS_SET]
+    planners: list[tuple[str, int | None, int | None, str]] = []
+    for algorithm in FOCUS_SET:
+        predict_horizon = PREDICT_HORIZON if algorithm in PREDICT_FAMILIES else None
+        label = algorithm_label(algorithm, None, predict_horizon)
+        planners.append((algorithm, None, predict_horizon, label))
+    return planners
 
 
-def selected_planner_set(algorithms: str) -> list[tuple[str, int | None, str]]:
-    """Resolve ``--algorithms`` to its ``(algorithm, replan_k, label)`` tuple list.
+def selected_planner_set(algorithms: str) -> list[tuple[str, int | None, int | None, str]]:
+    """Resolve ``--algorithms`` to its ``(algorithm, replan_k, predict_horizon, label)`` list.
 
-    ``"focus"`` -> :func:`focus_planner_set` (the 4-planner hypothesis set);
-    ``"all"`` -> ``run_all.canonical_planner_set()`` (the 11 canonical labels,
-    with ``--replan-k 5`` folded into the replan families' labels).
+    ``"focus"`` -> :func:`focus_planner_set` (the 5-planner hypothesis set);
+    ``"all"`` -> ``run_all.canonical_planner_set()`` (the 13 canonical labels, with
+    ``--replan-k 5`` folded into the replan families' labels and ``--predict-horizon``
+    folded into the predict families'). Both return the same 4-tuple shape.
     """
     if algorithms == "focus":
         return focus_planner_set()
@@ -134,6 +148,7 @@ def regime_results_dir(results_root: str, regime: str) -> str:
 def build_experiment_cmd(
     algorithm: str,
     replan_k: int | None,
+    predict_horizon: int | None,
     world: str,
     results_dir: str,
     regime: str,
@@ -151,6 +166,8 @@ def build_experiment_cmd(
 
     - appends ``--replan-k <k>`` ONLY when ``replan_k`` is not None (the child
       rejects the flag for non-replan families),
+    - appends ``--predict-horizon <h>`` ONLY when ``predict_horizon`` is not None
+      (the child requires it for the predict families, rejects it otherwise),
     - appends ``--traffic`` or ``--no-traffic`` per the flag,
     - appends ``--resume`` only when requested.
 
@@ -179,6 +196,8 @@ def build_experiment_cmd(
     ]
     if replan_k is not None:
         cmd.extend(["--replan-k", str(replan_k)])
+    if predict_horizon is not None:
+        cmd.extend(["--predict-horizon", str(predict_horizon)])
     cmd.append("--traffic" if traffic else "--no-traffic")
     if resume:
         cmd.append("--resume")
@@ -219,8 +238,8 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         choices=("focus", "all"),
         default="focus",
         help=(
-            "Planner set: 'focus' (default) = the 4-planner hypothesis set "
-            f"{', '.join(FOCUS_SET)}; 'all' = the 11 canonical planners."
+            "Planner set: 'focus' (default) = the 5-planner hypothesis set "
+            f"{', '.join(FOCUS_SET)}; 'all' = the 13 canonical planners."
         ),
     )
     ns = parser.parse_args(argv)
@@ -280,10 +299,11 @@ def main(argv: list[str] | None = None) -> int:
     jobs: list[SweepJob] = []
     for regime in regimes:
         regime_dir = regime_results_dir(results_root_abs, regime)
-        for algorithm, replan_k, label in planners:
+        for algorithm, replan_k, predict_horizon, label in planners:
             cmd = build_experiment_cmd(
                 algorithm,
                 replan_k,
+                predict_horizon,
                 world_abs_str,
                 regime_dir,
                 regime,

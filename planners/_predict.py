@@ -638,3 +638,73 @@ def predict_blocked_cells(
 
     groups.sort(key=lambda group: group[0])
     return groups
+
+
+@dataclass(frozen=True)
+class TrajectoryConflict:
+    """Result of a space-time robot-trajectory-vs-tracks conflict check.
+
+    ``collides`` is True when the robot body overlaps some track's body at a
+    MATCHED time step within the horizon; ``ttc_step`` is the earliest such step
+    (1-based, None when no collision); ``min_gap`` is the minimum matched-time
+    body gap (``center_dist - robot_radius - track_radius``) over every checked
+    (step, track) pair (``+inf`` when there are no tracks / no steps to check).
+    A surviving (non-colliding) candidate has ``min_gap > margin``, so the caller
+    can turn ``min_gap`` into a "predicted clearance" score term.
+    """
+
+    collides: bool
+    ttc_step: int | None
+    min_gap: float
+
+
+def trajectory_conflict(
+    robot_positions: np.ndarray,   # (S, 2) robot world positions at steps k = 1..S (step k is dt*k ahead)
+    tracks: list[Track],
+    robot_radius: float,
+    horizon_steps: int,
+    dt: float,
+    margin: float,
+) -> TrajectoryConflict:
+    """Space-time collision check: robot(k) vs each track's constant-velocity pose(k).
+
+    For each lookahead step ``k = 1..min(horizon_steps, S)`` the robot is at
+    ``robot_positions[k-1]`` and each track is at
+    ``(track.x + track.vx*k*dt, track.y + track.vy*k*dt)`` — the SAME sim time, so
+    this is genuine ``(x, y, t)`` reasoning, not a 2-D footprint stamp. A collision
+    is registered when the matched-time body gap
+    ``dist - robot_radius - track.radius`` drops to within ``margin``.
+    ``ttc_step`` is the earliest colliding step (steps are scanned ascending);
+    ``min_gap`` is the minimum gap over every checked pair (kept even past a
+    collision so a rejected candidate still has a meaningful negative gap and a
+    surviving one a positive clearance).
+
+    PURE and deterministic: plain floats + numpy in, a plain dataclass out; the
+    track list is iterated in caller order (no set-iteration), no RNG. Two calls on
+    identical inputs return byte-identical results (AC4).
+    """
+    no_conflict = TrajectoryConflict(collides=False, ttc_step=None, min_gap=float("inf"))
+    if horizon_steps <= 0 or not tracks or robot_positions.shape[0] == 0:
+        return no_conflict
+
+    steps = min(int(horizon_steps), int(robot_positions.shape[0]))
+    min_gap = float("inf")
+    ttc_step: int | None = None
+
+    for k in range(1, steps + 1):
+        robot_x = float(robot_positions[k - 1, 0])
+        robot_y = float(robot_positions[k - 1, 1])
+        for track in tracks:
+            obstacle_x = track.x + track.vx * k * dt
+            obstacle_y = track.y + track.vy * k * dt
+            delta_x = robot_x - obstacle_x
+            delta_y = robot_y - obstacle_y
+            gap = math.sqrt(delta_x * delta_x + delta_y * delta_y) - robot_radius - track.radius
+            if gap < min_gap:
+                min_gap = gap
+            if ttc_step is None and gap <= margin:
+                ttc_step = k
+
+    return TrajectoryConflict(
+        collides=ttc_step is not None, ttc_step=ttc_step, min_gap=min_gap
+    )

@@ -15,6 +15,10 @@ from planners.d_star_lite_predictive import (  # noqa: F401  (registers d_star_l
     DStarLitePredictiveController,
 )
 from planners.dwa import DWAController  # noqa: F401  (registers dwa)
+from planners.dwa_predictive import (  # noqa: F401  (registers dwa_predictive / dwa_predictive_oracle)
+    DWAPredictiveController,
+    DWAPredictiveOracleController,
+)
 from planners.apf import APFController  # noqa: F401  (registers apf)
 from planners.rrt import RRTOnceController, RRTReplanController  # noqa: F401  (registers rrt_once / rrt_replan)
 from planners.rrt_star import RRTStarOnceController, RRTStarReplanController  # noqa: F401  (registers rrt_star_once / rrt_star_replan)

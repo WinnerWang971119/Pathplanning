@@ -123,6 +123,7 @@ CANONICAL: list[tuple[str, int | None, int | None, str, str]] = [
     ("d_star_lite",            None, None, "incremental", "D* Lite"),
     ("d_star_lite_predictive", None, 10,   "predictive",  "D* Lite predictive (h10)"),
     ("dwa",                    None, None, "reactive",    "DWA"),
+    ("dwa_predictive",         None, 10,   "predictive",  "DWA predictive (h10)"),
     ("apf",                    None, None, "reactive",    "APF"),
     ("rrt_once",               None, None, "sampling",    "RRT once"),
     ("rrt_replan",             5,    None, "sampling",    "RRT replan (K=5)"),
@@ -2582,29 +2583,31 @@ def _tc_p10_run_all_canonical(_tmp: Path) -> str:
     from runners.run_all import canonical_planner_set, build_experiment_cmd
 
     planners = canonical_planner_set()
-    assert len(planners) == 12, f"canonical_planner_set must return 12 tuples, got {len(planners)}"
+    assert len(planners) == 13, f"canonical_planner_set must return 13 tuples, got {len(planners)}"
 
     replan_families = {"a_star_replan", "dijkstra_replan", "rrt_replan", "rrt_star_replan"}
+    predict_canonical = {"d_star_lite_predictive", "dwa_predictive"}
     seen_replan = set()
-    seen_predictive = False
+    seen_predictive = set()
     for algorithm, replan_k, predict_horizon, label in planners:
         if algorithm in replan_families:
             seen_replan.add(algorithm)
             assert replan_k == 5, f"{algorithm} must carry replan_k=5, got {replan_k}"
             assert predict_horizon is None, f"{algorithm} must carry predict_horizon=None, got {predict_horizon}"
             assert label.endswith("_k5"), f"{algorithm} label must end _k5, got {label!r}"
-        elif algorithm == "d_star_lite_predictive":
-            seen_predictive = True
+        elif algorithm in predict_canonical:
+            seen_predictive.add(algorithm)
             assert replan_k is None, f"{algorithm} must carry replan_k=None, got {replan_k}"
             assert predict_horizon == 10, f"{algorithm} must carry predict_horizon=10, got {predict_horizon}"
-            assert label == "d_star_lite_predictive_h10", f"{algorithm} label must be d_star_lite_predictive_h10, got {label!r}"
+            assert label == f"{algorithm}_h10", f"{algorithm} label must be {algorithm}_h10, got {label!r}"
         else:
             assert replan_k is None, f"{algorithm} must carry replan_k=None, got {replan_k}"
             assert predict_horizon is None, f"{algorithm} must carry predict_horizon=None, got {predict_horizon}"
             assert not label.endswith("_k5"), f"{algorithm} label must not end _k5, got {label!r}"
     assert seen_replan == replan_families, \
         f"all 4 replan families must appear, missing {replan_families - seen_replan}"
-    assert seen_predictive, "the canonical d_star_lite_predictive must appear in canonical_planner_set"
+    assert seen_predictive == predict_canonical, \
+        f"both canonical predict families must appear, missing {predict_canonical - seen_predictive}"
 
     # build_experiment_cmd: a replan family includes --replan-k 5; a non-replan omits it.
     replan_cmd = build_experiment_cmd(

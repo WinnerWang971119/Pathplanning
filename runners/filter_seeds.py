@@ -589,8 +589,10 @@ def _parse_args(argv: list[str] | None) -> FilterArgs:
         "--planners",
         choices=["all13", "canonical"],
         default="all13",
-        help="Required planner set: all13 (12 canonical + 1 experimental oracle, default) or "
-        "canonical (the 12 only).",
+        help="Required planner set: all13 (default; the canonical planners plus the "
+        "experimental d_star_lite_oracle) or canonical (the canonical planners only). "
+        "'all13' is a legacy name; the roster grew when dwa_predictive was promoted to "
+        "canonical (dwa_predictive_oracle is not part of it).",
     )
     parser.add_argument(
         "--selfcheck",
@@ -1024,11 +1026,12 @@ def _tc_f9_determinism(tmp: Path) -> str:
 
 
 def _tc_f10_canonical_only(tmp: Path) -> str:
-    """TC-F10: --planners canonical on a 12-canonical tree - required set is the 12; a seed can drop."""
+    """TC-F10: --planners canonical on a 13-canonical tree - required set is the 13; a seed can drop."""
     world_dir = tmp / "tc_f10" / "w"
     required = build_required_labels(10, 5, "canonical")
-    assert len(required) == 12, f"expected 12 canonical labels, got {len(required)}"
+    assert len(required) == 13, f"expected 13 canonical labels, got {len(required)}"
     assert "d_star_lite_predictive_h10" in required, "the canonical predictive label must be required"
+    assert "dwa_predictive_h10" in required, "the canonical DWA predictive label must be required"
     seed = 40
     _write_manifests_for_labels(world_dir, required, [seed])
     _write_seed_fixture(world_dir, seed, _default_outcomes(required, crash_step=1))
@@ -1037,11 +1040,11 @@ def _tc_f10_canonical_only(tmp: Path) -> str:
         world_stem="w", results_dir=str(tmp / "tc_f10"), replan_k=5, predict_horizon=10,
         window_seconds=DEFAULT_WINDOW_SECONDS, step_time=DEFAULT_STEP_TIME, planners="canonical",
     )
-    assert obj.required_labels == tuple(required), "recorded required_labels must equal the 12"
-    assert len(obj.required_labels) == 12
-    assert seed in obj.dropped_seeds, "a clean all-crash seed on a 12-canonical tree must still drop"
+    assert obj.required_labels == tuple(required), "recorded required_labels must equal the 13"
+    assert len(obj.required_labels) == 13
+    assert seed in obj.dropped_seeds, "a clean all-crash seed on a 13-canonical tree must still drop"
     assert exit_code == 0
-    return "canonical-only 12-label tree: a seed drops; required_labels recorded as the 12"
+    return "canonical-only 13-label tree: a seed drops; required_labels recorded as the 13"
 
 
 def _tc_f11_freshness_and_posix_keys(tmp: Path) -> str:

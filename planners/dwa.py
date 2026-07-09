@@ -126,6 +126,12 @@ class DWAController:
         self._last_v = 0.0
         self._last_w = 0.0
 
+        # Rollout length in CONTROL_DT sub-steps. Vanilla DWA uses ROLLOUT_STEPS;
+        # the predictive subclass raises it to cover a longer prediction horizon
+        # (the base score still reads only the first ROLLOUT_STEPS, so extending
+        # this leaves plain `dwa` byte-identical).
+        self._rollout_steps = ROLLOUT_STEPS
+
     def reset(
         self,
         world_yaml: str,
@@ -194,12 +200,14 @@ class DWAController:
         for candidate_v in np.linspace(window.v_min, window.v_max, LINEAR_SAMPLES):
             for candidate_w in np.linspace(window.w_min, window.w_max, ANGULAR_SAMPLES):
                 trajectory = self._rollout(state, float(candidate_v), float(candidate_w))
-                clearance = self._trajectory_clearance(trajectory, obstacle_points)
-                if clearance is None:
-                    # Rollout collides (within robot radius + margin): reject.
+                score = self._evaluate_candidate(
+                    state, trajectory, float(candidate_v), obstacle_points
+                )
+                if score is None:
+                    # Candidate rejected (present-position clearance, or a
+                    # space-time collision in the predictive subclass).
                     continue
 
-                score = self._score(trajectory, float(candidate_v), clearance)
                 if score > best_score:
                     best_score = score
                     best_v = float(candidate_v)
@@ -218,6 +226,31 @@ class DWAController:
         return np.array([[clamped_v], [clamped_w]], dtype=float)
 
     # --- Internal helpers ---------------------------------------------------
+
+    def _evaluate_candidate(
+        self,
+        state: np.ndarray,
+        trajectory: np.ndarray,
+        v: float,
+        obstacle_points: np.ndarray,
+    ) -> float | None:
+        """Score one rollout candidate, or reject it (return ``None``).
+
+        The base is vanilla DWA's per-candidate rule: reject when the present-
+        position clearance against the live lidar cloud is ``None`` (the rollout
+        would graze the body), otherwise the weighted heading + clearance + speed
+        score. Extracted as an overridable seam so the predictive DWA subclass can
+        add its space-time layer (advance each tracked obstacle to the matched
+        time and reject/penalize a future collision) WITHOUT reimplementing
+        ``act()``; this base body is byte-identical to the old inline block, so
+        plain ``dwa`` is unchanged. ``state`` is unused by the base but is passed
+        for the subclass (which needs the robot pose to project obstacle motion).
+        """
+        del state
+        clearance = self._trajectory_clearance(trajectory, obstacle_points)
+        if clearance is None:
+            return None
+        return self._score(trajectory, v, clearance)
 
     def _dynamic_window(self) -> _Window:
         """The feasible ``(v, w)`` window around the last command for one step.
@@ -245,16 +278,17 @@ class DWAController:
     def _rollout(self, state: np.ndarray, v: float, w: float) -> np.ndarray:
         """Forward-simulate constant ``(v, w)`` over the rollout horizon.
 
-        Returns an ``(ROLLOUT_STEPS, 2)`` array of predicted xy positions
+        Returns a ``(self._rollout_steps, 2)`` array of predicted xy positions
         (excluding the start pose) under the exact differential-drive unicycle
-        update at CONTROL_DT per sub-step.
+        update at CONTROL_DT per sub-step. ``self._rollout_steps`` defaults to
+        ROLLOUT_STEPS (vanilla DWA); the predictive subclass raises it.
         """
         x = float(state[0])
         y = float(state[1])
         theta = float(state[2])
 
-        positions = np.empty((ROLLOUT_STEPS, 2), dtype=float)
-        for step_index in range(ROLLOUT_STEPS):
+        positions = np.empty((self._rollout_steps, 2), dtype=float)
+        for step_index in range(self._rollout_steps):
             theta = wrap_to_pi(theta + w * CONTROL_DT)
             x += v * np.cos(theta) * CONTROL_DT
             y += v * np.sin(theta) * CONTROL_DT

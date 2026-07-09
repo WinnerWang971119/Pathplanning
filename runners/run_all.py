@@ -70,7 +70,7 @@ DEFAULT_RESULTS_DIR = "results"
 WALLCLOCK_SUBDIR = "__wallclock__"       # results-dir suffix for the serial pass; the child
                                          # re-inserts <world_stem>/<label> beneath it
 REPLAN_K = 5                             # canonical cadence for every replan family
-PREDICT_HORIZON = 10                     # canonical horizon for the predictive family (d_star_lite_predictive)
+PREDICT_HORIZON = 10                     # canonical horizon for the predict families (d_star_lite_predictive, dwa_predictive)
 
 # Stable, hand-listed canonical order so the driver is reproducible run to run and
 # the tally line numbering ([bulk i/11]) is deterministic. This is the authoritative
@@ -84,6 +84,7 @@ _CANONICAL_ORDER: tuple[str, ...] = (
     "d_star_lite",
     "d_star_lite_predictive",
     "dwa",
+    "dwa_predictive",
     "apf",
     "rrt_once",
     "rrt_replan",
@@ -106,12 +107,12 @@ if set(_CANONICAL_ORDER) != set(ALGORITHMS) - EXPERIMENTAL_KEYS:
 
 
 def canonical_planner_set() -> list[tuple[str, int | None, int | None, str]]:
-    """The 12 canonical ``(algorithm, replan_k, predict_horizon, label)`` tuples, in order.
+    """The 13 canonical ``(algorithm, replan_k, predict_horizon, label)`` tuples, in order.
 
     Replan-family keys (``planners._grid.REPLAN_FAMILIES``) carry the canonical
     cadence ``REPLAN_K``; predict-family keys (``planners._grid.PREDICT_FAMILIES``
-    — here just the canonical ``d_star_lite_predictive``) carry the canonical
-    horizon ``PREDICT_HORIZON``; every other planner carries ``None`` for both.
+    — the canonical ``d_star_lite_predictive`` and ``dwa_predictive``) carry the
+    canonical horizon ``PREDICT_HORIZON``; every other planner carries ``None`` for both.
     ``label`` is ``algorithm_label(algorithm, replan_k, predict_horizon)`` so it
     matches the results-dir each child writes to (``a_star_replan_k5`` /
     ``d_star_lite_predictive_h10`` / the bare ``a_star_once``). Pure and
