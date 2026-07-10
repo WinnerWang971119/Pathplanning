@@ -6078,7 +6078,13 @@ def tci(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses arena_no_pa
             cwd=str(repo_root),
             capture_output=True,
             text=True,
-            timeout=180,
+            # This is the suite's worst-case runtime: the boxed-in robot never
+            # crashes and never reaches the goal, so it runs the FULL 1200-step
+            # (120 s sim) episode with the heavier global-guidance predictive
+            # controller (a cost-to-go heading lookup per sampled candidate).
+            # Measured ~222 s wall uncontended, so 180 s was too tight; 420 s
+            # keeps generous margin for a loaded/slower machine.
+            timeout=420,
         )
         assert r.returncode == 0, (
             f"TCi runner exit {r.returncode}; stderr={r.stderr[-400:]}"
