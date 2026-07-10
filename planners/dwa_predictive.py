@@ -19,11 +19,27 @@ dynamic window, the sampling loop, the rollout, or the fallback:
 1. **Present-position safety FLOOR** — vanilla DWA's clearance check against the
    full live lidar cloud (walls AND movers at their *current* positions),
    hard-rejecting any candidate whose rollout grazes a currently-visible body. This
-   keeps the controller safe even when the tracker misses an obstacle.
-2. **Space-time predictive LAYER** — :func:`planners._predict.trajectory_conflict`
-   over the horizon: hard-reject candidates that collide with a track in matched
-   time, and add a predicted-clearance term to the score so the robot yields early
-   and smoothly rather than only at the last feasible instant.
+   keeps the controller safe even when the tracker misses an obstacle. The floor is
+   UNCHANGED: no live return is ever subtracted for a tracked mover, so an obstacle
+   with no track is still caught at its current position.
+2. **Space-time predictive LAYER** (braking-inevitability + soft yield) — this is
+   NOT a blanket space-time hard reject (that freezes the robot: any matched-time
+   conflict anywhere on the rollout kills every forward candidate). Instead, per
+   candidate, over the horizon via :func:`planners._predict.trajectory_conflict`:
+   - **Imminent backstop** — a conflict at the very next step (``ttc_step == 1``)
+     is rejected outright (too close to react).
+   - **Braking-inevitability (ICS) test** — simulate an emergency-braking
+     trajectory (decelerate to a stop at ``BRAKE_DECEL`` then hold, via
+     :meth:`_braking_trajectory`) and reject the candidate ONLY when even that
+     braking-and-holding path still collides in matched time. A conflict the robot
+     could brake out of is admitted (it is not an inevitable collision state), so
+     the layer cannot freeze the robot the way a blanket reject does.
+   - **Soft yield term** — a SYMMETRICALLY-clipped, un-floored predicted-clearance
+     score term (``PREDICTED_GAP_WEIGHT * clip(min_gap, -cap, cap)/cap``) added to
+     the base score. Being monotone in the matched-time gap and penalizing negative
+     gaps, it makes a slower collision-free candidate outscore a faster grazing one
+     — the mechanism that makes the robot yield early rather than only at the last
+     feasible instant.
 
 Velocity source behind the shared ``Tracker`` seam (mirrors D* Lite):
 - ``DWAPredictiveController`` (key ``"dwa_predictive"``): ``LidarTracker``
@@ -58,6 +74,7 @@ from manual_astar import (
     SAFETY_MARGIN,
     build_occupancy_grid,
     load_world,
+    wrap_to_pi,
 )
 from planners._predict import (
     PREDICT_DT,
@@ -69,17 +86,27 @@ from planners._predict import (
 from planners.dwa import (
     CLEARANCE_CAP,
     COLLISION_MARGIN,
+    CONTROL_DT,
+    MAX_LINEAR_ACCEL,
     ROLLOUT_STEPS,
     DWAController,
 )
 
-# Weight on the space-time predicted-clearance term added to DWA's weighted-sum
-# score. Same scale as the present-position CLEARANCE_WEIGHT (0.3): it rewards
-# candidates that keep more matched-time margin from moving obstacles, so the robot
-# starts easing away from a predicted conflict before a hard space-time rejection
-# is forced. Tunable; a small default that biases toward foresight without
-# overwhelming the goal-heading term.
-PREDICTED_CLEARANCE_WEIGHT = 0.4
+# Braking-simulation deceleration (m/s^2) used by the inevitable-collision-state
+# test. The braking rollout decelerates the candidate's linear speed at this rate
+# to a stop, then holds — so it uses the dynamic window's OWN physics (the same
+# acceleration bound that shapes the reachable window each tick), rather than an
+# arbitrary braking constant.
+BRAKE_DECEL = MAX_LINEAR_ACCEL
+
+# Weight on the space-time predicted-clearance ("min_gap") soft-score term added
+# to DWA's weighted-sum score. The term is the SYMMETRICALLY-clipped, normalized
+# matched-time body gap: clip(min_gap, -CLEARANCE_CAP, CLEARANCE_CAP)/CLEARANCE_CAP
+# in [-1, 1]. Being un-floored (negative gaps penalize) makes a slower
+# collision-free candidate outscore a faster grazing/colliding one — the mechanism
+# that makes the robot yield rather than race a crosser. Small so foresight biases
+# the argmax without overwhelming the goal-heading term.
+PREDICTED_GAP_WEIGHT = 0.3
 
 
 class PredictiveDWAController(DWAController):
@@ -215,49 +242,122 @@ class PredictiveDWAController(DWAController):
         state: np.ndarray,
         trajectory: np.ndarray,
         v: float,
+        w: float,
         obstacle_points: np.ndarray,
     ) -> float | None:
-        """Two-layer per-candidate evaluation: present floor + space-time layer.
+        """Present floor + braking-inevitability space-time layer for one candidate.
 
         1. Present-position FLOOR + base score on the first ``ROLLOUT_STEPS`` (a
            forward prefix of the possibly-longer rollout) — identical to vanilla
-           DWA, so with no tracks this returns exactly the base score.
-        2. Space-time LAYER over the first ``horizon_steps``: hard-reject a
-           matched-time collision with any track; otherwise add a capped
-           predicted-clearance bonus so a candidate that keeps more space-time
-           margin from movers scores higher.
-        """
-        del state  # the trajectory already encodes the robot's future poses
+           DWA, so with no tracks this returns exactly the base score. The cloud
+           (``obstacle_points``) is the FULL live lidar projection: no mover return
+           is subtracted, so a tracker miss is still rejected here (AC6).
+        2. Space-time LAYER over the horizon: reject an imminent conflict
+           (``ttc_step == 1``); reject an INEVITABLE conflict (even the
+           braking-and-holding trajectory still collides in matched time); and add
+           the symmetric, un-floored predicted-clearance soft term so a slower
+           collision-free candidate outscores a faster grazing one (yielding).
 
+        The whole space-time block is wrapped so an unexpected raise degrades this
+        candidate to base scoring rather than propagating out of ``act()`` (AC11).
+        A deliberate ``return None`` reject inside the block is normal control flow,
+        not caught by the guard — it returns from the method directly.
+        """
         # Base heading/clearance/speed on the first ROLLOUT_STEPS (byte-identical
         # to plain DWA — the extra rollout steps feed only the space-time check).
+        # ``state`` is used below (the base ``_score`` ignores it, but the braking
+        # rollout needs the start pose), so it is NOT deleted here.
         base_trajectory = trajectory[:ROLLOUT_STEPS]
         clearance = self._trajectory_clearance(base_trajectory, obstacle_points)
         if clearance is None:
             return None
-        base_score = self._score(base_trajectory, v, clearance)
+        base_score = self._score(state, base_trajectory, v, clearance)
 
         # No tracks -> no space-time layer; behaves as plain DWA (also the h0 path).
         if not self._tracks:
             return base_score
 
         assert self._robot_radius is not None  # narrowed by super().act()'s guard
-        conflict = trajectory_conflict(
-            trajectory,
-            self._tracks,
-            float(self._robot_radius),
-            self._horizon_steps,
-            PREDICT_DT,
-            COLLISION_MARGIN,
-        )
-        if conflict.collides:
-            # The robot body would meet a moving obstacle at a matched time: reject.
-            return None
+        robot_radius = float(self._robot_radius)
 
-        # Predicted-clearance bonus: reward matched-time margin from movers, capped
-        # like the present-position clearance term and normalized to [0, 1].
-        predicted_clearance = min(max(conflict.min_gap, 0.0), CLEARANCE_CAP)
-        return base_score + PREDICTED_CLEARANCE_WEIGHT * (predicted_clearance / CLEARANCE_CAP)
+        try:
+            # Predicted matched-time conflict on the constant-(v, w) rollout. Pass
+            # the FULL (possibly longer) trajectory; trajectory_conflict clamps
+            # internally to min(horizon_steps, len).
+            conflict = trajectory_conflict(
+                trajectory,
+                self._tracks,
+                robot_radius,
+                self._horizon_steps,
+                PREDICT_DT,
+                COLLISION_MARGIN,
+            )
+
+            # Imminent backstop: a conflict at the very next step is too close to
+            # react to; reject outright.
+            if conflict.ttc_step == 1:
+                return None
+
+            # Braking-inevitability (ICS) test: if even an emergency-braking-and-
+            # holding trajectory still collides at a matched time, the collision is
+            # inevitable — reject. A conflict the robot could brake out of is
+            # admitted (the soft term below biases the argmax toward yielding).
+            braking = self._braking_trajectory(state, v, w)
+            braking_conflict = trajectory_conflict(
+                braking,
+                self._tracks,
+                robot_radius,
+                self._horizon_steps,
+                PREDICT_DT,
+                COLLISION_MARGIN,
+            )
+            if braking_conflict.collides:
+                return None
+
+            # Soft yield term: symmetric-clipped, un-floored matched-time gap in
+            # [-1, 1]. Negative gaps penalize, so a slower collision-free candidate
+            # outscores a faster grazing/colliding one.
+            gap = float(np.clip(conflict.min_gap, -CLEARANCE_CAP, CLEARANCE_CAP))
+            soft = PREDICTED_GAP_WEIGHT * (gap / CLEARANCE_CAP)
+            return base_score + soft
+        except Exception:
+            # AC11: an unexpected raise in the space-time layer degrades this
+            # candidate to base scoring; act() never raises mid-episode.
+            return base_score
+
+    def _braking_trajectory(
+        self, state: np.ndarray, v: float, w: float
+    ) -> np.ndarray:
+        """Forward-simulate an emergency-braking-then-hold rollout for the ICS test.
+
+        Mirrors :meth:`DWAController._rollout` exactly (same heading-first unicycle
+        update at CONTROL_DT), but the linear speed decelerates at ``BRAKE_DECEL``:
+        at sub-step ``k`` (1-based) the speed is
+        ``v_k = max(0, v - BRAKE_DECEL * k * CONTROL_DT)``. Once ``v_k`` hits 0 the
+        position increment is 0, so the robot HOLDS its stopped pose for the
+        remaining steps — a robot stopped in a crosser's lane is still an inevitable
+        collision state, so the space-time check must see the full braking+held
+        path. The angular velocity ``w`` is applied unchanged (heading keeps
+        turning), matching the base rollout's constant-``w`` assumption.
+
+        RNG-free and fixed step count (``self._rollout_steps``), so the extra
+        rollout is deterministic. Returns a ``(self._rollout_steps, 2)`` float64
+        array of predicted xy positions (excluding the start pose).
+        """
+        x = float(state[0])
+        y = float(state[1])
+        theta = float(state[2])
+
+        positions = np.empty((self._rollout_steps, 2), dtype=float)
+        for step_index in range(self._rollout_steps):
+            theta = wrap_to_pi(theta + w * CONTROL_DT)
+            v_k = max(0.0, v - BRAKE_DECEL * (step_index + 1) * CONTROL_DT)
+            x += v_k * np.cos(theta) * CONTROL_DT
+            y += v_k * np.sin(theta) * CONTROL_DT
+            positions[step_index, 0] = x
+            positions[step_index, 1] = y
+
+        return positions
 
 
 class DWAPredictiveController(PredictiveDWAController):

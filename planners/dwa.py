@@ -201,7 +201,11 @@ class DWAController:
             for candidate_w in np.linspace(window.w_min, window.w_max, ANGULAR_SAMPLES):
                 trajectory = self._rollout(state, float(candidate_v), float(candidate_w))
                 score = self._evaluate_candidate(
-                    state, trajectory, float(candidate_v), obstacle_points
+                    state,
+                    trajectory,
+                    float(candidate_v),
+                    float(candidate_w),
+                    obstacle_points,
                 )
                 if score is None:
                     # Candidate rejected (present-position clearance, or a
@@ -232,6 +236,7 @@ class DWAController:
         state: np.ndarray,
         trajectory: np.ndarray,
         v: float,
+        w: float,
         obstacle_points: np.ndarray,
     ) -> float | None:
         """Score one rollout candidate, or reject it (return ``None``).
@@ -246,8 +251,11 @@ class DWAController:
         plain ``dwa`` is unchanged. ``state`` is threaded through to
         :meth:`_score` (and on to :meth:`_heading_term`) for the subclass, which
         needs the robot pose to project obstacle motion / substitute a heading
-        target; the base ignores it there.
+        target; the base ignores it there. ``w`` (the candidate angular velocity)
+        is threaded through for the predictive subclass's braking-inevitability
+        simulation; the base ignores it entirely.
         """
+        del w  # only the predictive subclass's braking rollout needs it
         clearance = self._trajectory_clearance(trajectory, obstacle_points)
         if clearance is None:
             return None
