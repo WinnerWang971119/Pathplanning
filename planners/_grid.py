@@ -459,26 +459,41 @@ REPLAN_FAMILIES = frozenset(
 # and label their results with _h<steps>. They are NOT in REPLAN_FAMILIES, so the
 # existing "--replan-k not allowed" branch rejects --replan-k for them. This holds
 # both the grid-STAMPING D* Lite family (d_star_lite_*) and the space-time DWA
-# family (dwa_predictive*), which share the --predict-horizon / _h<steps> machinery
-# but reason very differently (stamp a grid vs. check collisions in (x, y, t)).
+# family (dwa_predictive*, incl. the paper-only ablation pair), which share the
+# --predict-horizon / _h<steps> machinery but reason very differently (stamp a
+# grid vs. check collisions in (x, y, t)). Six keys total.
 PREDICT_FAMILIES = frozenset(
     {
         "d_star_lite_oracle",
         "d_star_lite_predictive",
         "dwa_predictive",
         "dwa_predictive_oracle",
+        "dwa_predictive_paper",
+        "dwa_predictive_paper_oracle",
     }
 )
 
-# EXPERIMENTAL_KEYS is a STRICT SUBSET of PREDICT_FAMILIES: the lidar-fed
-# predictive variants (d_star_lite_predictive, dwa_predictive) are full canonical
-# study planners (run at h10 by run_all and charted on the main plots), so only the
-# perfect-velocity ORACLE cheats stay carved out of the canonical set. All four
-# predict families still take --predict-horizon and label with _h<steps> (that is
+# EXPERIMENTAL_KEYS is a STRICT SUBSET of PREDICT_FAMILIES (6 predict keys, 4
+# experimental): the lidar-fed, paper+global-guidance predictive variants
+# (d_star_lite_predictive, dwa_predictive) are full canonical study planners (run
+# at h10 by run_all and charted on the main plots). Carved OUT of the canonical
+# set are the perfect-velocity oracle cheats (d_star_lite_oracle,
+# dwa_predictive_oracle) AND the paper-only ablation pair (dwa_predictive_paper,
+# dwa_predictive_paper_oracle) — the ablation that isolates the braking layer from
+# the cost-to-go guidance, reached only through the runner. All six predict
+# families still take --predict-horizon and label with _h<steps> (that is
 # PREDICT_FAMILIES, unchanged); membership here is ONLY about the canonical-set
 # carve-out, not the horizon/label machinery. run_all's canonical-set assertion
-# tolerates the oracles via this set, so they never land on the canonical scatter.
-EXPERIMENTAL_KEYS = frozenset({"d_star_lite_oracle", "dwa_predictive_oracle"})
+# tolerates these four via this set, so they never land on the canonical scatter;
+# the canonical set stays 13.
+EXPERIMENTAL_KEYS = frozenset(
+    {
+        "d_star_lite_oracle",
+        "dwa_predictive_oracle",
+        "dwa_predictive_paper",
+        "dwa_predictive_paper_oracle",
+    }
+)
 
 
 def register(name: str, cls: type) -> None:

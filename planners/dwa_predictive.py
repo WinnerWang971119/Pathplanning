@@ -80,7 +80,9 @@ from manual_astar import (
 )
 from planners._costfield import build_cost_to_go_field
 from planners._predict import (
+    MAX_TRACK_SPEED,
     PREDICT_DT,
+    VELOCITY_SMOOTHING_FRAMES,
     LidarTracker,
     OracleTracker,
     Tracker,
@@ -478,8 +480,18 @@ class DWAPredictiveController(PredictiveDWAController):
         # Lazy: reset() has populated self._grid / self._bearings / self._geom by
         # the time this first fires (first non-h0 act()). The bearings are the exact
         # linspace recovery the rest of the harness uses (NOT i*angle_increment).
+        # Hardening (velocity smoothing + speed clamp) is opt-in on the LidarTracker
+        # and defaults OFF, so it must be requested explicitly here; it is used only
+        # by the DWA lidar keys, leaving d_star_lite_predictive's tracker construction
+        # (and TC63/TC64) byte-unchanged.
         assert self._grid is not None and self._bearings is not None and self._geom is not None
-        return LidarTracker(self._grid, self._bearings, range_max=self._geom.range_max)
+        return LidarTracker(
+            self._grid,
+            self._bearings,
+            range_max=self._geom.range_max,
+            smoothing_frames=VELOCITY_SMOOTHING_FRAMES,
+            max_track_speed=MAX_TRACK_SPEED,
+        )
 
 
 class DWAPredictiveOracleController(PredictiveDWAController):
@@ -498,9 +510,43 @@ class DWAPredictiveOracleController(PredictiveDWAController):
         return OracleTracker()
 
 
+class DWAPredictivePaperController(DWAPredictiveController):
+    """Paper-only ablation: braking-inevitability layer WITHOUT global guidance.
+
+    Isolates the Missura & Bennewitz braking/soft-yield layer from the
+    cost-to-go guidance field by flipping ``use_global_guidance`` back off; the
+    base heading term is the plain Euclidean goal-heading DWA already uses.
+    Inherits the hardened ``LidarTracker`` construction from
+    :class:`DWAPredictiveController` unchanged (only ``name`` and
+    ``use_global_guidance`` differ). EXPERIMENTAL — an ablation cell reached only
+    through the runner, not the canonical main-scatter dot (that remains plain
+    ``dwa_predictive``, the paper+global lidar variant).
+    """
+
+    name = "dwa_predictive_paper"
+    use_global_guidance = False
+
+
+class DWAPredictivePaperOracleController(DWAPredictiveOracleController):
+    """Paper-only ablation of the oracle: braking-inevitability WITHOUT global guidance.
+
+    Same relationship to :class:`DWAPredictiveOracleController` as
+    :class:`DWAPredictivePaperController` has to :class:`DWAPredictiveController`:
+    only ``name`` and ``use_global_guidance`` change, so the oracle's
+    ``_make_tracker`` (perfect live velocities via the truth seam) is inherited
+    unchanged. EXPERIMENTAL — isolates the braking layer from the guidance field
+    on the oracle ceiling; not on the canonical main scatter.
+    """
+
+    name = "dwa_predictive_paper_oracle"
+    use_global_guidance = False
+
+
 # Self-register at import (mirrors dwa.py / d_star_lite_predictive.py). Imported
 # after the class definitions so the registry sees the fully-defined classes.
 from planners._grid import register  # noqa: E402
 
 register("dwa_predictive", DWAPredictiveController)
 register("dwa_predictive_oracle", DWAPredictiveOracleController)
+register("dwa_predictive_paper", DWAPredictivePaperController)
+register("dwa_predictive_paper_oracle", DWAPredictivePaperOracleController)
