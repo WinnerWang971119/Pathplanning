@@ -1,181 +1,198 @@
-# Predictive DWA v2 — Admissible-Velocity Braking + Cost-to-Go Guidance
+# Predictive DWA v2 — Braking-Inevitability + Cost-to-Go Guidance
 
 **Goal:** Rebuild the predictive DWA family so it faithfully matches Missura & Bennewitz
-(ICRA 2019) — one soft admissible-velocity braking model instead of a double-counted
-hard-reject stack — and adds a static cost-to-go guidance field, so a predictive DWA
+(ICRA 2019) — a soft emergency-braking inevitable-collision test instead of a blanket
+space-time hard reject — and adds a static cost-to-go guidance field, so a predictive DWA
 actually beats plain DWA on the arena's dense crossing traffic instead of being
-net-harmful.
+net-harmful (measured baseline: plain `dwa` 0.50, `dwa_predictive_oracle` h10 0.80,
+`dwa_predictive` h10 0.70 on the 10-seed quick read — prediction is currently net-harmful
+even with a perfect-velocity oracle).
 
-**Approach:** Replace the current two-layer (present-position hard floor + space-time
-hard reject) model with a single-count soft model: walls (and un-tracked returns) keep
-the present-position lidar floor; tracked movers are removed from that floor and checked
-once by an admissible-velocity braking rule (slow to stay stoppable; hard-reject only an
-imminent unstoppable conflict). A static cost-to-go field (one Dijkstra from the goal at
-reset) replaces DWA's Euclidean heading term to cure the local-minima timeouts. Ship as a
-2×2 ablation: {paper-only, paper+global} × {oracle, lidar}, oracle-first. The paper+global
-lidar variant becomes the canonical `dwa_predictive`; the LidarTracker is hardened
-(smoothing + speed clamp) so the canonical key does not inherit the known-harmful raw
-estimator.
+**Approach:** Keep vanilla DWA's present-position lidar floor UNCHANGED (full live cloud —
+walls and movers at their current returns — so a tracker miss is always caught). Replace
+the freezing hard space-time reject with a soft predictive layer: an imminent backstop, an
+emergency-braking inevitable-collision test (reject only when even braking-to-a-stop still
+collides at matched time), and an un-clipped monotone predicted-clearance score term that
+mechanizes yielding (the collision-free slower candidate wins the argmax). Add a static
+cost-to-go field (one Dijkstra from the goal at reset) as the heading term to cure the
+local-minima timeouts. Ship as a 2×2 ablation — {paper-only, paper+global} × {oracle,
+lidar}, oracle-first. The paper+global lidar variant becomes the canonical `dwa_predictive`;
+the `LidarTracker` gains OPT-IN hardening (smoothing + speed clamp) used only by the DWA
+lidar keys, so the other canonical planner that shares the tracker (`d_star_lite_predictive`)
+is byte-unchanged.
 
 ## Scope
 
 - **In scope:**
-  - Byte-preserving refactor of `DWAController` to expose two seams: `_heading_term`
-    (the goal-heading score block) and `_present_floor_points` (identity in base).
+  - Byte-preserving refactor of `DWAController` to expose ONE seam: `_heading_term`
+    (the goal-heading score block), threading `state` through `_score`.
   - A pure `build_cost_to_go_field(grid, goal_cell)` Dijkstra-from-goal field builder.
-  - Rewrite of the predictive DWA `_evaluate_candidate`: admissible-velocity braking
-    over the reused `trajectory_conflict`, single-count floor filter with a blindness
-    guard, risk-budgeted so ~20 crossers cannot collapse speed to zero.
+  - Predictive DWA `_evaluate_candidate` rewrite: imminent backstop + emergency-braking
+    inevitable-collision test + un-clipped monotone predicted-clearance term. A
+    `_braking_trajectory` helper (decelerate to 0, then hold).
   - A global-guidance mixin: build the cost-to-go field at reset, override `_heading_term`
-    to score by field-value decrease; fall back to base heading (no `planner_error`) if
-    the field build fails.
+    to score by normalized field-value decrease; fall back to base heading (no
+    `planner_error`) if the start cell is unreachable.
   - Four registry keys: `dwa_predictive` / `dwa_predictive_oracle` REPLACED in place with
     the paper+global behavior; new `dwa_predictive_paper` / `dwa_predictive_paper_oracle`
     for the paper-only ablation. `EXPERIMENTAL_KEYS` grows to 4; canonical set stays 13.
-  - LidarTracker hardening: windowed-mean velocity smoothing (≤3 associated frames) +
-    clamp to the env max obstacle speed, deterministic, state cleared on reset.
-  - New/updated TCs in `arena/arena.py --check` covering all of the above.
+  - OPT-IN LidarTracker hardening: windowed-mean velocity smoothing (≤3 associated frames)
+    + clamp to the max regime obstacle speed, off by default so `d_star_lite_predictive`
+    is byte-unchanged, on only for the two DWA lidar keys.
+  - New/updated TCs in `arena/arena.py --check`.
   - A 10-seed × {0,5,10,20} quick read (all variants + plain dwa), a findings doc + PNG,
-    and evaluation of the tightened 2×2 success gates. **Run by Claude.**
-  - Docs: CLAUDE.md's DWA-predictive section, Mission.md's Phase 7 note, README if a
-    command/flag changes.
+    and evaluation of the tightened 2×2 success gates. **Run by Claude** (scratch script,
+    not committed; the findings doc + PNG are the committed deliverable).
+  - Docs: CLAUDE.md (both the DWA-predictive AND the D* Lite predictive sections — the
+    latter to record that the shared tracker's default is unchanged), Mission.md Phase 7,
+    README (two new `--algorithm` values).
 - **Out of scope:**
   - The full 50-seed canonical / horizon / speed sweeps — **the user launches these**;
-    this spec only sets them up and runs the 10-seed quick read.
+    this spec sets them up and runs only the 10-seed quick read.
   - A velocity-obstacle (VO) steering layer, SIPP, or any new non-DWA planner family
-    (considered by the consult, deliberately deferred as separate future work).
-  - Global-path *replanning* / any `--replan-k` on the DWA-predict family (the field is
+    (considered by the consult, deliberately deferred).
+  - Global-path *replanning* / any `--replan-k` on the DWA-predict family (field is
     plan-once at reset).
   - `trajectory_conflict` / `predict_blocked_cells` signature changes — reused as-is.
+  - Adding the paper-only keys to the horizon-sweep `SWEEP_ALGORITHMS` (driver/plotter) —
+    they are an ablation reached only through the runner + the T8 quick-read script;
+    `dwa_predictive` / `dwa_predictive_oracle` remain in the sweep as today.
 
 ## Decisions
 
-- **Match-the-paper mechanism = admissible-velocity braking** (chosen over a TTC-threshold
-  or a VO gate) — it is the literal Missura & Bennewitz model and structurally cannot
-  freeze (every heading keeps an admissible speed, including ~0).
+- **Braking = emergency-braking inevitable-collision-state test, NOT a scalar
+  stopping-distance formula.** The first-draft `d_c = v·ttc·dt; v_adm = sqrt(2·b·d_c)`
+  was found in review to algebraically collapse to a degenerate TTC cutoff (`v > 0.4·k`)
+  that never fires beyond 0.2 s — deleted. The correct rule simulates a braking trajectory
+  through `trajectory_conflict` and rejects only when the collision is inevitable even if
+  the robot brakes now (the ICS test), which structurally cannot freeze.
+- **Single-count by softening the FUTURE layer, not by thinning the present floor.** The
+  present-position floor keeps the FULL live lidar cloud (walls + movers at current
+  returns), so a tracker miss is still caught. The old double-count (present hard-reject +
+  every-future hard-reject) is cured by making the future layer soft (braking-admissibility
+  + monotone score), NOT by subtracting mover returns. No blindness risk; no
+  `_present_floor_points` subtraction.
 - **Guidance = cost-to-go field, not a WaypointFollower** — both approach consultants
-  (Fable + Codex) independently made this their top pick; a scalar geodesic field cannot
-  wedge under constant lateral displacement by ~20 crossers, the exact pathology this repo
-  already paid to fix for the follower (`project-replanning-commitment-horizon`).
-- **Single-count with a blindness guard** — a mover is dropped from the present-position
-  floor only if it is within a tracked obstacle's current disk; an un-tracked (missed /
-  over-segmented) return stays in the floor as a zero-velocity point. Trades a little
-  conservatism for never going blind — required because the raw LidarTracker over-segments.
-- **Risk-budgeted braking** — the hard admissibility check keys off the *earliest* (binding)
-  matched-time conflict from `trajectory_conflict`; distant crossers only shape the soft
-  score via `min_gap`. So many simultaneous crossers do not each veto the window.
+  independently made this their top pick; a scalar geodesic field cannot wedge under
+  constant lateral displacement by ~20 crossers (the pathology this repo already fixed for
+  the follower, `project-replanning-commitment-horizon`).
 - **Replace canonical in place; paper-only is a new experimental pair** — the main-scatter
-  `dwa_predictive` dot becomes the strongest (paper+global) variant; the paper-only keys
-  are experimental ablation, off the canonical set.
-- **Tightened 2×2 success bar** — prediction must beat its own guided baseline, not merely
-  clear 0.50 (guidance alone would false-positive a plain-0.50 gate). See Acceptance
-  Criteria AC11.
-- **Harden the LidarTracker now** — shipping the raw 1-frame estimator under a *canonical*
-  key would repeat the measured `d_star_lite_predictive` net-harm; smoothing + clamp is
-  cheap and deterministic. Oracle is unaffected (perfect velocities).
-- **h0 semantics** — paper-only h0 is byte-identical to plain `dwa`; paper+global h0 is
-  field-guided-without-prediction, a deliberate 2×2 ablation cell (NOT equal to plain dwa).
-- **`BRAKE_DECEL = MAX_LINEAR_ACCEL` (2.0)** — the admissibility bound uses the dynamic
-  window's own physics rather than a free-floating constant.
+  `dwa_predictive` dot becomes the strongest (paper+global) variant.
+- **Tightened 2×2 success bar, judged on the ORACLE rows** — prediction must beat its own
+  guided baseline; lidar rows are reported but a lidar miss is a perception finding, not a
+  spec blocker (oracle-first isolates policy from perception). See AC12.
+- **LidarTracker hardening is opt-in (default off)** so the shared tracker leaves
+  `d_star_lite_predictive` byte-identical (TC63/TC64 stay binding). `MAX_TRACK_SPEED = 2.0`
+  (the `fast` regime cap, NOT 1.5) so the issue-#11 speed sweep is not truncated.
+- **`BRAKE_DECEL = MAX_LINEAR_ACCEL` (2.0)** — the braking sim uses the window's own physics.
 
 ## Acceptance Criteria
 
 Correctness / determinism (verified by TCs):
-- [ ] **AC1** Plain `dwa` trace JSONL is byte-identical to pre-change on the same seed
-  (`--no-traffic` and traffic-on) — the base refactor is byte-preserving.
+- [ ] **AC1** Plain `dwa` trace JSONL byte-identical to pre-change on the same seed
+  (`--no-traffic` and traffic-on) — the `_heading_term` extraction is byte-preserving.
 - [ ] **AC2** `dwa_predictive_paper` and `dwa_predictive_paper_oracle` at `h0` produce a
-  byte-identical trace to plain `dwa` (both `--no-traffic` and traffic-on).
+  byte-identical trace to plain `dwa` (`--no-traffic` and traffic-on).
 - [ ] **AC3** `dwa_predictive` and `dwa_predictive_oracle` (paper+global) at `h0` are
   deterministic (two same-seed runs byte-identical) and are NOT byte-identical to plain
-  `dwa` (field guidance is active) — the global-only ablation cell.
-- [ ] **AC4** All four keys: two same-seed traffic-on runs are byte-identical; every trace
-  line carries the 8-key schema (incl. `dynamic_obstacles_sha256`).
-- [ ] **AC5** `--predict-horizon` is required for all four keys (omission → exit 2);
-  `--replan-k` is rejected for all four (exit 2); `algorithm_label` folds `_h<steps>`.
-- [ ] **AC6** Single-count + blindness guard: a tracked mover's returns are excluded from
-  the present-position floor; an obstacle with no track keeps its returns in the floor
-  (verified on a synthetic split). No candidate is rejected by both the floor and the
-  braking layer for the same mover.
-- [ ] **AC7** `build_cost_to_go_field` returns octile goal-distances matching an A*-cost
-  oracle on reachable cells, `inf` on unreachable cells, and is deterministic; a field
-  whose start cell is unreachable makes the global variant fall back to base heading with
-  `planner_error` null.
-- [ ] **AC8** Hardened LidarTracker is deterministic across a multi-frame cluster-count
-  change (byte-identical `Track` tuples on two fresh runs), never reports a speed above
-  `MAX_TRACK_SPEED`, and clears smoothing state on `reset()`.
-- [ ] **AC9** `run_all` canonical set == 13; `EXPERIMENTAL_KEYS == {d_star_lite_oracle,
+  `dwa` (field guidance active) — the global-only ablation cell.
+- [ ] **AC4** All four keys: two same-seed traffic-on runs byte-identical; every trace line
+  carries the 8-key schema.
+- [ ] **AC5** `--predict-horizon` required for all four (omission → exit 2); `--replan-k`
+  rejected for all four (exit 2); `algorithm_label` folds `_h<steps>`.
+- [ ] **AC6** The present-position floor is UNCHANGED — it checks the full live lidar cloud;
+  no live return is ever subtracted for a tracked mover, so an obstacle with no track is
+  still rejected by the floor at its current position (verified on a synthetic scan).
+- [ ] **AC7** Predictive layer: an inevitable matched-time collision (the braking+held
+  trajectory still collides) is rejected; a brakeable conflict is admitted; a `ttc_step==1`
+  imminent conflict is rejected; the predicted-clearance score term is strictly monotone in
+  `min_gap` and NOT clipped at 0 (a slower collision-free candidate outscores a faster
+  colliding one). The extra braking rollout is RNG-free and fixed-step (determinism).
+- [ ] **AC8** `build_cost_to_go_field` returns octile goal-distances (CELL units) matching
+  an A*-cost oracle on reachable cells and `inf` on occupied/unreachable cells, and is
+  deterministic; the global `_heading_term` is non-saturated and monotone in geodesic
+  progress; if the start cell is unreachable the global variant falls back to base heading
+  with `planner_error` null.
+- [ ] **AC9** Opt-in LidarTracker hardening: DEFAULT construction is byte-identical to
+  today (so `d_star_lite_predictive` is unchanged, TC63/TC64 pass); when enabled it is
+  deterministic across a cluster-count change AND an association swap, and never reports a
+  speed above `MAX_TRACK_SPEED`.
+- [ ] **AC10** `run_all` canonical set == 13; `EXPERIMENTAL_KEYS == {d_star_lite_oracle,
   dwa_predictive_oracle, dwa_predictive_paper, dwa_predictive_paper_oracle}`; the import
-  assertion `set(_CANONICAL_ORDER) == set(ALGORITHMS) - EXPERIMENTAL_KEYS` holds; all four
-  keys are in `PREDICT_FAMILIES`.
-- [ ] **AC10** `act()` never raises mid-episode for any key; the DWA family's
-  `planner_error` is always null (field-build fallback preserves this).
+  assertion holds; all four DWA-predict keys are in `PREDICT_FAMILIES`.
+- [ ] **AC11** `act()` never raises mid-episode for any key (the new field lookup, braking
+  rollout, and score paths are non-raising / guarded); the DWA family's `planner_error` is
+  always null.
 
 Empirical (produced + evaluated by the quick read, T8 — documented, not silently passed):
-- [ ] **AC11** The 10-seed × {0,5,10,20} quick read runs for plain `dwa` + all four
-  predictive keys; results, the 2×2 table, and a PNG land in a findings doc. **PASS** =
-  **gate 1** (`dwa_predictive_paper` best-horizon failure_rate < 0.50) **AND gate 2**
-  (`dwa_predictive` best-horizon failure_rate < the `dwa_predictive` h0 = global-only
-  cell). A miss is recorded as a finding with the next-step levers (weights, horizon,
-  estimator), not reported as success.
+- [ ] **AC12** The 10-seed × {0,5,10,20} quick read runs for plain `dwa` + all four
+  predictive keys; results, the 2×2 table, and a PNG land in a findings doc. **PASS**,
+  judged on the ORACLE rows = **gate 1** (`dwa_predictive_paper_oracle` best-horizon
+  failure_rate < the measured plain-`dwa` rate on the same 10 seeds) **AND gate 2**
+  (`dwa_predictive_oracle` best-horizon failure_rate < the `dwa_predictive_oracle` h0 =
+  global-only cell). The lidar rows are reported alongside; a lidar-only miss is recorded
+  as a perception finding, not a spec failure. A gate miss is documented with next-step
+  levers, never reported as success.
 
 ## Contracts & Interfaces
 
-Single source of truth for every cross-task seam.
-
 ### New / changed signatures
 
-- `DWAController._heading_term(self, trajectory: np.ndarray) -> float` — **owner T1**;
-  overridden by the global-guidance mixin (**consumer T4**). Base body is the exact
-  goal-heading block lifted verbatim from `_score` (returns the `[0,1]` heading alignment,
-  `1.0` inside `GOAL_REACHED_RADIUS`). `_score` calls `HEADING_WEIGHT * self._heading_term(traj)`.
-- `DWAController._present_floor_points(self, state: np.ndarray, obstacle_points: np.ndarray) -> np.ndarray`
-  — **owner T1**; identity in base (returns `obstacle_points` unchanged). Called once in
-  `act()` immediately after `obstacle_points` is computed, before the candidate loop.
-  Overridden by the predictive base (**consumer T3**) to drop tracked-mover returns.
+- `DWAController._score(self, state, trajectory, v, clearance) -> float` — **owner T1**;
+  gains `state` (threaded from `_evaluate_candidate`, which already has it) so it can pass
+  it to `_heading_term`. Byte-preserving: base ignores `state`.
+- `DWAController._heading_term(self, state, trajectory) -> float` — **owner T1**; base body
+  is the exact goal-heading block lifted verbatim from `_score` (returns the `[0,1]` heading
+  alignment, `1.0` inside `GOAL_REACHED_RADIUS`; ignores `state`). Overridden by the
+  global-guidance mixin (**consumer T4**).
 - `build_cost_to_go_field(grid: OccupancyGrid, goal_cell: tuple[int, int]) -> np.ndarray`
   — **owner T2**, new module `planners/_costfield.py`. Dijkstra from `goal_cell` over
-  `grid.cells`, SAME cost model as `astar_search` (8-connected, `np.hypot` octile step
-  cost, no corner-cutting: a diagonal is blocked if either orthogonal neighbor is
-  occupied). Returns a `(rows, cols)` float64 array of goal-distances; occupied and
-  unreachable cells are `inf`. Deterministic: `(dist, (row, col))` heap entries so ties
-  break on cell index, exactly like `astar_search`. **Consumer T4.** Pure — imports only
-  `manual_astar.OccupancyGrid` + numpy + heapq, no irsim.
-- `LidarTracker` (`planners/_predict.py`) — **owner T6**: constructor gains no required
-  arg; internally carries a per-prior-cluster short velocity history along the existing
-  positional association chain. `update()` return type unchanged (`list[Track]`), but
-  `Track.vx/vy` are now the windowed-mean over the last ≤`VELOCITY_SMOOTHING_FRAMES`
-  associated instantaneous velocities, magnitude-clamped to `MAX_TRACK_SPEED`. Consumers:
-  the two lidar predictive keys (via `_make_tracker`).
+  `grid.cells`, SAME cost model as `astar_search` (8-connected, `np.hypot(dr,dc)` octile
+  step cost in CELL units, no corner-cutting: a diagonal is blocked if either orthogonal
+  neighbor is occupied). Returns a `(rows, cols)` float64 array of goal-distances in CELL
+  units; occupied and unreachable cells are `inf`. Deterministic `(dist, (row, col))` heap
+  so ties break on cell index (exactly like `astar_search`). Pure — imports only
+  `manual_astar.OccupancyGrid`, numpy, heapq; no irsim. **Consumer T4.**
+- `PredictiveDWAController._braking_trajectory(self, state, v, w) -> np.ndarray` — **owner
+  T3**; forward-simulate same `w`, `v_k = max(0, v - BRAKE_DECEL*k*dt)`; once `v` hits 0,
+  HOLD position for the remaining steps. Returns `(self._rollout_steps, 2)`. RNG-free,
+  fixed step count.
+- `LidarTracker.__init__(self, grid, bearings, range_max=inf, *, smoothing_frames=0,
+  max_track_speed=inf)` — **owner T6**; the two new keyword-only args default to OFF, so
+  every existing construction (incl. `d_star_lite_predictive`) is byte-identical. When
+  `smoothing_frames>0`, reported `vx/vy` = windowed mean over the last ≤`smoothing_frames`
+  associated instantaneous velocities (history rides the existing positional association
+  chain); when `max_track_speed<inf`, the velocity magnitude is clamped to it. `update()`
+  return type unchanged (`list[Track]`). **Consumers:** the two DWA lidar keys.
 
 ### Reused as-is (no signature change)
 
 - `trajectory_conflict(robot_positions, tracks, robot_radius, horizon_steps, dt, margin)
-  -> TrajectoryConflict(collides, ttc_step, min_gap)` — the braking model reads `ttc_step`
-  (earliest binding conflict) and `min_gap` (soft gradient). No change.
-- `OracleTracker`, the `Tracker` protocol, `Track`, the truth seam
-  (`wants_truth` / `observe_truth`), `world_to_grid`, `build_occupancy_grid`, `load_world`.
+  -> TrajectoryConflict(collides, ttc_step, min_gap)` — the predictive layer calls it once
+  on the constant-`(v,w)` rollout (imminent + soft term) and once on the braking trajectory
+  (inevitability). `margin = COLLISION_MARGIN` (0.05). No change.
+- `OracleTracker`, `Tracker`, `Track`, truth seam (`wants_truth`/`observe_truth`),
+  `world_to_grid`, `build_occupancy_grid`, `load_world`, the base `_rollout` /
+  `_trajectory_clearance` / present-position floor.
 
 ### Registry / family sets (`planners/_grid.py`, **owner T5**)
 
 - `ALGORITHMS` gains `dwa_predictive_paper`, `dwa_predictive_paper_oracle`.
-- `PREDICT_FAMILIES = {d_star_lite_oracle, d_star_lite_predictive, dwa_predictive,
-  dwa_predictive_oracle, dwa_predictive_paper, dwa_predictive_paper_oracle}`.
+- `PREDICT_FAMILIES` gains the same two (six DWA/D*-predict keys total).
 - `EXPERIMENTAL_KEYS = {d_star_lite_oracle, dwa_predictive_oracle, dwa_predictive_paper,
-  dwa_predictive_paper_oracle}` (grows from 2 to 4; `dwa_predictive` stays canonical).
+  dwa_predictive_paper_oracle}` (2 → 4; `dwa_predictive` stays canonical).
 
 ### New module-level constants (`planners/dwa_predictive.py`, owners T3/T4)
 
-- `BRAKE_DECEL = MAX_LINEAR_ACCEL` (2.0) — admissibility deceleration.
-- `PREDICTED_GAP_WEIGHT` — soft-term weight on normalized `min_gap` (replaces
-  `PREDICTED_CLEARANCE_WEIGHT`; default ≤ `CLEARANCE_WEIGHT` = 0.3, NOT 0.4).
-- `FLOOR_DROP_MARGIN` — extra band added to `track.radius` when deciding which floor
-  returns belong to a tracked mover.
-- `GUIDANCE_WEIGHT` reuse of `HEADING_WEIGHT` (0.8) via `_heading_term` (no new weight);
-  `MAX_PROGRESS_PER_ROLLOUT = MAX_LINEAR_SPEED * ROLLOUT_STEPS * CONTROL_DT` normalizer.
+- `BRAKE_DECEL = MAX_LINEAR_ACCEL` (2.0).
+- `PREDICTED_GAP_WEIGHT = 0.3` — weight on `clip(min_gap, -CLEARANCE_CAP, CLEARANCE_CAP)/CLEARANCE_CAP`
+  (symmetric clip, so negative gaps penalize; NOT the old `clip(·,0,cap)`).
+- `MAX_PROGRESS_CELLS = MAX_LINEAR_SPEED * ROLLOUT_STEPS * CONTROL_DT / GRID_RESOLUTION`
+  (= 12.0) — the field-progress normalizer, in CELL units to match the field.
 
 ### New constants (`planners/_predict.py`, owner T6)
 
-- `MAX_TRACK_SPEED = 1.5` (m/s) — env obstacle speed cap (0.3–1.5× robot top speed 1.0).
+- `MAX_TRACK_SPEED = 2.0` (m/s) — the `fast` regime cap.
 - `VELOCITY_SMOOTHING_FRAMES = 3`.
 
 ### File ownership
@@ -188,108 +205,114 @@ Single source of truth for every cross-task seam.
 | `planners/_grid.py` | T5 | T7 |
 | `planners/_predict.py` | T6 | T7, T8 |
 | `arena/arena.py` | T7 | — |
-| `docs/plans/2026-07-10-predictive-dwa-braking.findings.md` (+ .png), quick-read script | T8 | — |
+| findings doc `...braking.findings.md` (+ `.png`), scratch quick-read script | T8 | — |
 | `CLAUDE.md`, `Mission.md`, `README.md` | T9 | — |
 
-## Algorithm detail — the soft model (Notes for T3)
+## Algorithm detail — the predictive layer (Notes for T3, from the judge's SYNTHESIS)
 
-Per candidate `(v, w)` with rollout `trajectory` (S poses at `k·dt`):
-1. **Floor (walls + un-tracked):** `clearance = _trajectory_clearance(trajectory[:ROLLOUT_STEPS], floor_points)`
-   where `floor_points` already has tracked-mover returns removed (in `_present_floor_points`).
-   If `None` → reject (unchanged vanilla rule).
-2. **Base score:** `base = _score(...)` using `_heading_term` (Euclidean for paper-only,
-   field for global) + clearance + speed.
-3. **No tracks** (h0, or empty): return `base` (paper-only h0 ⇒ plain dwa).
-4. **Predicted conflict:** `c = trajectory_conflict(trajectory, tracks, r, H, dt, margin)`.
-   - If `c.collides` (earliest binding step `k_c = c.ttc_step`): `d_c = max(0, v · k_c · dt)`;
-     `v_adm = sqrt(2 · BRAKE_DECEL · d_c)`. If `v > v_adm` → **reject** (cannot stop before
-     the conflict = imminent). Else keep (the robot will brake over the next ticks).
-   - Soft term (always, capped): `base + PREDICTED_GAP_WEIGHT · clip(c.min_gap, 0, CLEARANCE_CAP)/CLEARANCE_CAP`.
-   Determinism: `max(0, d_c)` guards the sqrt; the argmax keeps the existing strict-`>`,
-   fixed-iteration-order tie-break.
+Per sampled candidate `(v, w)` with constant-`(v,w)` rollout `traj`:
+1. **Present-position floor (UNCHANGED):** reject if `_trajectory_clearance(traj[:ROLLOUT_STEPS],
+   full_live_cloud)` is `None`. The cloud is the full lidar projection — movers at current
+   returns are NOT subtracted. Catches walls and any tracker miss.
+2. **Base score:** `_score(state, traj, v, clearance)` using `_heading_term` (Euclidean for
+   paper-only, field for global) + clearance + speed.
+3. **No tracks** (h0 or empty): return base (paper-only h0 ⇒ plain dwa).
+4. **Predicted conflict:** `c = trajectory_conflict(traj, tracks, r, H, dt, COLLISION_MARGIN)`.
+   - **Imminent backstop:** `if c.ttc_step == 1: reject`.
+   - **Braking inevitability:** `b = _braking_trajectory(state, v, w)`;
+     `cb = trajectory_conflict(b, tracks, r, H, dt, COLLISION_MARGIN)`;
+     `if cb.collides: reject` (even braking-to-a-stop-and-hold still collides at matched
+     time → inevitable).
+   - **Soft term (always):** `base + PREDICTED_GAP_WEIGHT * clip(c.min_gap, -CLEARANCE_CAP,
+     CLEARANCE_CAP)/CLEARANCE_CAP` — strictly monotone, un-clipped at 0, so a
+     collision-free slower/off-heading candidate outscores a grazing faster one. This is
+     what mechanizes yielding.
+   Determinism: both rollouts share fixed `H`, `dt`, constant obstacle advance, no RNG;
+   `_braking_trajectory` uses `max(0, ·)` on `v`. Argmax keeps the existing strict-`>`
+   fixed-iteration tie-break.
 
-`_present_floor_points` (T3 override): drop every `obstacle_point` within
-`track.radius + FLOOR_DROP_MARGIN` of any current `self._tracks` center (blindness guard:
-un-tracked returns survive). Works for oracle (truth centers) and lidar (cluster centers).
-
-Global `_heading_term` (T4 override): `progress = field[start_cell] - field[end_cell]`
-(via `world_to_grid`); if either is `inf` (unreachable/blocked) treat as `0` progress;
-return `clip(progress / MAX_PROGRESS_PER_ROLLOUT, 0, 1)`. Keep the `GOAL_REACHED_RADIUS`
-suppression → `1.0` near goal.
+Global `_heading_term(state, traj)` (T4 override):
+`start = world_to_grid(state[:2])`, `end = world_to_grid(traj[-1])`;
+`if field[start]==inf: fall back to base heading` (should not happen post-reset guard);
+`if field[end]==inf: return 0.0` (rollout ends in a wall — disfavor);
+`progress = field[start] - field[end]` (cells);
+`return 0.5 + 0.5*clip(progress / MAX_PROGRESS_CELLS, -1.0, 1.0)` (interior, monotone,
+retreat<no-progress<progress); keep the `GOAL_REACHED_RADIUS` → `1.0` guard.
 
 ## Error Handling
 
-- **Field build fails at reset** (goal cell unreachable / walled): the global variant logs
-  nothing to `planner_error`, drops `use_global_guidance` for the episode, and uses base
-  Euclidean heading. Preserves DWA's "never fails to plan" property (AC7, AC10).
-- **Tracker / prediction raises inside `act()`:** caught (`except Exception`), that tick
-  degrades to plain-DWA scoring (no braking layer) — never propagates (AC10). Matches the
-  current predictive `act()` guard.
-- **Empty dynamic window / all candidates rejected:** the existing in-place-rotation
-  fallback fires. The soft braking model makes a total-reject far rarer (every heading
-  keeps an admissible low speed), but the fallback stays as the backstop.
-- **Reused instance across episodes:** `reset()` clears the field, tracker, tracks,
-  snapshot, and (T6) the smoothing history, so episode 2 never differences against
-  episode 1.
+- **Start cell unreachable at reset** (goal walled off from start): the global variant
+  disables guidance for the episode (base Euclidean heading), `planner_error` null — DWA
+  never fails to plan (AC8, AC11).
+- **Tracker / prediction / field lookup raises inside `act()`:** the tracker update keeps
+  its existing guard; the new per-candidate paths are non-raising by construction
+  (`world_to_grid` clips to bounds; braking rollout is pure math), and the candidate loop
+  is additionally wrapped so any unexpected raise degrades that tick to base-DWA scoring —
+  never propagates (AC11).
+- **Empty window / all rejected:** the existing in-place-rotation fallback fires (far rarer
+  now — the soft layer keeps admissible candidates).
+- **Reused instance across episodes:** `reset()` clears field, tracker (`_tracker=None`),
+  tracks, snapshot; the tracker's smoothing history dies with the rebuilt tracker.
 
 ## Testing Strategy
 
-**Levels:** Unit (pure helpers, in-process) + Integration (subprocess runner drives,
-mirrors existing TC pattern). Added to `python arena/arena.py arena/arena_v1.yaml --check`.
+**Levels:** Unit (pure helpers, in-process) + Integration (subprocess runner). Added to
+`python arena/arena.py arena/arena_v1.yaml --check`. **Run:**
+`& .venv\Scripts\python.exe arena/arena.py arena/arena_v1.yaml --check`.
 
 | ID | Test Case | Type | Expected |
 |----|-----------|------|----------|
-| TC65* | plain `dwa` unchanged; paper-only h0 == plain dwa (`--no-traffic` + traffic) | Integration | byte-identical trace (AC1, AC2) |
-| TCa | paper+global h0 deterministic AND != plain dwa | Integration | two same-seed runs equal; differs from plain dwa (AC3) |
-| TCb | all four keys traffic-on e2e + determinism, 8-key schema | Integration | terminal state, byte-identical pair, 8 keys/line (AC4) |
-| TCc | `--predict-horizon` required / `--replan-k` rejected for the 4 keys; `_h<steps>` label | Integration | exit 2 on violation; no `<seed>.json` written (AC5) |
-| TCd | `build_cost_to_go_field` == A* cost on reachable cells; inf on sealed cells; deterministic | Unit | equal to oracle; inf; byte-identical (AC7) |
-| TCe | admissible-braking pure logic: imminent conflict rejected, brakeable kept, soft gap monotone | Unit | reject/keep per formula; deterministic (AC6 core) |
-| TCf | floor blindness guard: tracked mover dropped from floor; un-tracked return kept | Unit | membership per `FLOOR_DROP_MARGIN` (AC6) |
-| TCg | hardened LidarTracker: multi-frame cluster-count change deterministic; speed ≤ cap; reset clears | Unit | byte-identical Tracks; clamp; state cleared (AC8) |
-| TCh | field-build failure → global variant falls back, `planner_error` null | Integration | reaches terminal / null error (AC7, AC10) |
-| TCi | `run_all` canonical == 13; `EXPERIMENTAL_KEYS` == the 4; assertion holds; 4 keys in `PREDICT_FAMILIES` | Unit (in-process) | as stated (AC9) |
+| TC65* | plain `dwa` unchanged; paper-only h0 == plain dwa (`--no-traffic` + traffic). **Also REPLACE the existing TC65 assertions that `dwa_predictive_h0`/`_oracle_h0` == plain dwa — those become `!=` (moved to TCa).** | Integration | byte-identical (AC1, AC2) |
+| TCa | paper+global h0 deterministic AND != plain dwa | Integration | equal pair; differs from plain dwa (AC3) |
+| TCb | all four keys traffic-on e2e + determinism + 8-key schema | Integration | terminal, byte-identical pair, 8 keys/line (AC4) |
+| TCc | `--predict-horizon` required / `--replan-k` rejected for the 4 keys; `_h<steps>` label | Integration | exit 2 on violation; no `<seed>.json` (AC5) |
+| TCd | `build_cost_to_go_field` == A* cost (cells) on reachable; inf on sealed; deterministic | Unit | equal; inf; byte-identical (AC8) |
+| TCe | braking-inevitability + soft term: inevitable (braking+held still collides) rejected; brakeable admitted; `ttc==1` rejected; monotone un-clipped soft term makes a slower collision-free candidate outscore a faster colliding one; behavioral head-on crosser ⇒ chosen v decreases tick-over-tick | Unit + Integration | per §Algorithm (AC7) |
+| TCf | present floor keeps un-tracked mover returns (a mover with no track still rejected by the floor); no live return subtracted | Unit | rejection preserved (AC6) |
+| TCg | field `_heading_term` non-saturated + monotone: two candidates at different geodesic progress → strictly ordered interior scores; retreat < no-progress < progress | Unit | ordered, interior (AC8) |
+| TCh | opt-in tracker: DEFAULT construction byte-identical (assert `d_star_lite_predictive` TC63/TC64 unaffected); ENABLED deterministic across cluster-count change AND association swap; speed ≤ `MAX_TRACK_SPEED` | Unit | as stated (AC9) |
+| TCi | start-unreachable fallback on `arena/arena_no_path.yaml` (sealed start → `field[start]=inf`) → global variant falls back, `planner_error` null, terminal = timeout (not crash) | Integration | null error, timeout (AC8, AC11) |
+| TCj | mid-episode raise guard: make the tracker/prediction raise after the first successful act → `act()` returns a finite `(2,1)` action | Unit (in-process) | no raise (AC11) |
+| TCk | `run_all` canonical == 13; `EXPERIMENTAL_KEYS` == the 4; 4 keys in `PREDICT_FAMILIES`; assertion holds | Unit | as stated (AC10) |
 
-`TC65*` = extend the existing TC65 to also assert the two paper-only keys. **Test data:**
-synthetic grids/tracks built in-process (no irsim) for TCd–TCg,TCi; the seeded subprocess
-runner for the integration TCs. **Run command:**
-`& .venv\Scripts\python.exe arena/arena.py arena/arena_v1.yaml --check`.
+**Test data:** synthetic grids/tracks in-process for the unit TCs; seeded subprocess runner
+for integration; `arena/arena_no_path.yaml` for TCi.
 
 ## Tasks
 
 | ID | Task | Blocked By | Risk | Files | Description |
 |----|------|------------|------|-------|-------------|
-| T1 | Base DWA seams (byte-preserving) | — | med | `planners/dwa.py` | Extract the goal-heading block of `_score` into `_heading_term(trajectory)->float` (base returns the exact current value; `_score` calls `HEADING_WEIGHT*self._heading_term(traj)`). Add `_present_floor_points(state, obstacle_points)->np.ndarray` returning input unchanged, called once in `act()` right after `obstacle_points` is built. Must keep plain `dwa` byte-identical. Satisfies AC1. |
-| T2 | Cost-to-go field builder | — | med | `planners/_costfield.py` (new) | Pure `build_cost_to_go_field(grid, goal_cell)->np.ndarray`: Dijkstra from goal, octile step cost via `np.hypot`, no corner-cutting (diagonal blocked if either orthogonal neighbor occupied), `(dist,(r,c))` heap for deterministic ties; occupied/unreachable = inf. Imports only `manual_astar.OccupancyGrid`, numpy, heapq. Satisfies AC7 (field half). |
-| T3 | Predictive base: soft braking + single-count floor | T1 | high | `planners/dwa_predictive.py` | Rewrite `PredictiveDWAController._evaluate_candidate` per "Algorithm detail": admissible-velocity braking over `trajectory_conflict` (`d_c=max(0,v*ttc*dt)`, reject if `v>sqrt(2*BRAKE_DECEL*d_c)`, else soft `min_gap` bonus). Override `_present_floor_points` to drop tracked-mover returns (`FLOOR_DROP_MARGIN`, blindness guard). Add `BRAKE_DECEL`, `PREDICTED_GAP_WEIGHT`, `FLOOR_DROP_MARGIN`. Keep tracker plumbing + `act()` h0 fast-path. Satisfies AC6. |
-| T4 | Global-guidance mixin + field heading | T1, T2, T3 | high | `planners/dwa_predictive.py` | Add `use_global_guidance` (class attr). When set: `reset()` builds the cost-to-go field (goal cell via `world_to_grid`); override `_heading_term` to score field-decrease normalized by `MAX_PROGRESS_PER_ROLLOUT`, keeping the `GOAL_REACHED_RADIUS` guard. Field-build failure → fall back to base heading, `planner_error` null. Ensure paper-only h0==plain dwa and global h0=field-only (AC2, AC3, AC7, AC10). |
-| T5 | Register 4 keys + family sets | T3, T4 | med | `planners/dwa_predictive.py`, `planners/_grid.py` | Concrete classes: `DWAPredictiveController`(dwa_predictive, lidar, global), `DWAPredictiveOracleController`(dwa_predictive_oracle, oracle, global) — replace behavior in place; `DWAPredictivePaperController`(dwa_predictive_paper, lidar, no global), `DWAPredictivePaperOracleController`(dwa_predictive_paper_oracle, oracle, no global). `register()` the two new keys; add both to `PREDICT_FAMILIES` and `EXPERIMENTAL_KEYS`. Lidar keys use the hardened tracker. Satisfies AC5, AC9. |
-| T6 | Harden LidarTracker | — | high | `planners/_predict.py` | Carry a per-prior-cluster velocity history (deque ≤`VELOCITY_SMOOTHING_FRAMES`) along the existing positional association chain; reported `vx/vy` = windowed mean incl. current instantaneous, magnitude-clamped to `MAX_TRACK_SPEED`. Clear history in the tracker's per-episode reset path. Preserve full determinism (fixed association order, no set-iteration into output). Satisfies AC8. |
-| T7 | Tests TC65*+TCa–TCi | T5, T6 | med | `arena/arena.py` | Implement the Testing Strategy table in `--check`. Extend TC65 for the paper-only keys; add TCa–TCi. In-process fixtures for the pure ones (TCd–TCg,TCi), seeded subprocess for integration. Satisfies AC1–AC10. |
-| T8 | Quick read + findings | T5, T6 | med | `docs/plans/2026-07-10-predictive-dwa-braking.findings.md`, `.png`, quick-read script | Run 10-seed × {0,5,10,20} for plain dwa + 4 keys (traffic on, arena_v1); render a failure-rate-vs-horizon PNG; write the 2×2 table and evaluate gate 1 + gate 2 (AC11). **Claude runs this.** Document a miss with next-step levers. |
-| T9 | Docs | T5, T6, T7, T8 | low | `CLAUDE.md`, `Mission.md`, `README.md` | Rewrite the "space-time predictive DWA" CLAUDE.md section for the new model (admissible braking, cost-to-go field, blindness guard, 4 keys, EXPERIMENTAL_KEYS=4, hardened tracker). Update Mission.md Phase 7 note. Update README only if a command/flag changed (none expected). |
+| T1 | Base DWA `_heading_term` seam (byte-preserving) | — | med | `planners/dwa.py` | Thread `state` into `_score`; extract the goal-heading block of `_score` into `_heading_term(state, trajectory)->float` (base returns the exact current value, ignores `state`). `_score` calls `HEADING_WEIGHT*self._heading_term(state, traj)`. Keep plain `dwa` byte-identical. No `_present_floor_points` (the floor is unchanged). Satisfies AC1. |
+| T2 | Cost-to-go field builder | — | med | `planners/_costfield.py` (new) | Pure `build_cost_to_go_field(grid, goal_cell)->np.ndarray`: Dijkstra from goal, octile `np.hypot` step cost in CELL units, no corner-cutting, `(dist,(r,c))` heap for deterministic ties; occupied/unreachable = inf. Imports only `manual_astar.OccupancyGrid`, numpy, heapq. Satisfies AC8 (field half). |
+| T3 | Predictive base: braking-inevitability + soft term | T1 | high | `planners/dwa_predictive.py` | Rewrite `PredictiveDWAController._evaluate_candidate` per §Algorithm: present floor unchanged; imminent `ttc==1` reject; `_braking_trajectory` (decel to 0 then HOLD) + `trajectory_conflict` inevitability reject; un-clipped symmetric monotone `min_gap` soft term. Add `BRAKE_DECEL`, `PREDICTED_GAP_WEIGHT`. Wrap the candidate loop so an unexpected raise degrades to base scoring. Delete the degenerate `d_c`/`sqrt` formula and any `_present_floor_points` idea. Satisfies AC6, AC7, AC11. |
+| T4 | Global-guidance mixin + field heading | T1, T2, T3 | high | `planners/dwa_predictive.py` | Add `use_global_guidance` (class attr). When set: `reset()` builds the field (goal via `world_to_grid`); if `field[start]==inf` disable guidance for the episode (base heading, null error). Override `_heading_term` to `0.5+0.5*clip(progress/MAX_PROGRESS_CELLS,-1,1)` with the inf-end→0 and `GOAL_REACHED_RADIUS`→1 guards. Add `MAX_PROGRESS_CELLS`. Ensure paper-only h0==plain dwa, global h0=field-only. Satisfies AC3, AC8, AC11. |
+| T5 | Register 4 keys + family sets | T3, T4 | med | `planners/dwa_predictive.py`, `planners/_grid.py` | Concrete classes: `DWAPredictiveController`(dwa_predictive, lidar+hardened, global), `DWAPredictiveOracleController`(dwa_predictive_oracle, oracle, global) — replace behavior in place; `DWAPredictivePaperController`(dwa_predictive_paper, lidar+hardened, no global), `DWAPredictivePaperOracleController`(dwa_predictive_paper_oracle, oracle, no global). `register()` the two new keys; add both to `PREDICT_FAMILIES` and `EXPERIMENTAL_KEYS`. Lidar keys build the tracker with `smoothing_frames=VELOCITY_SMOOTHING_FRAMES, max_track_speed=MAX_TRACK_SPEED`. Satisfies AC5, AC10. |
+| T6 | Opt-in LidarTracker hardening | — | high | `planners/_predict.py` | Add keyword-only `smoothing_frames=0`, `max_track_speed=inf` to `LidarTracker.__init__` (default OFF ⇒ byte-identical for `d_star_lite_predictive`). When on: carry a per-prior-cluster velocity history (deque ≤`smoothing_frames`) along the existing positional association chain; reported `vx/vy` = windowed mean incl. current, magnitude-clamped to `max_track_speed`. Preserve full determinism. Add `MAX_TRACK_SPEED=2.0`, `VELOCITY_SMOOTHING_FRAMES=3`. Satisfies AC9. |
+| T7 | Tests TC65*+TCa–TCk | T5, T6 | med | `arena/arena.py` | Implement the Testing Strategy table in `--check`, including the TC65 assertion inversion for the canonical keys and the TCh guard that `d_star_lite_predictive` (TC63/TC64) is unaffected. In-process fixtures for unit TCs; seeded subprocess for integration. Satisfies AC1–AC11. |
+| T8 | Quick read + findings | T5, T6 | med | findings doc + `.png`, scratch script | Run 10-seed × {0,5,10,20} for plain dwa + 4 keys (traffic on, arena_v1); render failure-rate-vs-horizon PNG; write the 2×2 table; evaluate gate 1 + gate 2 on the ORACLE rows against the measured plain-dwa rate (AC12); report the lidar rows. **Claude runs this.** Document a miss with next-step levers. |
+| T9 | Docs | T5, T6, T7, T8 | low | `CLAUDE.md`, `Mission.md`, `README.md` | Rewrite the "space-time predictive DWA" CLAUDE.md section (braking-inevitability model, cost-to-go field, unchanged floor, 4 keys, EXPERIMENTAL_KEYS=4); note in the D* Lite predictive section that the shared `LidarTracker` default is unchanged; update Mission.md Phase 7; add the two new `--algorithm` values to README (`keep-readme-current-with-commands`). |
 
 ## Notes for Implementer
 
-- **Byte-identity is the tripwire.** T1's `_heading_term` extraction and
-  `_present_floor_points` identity insertion must not perturb plain `dwa` (TC65 guards it) —
-  compute in the same order, same floats. Run TC65 before and after T1.
-- **Blindness guard is not optional** (Fable veto): removing movers from the floor *without*
-  the un-tracked fallback turns the raw estimator's over-segmentation into invisible
-  obstacles → crashes. Drop a floor return only when it is inside an actual track disk.
-- **The braking uses the earliest conflict only** (risk-budgeting, Codex): do not AND a
-  separate admissibility constraint per crosser — `trajectory_conflict` already returns the
-  binding `ttc_step`; that single constraint plus the soft `min_gap` is the whole rule.
-- **Determinism traps:** clamp `d_c = max(0.0, ...)` before `sqrt`; pin the field heap
-  tie-break to `(dist, cell)`; clear the LidarTracker smoothing history on reset (reuse
-  contract); keep the candidate argmax strict-`>` in fixed order.
-- **Oracle-first sequencing:** the AC11 gate is judged first on the oracle rows; the lidar
-  rows (needing T6) are reported alongside. If the oracle passes but lidar does not, that
-  is a perception finding, not a policy failure — record it, do not block the spec.
-- **`wallclock_per_step` does not measure `act()`** (`gotcha-wallclock-per-step-excludes-act`)
-  — do not use it to judge the braking/field cost; total episode wall time is the signal.
-- **Run everything with the venv python** (`& .venv\Scripts\python.exe -m ...`); PATH python
-  lacks irsim (`gotcha-use-venv-python-not-path-python`).
-- **Rollback:** the whole change is additive except the in-place `dwa_predictive[_oracle]`
-  rewrite; git revert restores the old two-layer behavior. The paper-only keys and
-  `_costfield.py` are pure additions.
+- **Byte-identity is the tripwire.** T1's `_heading_term` extraction and `state` threading
+  must not perturb plain `dwa` (TC65 guards it). Run TC65 before and after T1.
+- **The floor stays FULL** (judge ruling): never subtract a tracked mover's live return.
+  "Single count" comes from the future layer being soft, not from thinning the present one.
+- **The braking trajectory must include the stationary HELD tail** — decelerate to 0 then
+  hold position for the rest of `H`; a robot stopped in a crosser's lane is still an ICS,
+  so `trajectory_conflict` must check the full braking+held path, not just the ramp.
+- **Soft term is symmetric-clipped, not floored at 0** — `clip(min_gap, -cap, cap)/cap`.
+  Flooring at 0 makes faster colliders win ties (the regression the review caught).
+- **Determinism traps:** RNG-free fixed-`H` braking rollout; `max(0,·)` on `v`; pin the
+  field heap tie-break to `(dist, cell)`; tracker smoothing history dies with the rebuilt
+  tracker; keep the argmax strict-`>` fixed order.
+- **Oracle-first sequencing:** AC12 gates on the oracle rows; the lidar rows (needing T6)
+  are reported alongside. Oracle pass + lidar miss ⇒ perception finding, not a spec block.
+- **`MAX_TRACK_SPEED=2.0`**, not 1.5 — 1.5 would truncate genuine `fast`-regime crossers in
+  the issue-#11 speed sweep (`dwa_predictive` is in that focus set).
+- **`wallclock_per_step` does NOT measure `act()`** — the extra braking rollout per
+  candidate does not show there; judge cost by total episode wall time.
+- **Run everything with the venv python** (`& .venv\Scripts\python.exe -m ...`).
+- **Rollback:** additive except the in-place `dwa_predictive[_oracle]` rewrite and the T1
+  refactor; `git revert` restores the old two-layer behavior. Paper-only keys,
+  `_costfield.py`, and the opt-in tracker args are pure additions.
