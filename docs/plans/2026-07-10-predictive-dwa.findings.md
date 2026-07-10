@@ -34,6 +34,8 @@ Horizon 10 = 1.0 s of lookahead.
 | `dwa_predictive_oracle` (perfect v) | 10 | **0.80** (8/10) | 89.2 | 2 / 4 / 4 |
 | `dwa_predictive` (lidar v)          | 10 | **0.70** (7/10) | 86.2 | 3 / 4 / 3 |
 
+![Space-time predictive DWA quick read](2026-07-10-predictive-dwa.png)
+
 All 30 episodes ran to a terminal state; `planner_error` is null everywhere (DWA
 `reset()` never raises); 0 runner failures. Master seed 20260605, first 10 derived
 seeds.
