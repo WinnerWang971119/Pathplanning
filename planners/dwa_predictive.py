@@ -71,11 +71,14 @@ import numpy as np
 
 from manual_astar import (
     GRID_RESOLUTION,
+    MAX_LINEAR_SPEED,
     SAFETY_MARGIN,
     build_occupancy_grid,
     load_world,
+    world_to_grid,
     wrap_to_pi,
 )
+from planners._costfield import build_cost_to_go_field
 from planners._predict import (
     PREDICT_DT,
     LidarTracker,
@@ -87,6 +90,7 @@ from planners.dwa import (
     CLEARANCE_CAP,
     COLLISION_MARGIN,
     CONTROL_DT,
+    GOAL_REACHED_RADIUS,
     MAX_LINEAR_ACCEL,
     ROLLOUT_STEPS,
     DWAController,
@@ -108,6 +112,17 @@ BRAKE_DECEL = MAX_LINEAR_ACCEL
 # the argmax without overwhelming the goal-heading term.
 PREDICTED_GAP_WEIGHT = 0.3
 
+# Normalizer for the global-guidance heading term's geodesic-progress score, in
+# CELL units to match the cost-to-go field (which stores octile distances in cell
+# units). It is the field-progress a full-speed straight rollout achieves over one
+# rollout window: MAX_LINEAR_SPEED * ROLLOUT_STEPS * CONTROL_DT metres, converted to
+# cells by dividing by GRID_RESOLUTION. Progress at or beyond this saturates the
+# term; the ratio is symmetrically clipped so a retreat of the same magnitude
+# saturates the low end (= 0.0). Evaluates to ~12.0 for the current constants (the
+# expression, kept verbatim so it tracks the constants, carries the usual 0.1
+# float error and lands at 12.000000000000002 rather than an exact 12.0).
+MAX_PROGRESS_CELLS = MAX_LINEAR_SPEED * ROLLOUT_STEPS * CONTROL_DT / GRID_RESOLUTION
+
 
 class PredictiveDWAController(DWAController):
     """Base for the space-time DWA family. Subclasses pick the velocity source.
@@ -124,6 +139,13 @@ class PredictiveDWAController(DWAController):
     # Opt-in live-truth flag; the oracle sets True so the runner feeds it the
     # dynamic-obstacle snapshot via observe_truth().
     wants_truth = False
+    # Opt-in cost-to-go global guidance. When True, reset() builds a static
+    # Dijkstra-from-goal field and the overridden _heading_term scores candidates by
+    # geodesic progress toward the goal (immune to the Euclidean-heading local minima
+    # a wall segment induces) instead of straight-line heading. The paper-only
+    # ablation classes leave this False (base Euclidean heading); the two global
+    # concrete classes flip it True. Default off so the base stays paper-behaviour.
+    use_global_guidance = False
 
     def _make_tracker(self) -> Tracker:
         """Return the velocity-source adapter (subclass responsibility)."""
@@ -155,9 +177,16 @@ class PredictiveDWAController(DWAController):
         # static grid + beam geometry; the OracleTracker is stateless.
         self._tracker: Tracker | None = None
         self._snapshot: tuple = ()
-        # Static inflated occupancy grid (built in reset(); consumed only by the
-        # LidarTracker's static-return subtraction, unused by the oracle).
+        # Static inflated occupancy grid (built in reset(); consumed by the
+        # LidarTracker's static-return subtraction — unused by the oracle — and, when
+        # global guidance is on, by the cost-to-go field build and per-candidate
+        # world_to_grid lookups).
         self._grid = None
+        # Static cost-to-go field (goal-distances in CELL units), or None when global
+        # guidance is off OR the start cell is walled off from the goal (the
+        # start-unreachable fallback: guidance disabled for the episode, base
+        # Euclidean heading used, planner_error stays null). Built in reset().
+        self._field: np.ndarray | None = None
         # Current-tick tracks, refreshed once per act() and read per candidate.
         self._tracks: list = []
 
@@ -193,6 +222,22 @@ class PredictiveDWAController(DWAController):
         self._tracks = []
         self.last_predicted_cells = []
         self.last_tracks = []
+
+        # Global guidance: build the static cost-to-go field once. Clear any
+        # prior-episode field first, so a reused instance whose second episode has
+        # guidance disabled (or a walled-off start) does not carry episode 1's field.
+        self._field = None
+        if self.use_global_guidance:
+            assert self._grid is not None and self._goal_xy is not None
+            goal_cell = world_to_grid(self._goal_xy, self._grid)
+            field = build_cost_to_go_field(self._grid, goal_cell)
+            start_cell = world_to_grid(np.asarray(state0, dtype=float)[:2], self._grid)
+            # Start-unreachable fallback: if the goal is walled off from the start
+            # the field is inf at the start cell — leave self._field None so
+            # _heading_term falls back to the base Euclidean heading for the whole
+            # episode. DWA never fails to plan, so planner_error stays null.
+            if not np.isinf(field[start_cell]):
+                self._field = field
 
     def observe_truth(self, snapshot: tuple) -> None:
         """Store the live dynamic-obstacle snapshot for the upcoming act() tick.
@@ -325,6 +370,64 @@ class PredictiveDWAController(DWAController):
             # candidate to base scoring; act() never raises mid-episode.
             return base_score
 
+    def _heading_term(self, state: np.ndarray, trajectory: np.ndarray) -> float:
+        """Geodesic-progress heading score when global guidance is active.
+
+        When no cost-to-go field is available (guidance off, or the
+        start-unreachable fallback disabled it for the episode) this delegates to
+        the base Euclidean goal-heading term unchanged, so a paper-only variant and
+        the global-with-walled-off-start case behave exactly as plain DWA's heading.
+
+        With a field, the score is a NON-SATURATED, strictly-monotone function of
+        the geodesic progress the rollout makes toward the goal (the field-value
+        DROP from the start cell to the rollout's final cell, in CELL units):
+
+            0.5 + 0.5 * clip(progress / MAX_PROGRESS_CELLS, -1.0, 1.0)
+
+        so retreat (< 0.5) < no progress (0.5) < progress (> 0.5), and the interior
+        is never exactly 0 or 1. This cures the local-minima pathology a Euclidean
+        heading hits behind a wall segment (the straight-line bearing points into
+        the wall; the geodesic field points around it).
+
+        Guards, in order:
+        - Goal-reached: within GOAL_REACHED_RADIUS of the goal the heading is
+          ill-defined, so return 1.0 (same convention as the base term).
+        - Start cell unreachable: defensive — the reset guard should have disabled
+          guidance (self._field would be None), but if a start read still lands on
+          an inf cell, fall back to the base heading rather than divide meaning into
+          an inf progress.
+        - Rollout ends in a wall (end cell inf): disfavour with 0.0.
+
+        world_to_grid clips to the grid bounds, so both cell reads are always
+        in-bounds and this method never raises (AC11).
+        """
+        assert self._goal_xy is not None  # narrowed by act()'s guard
+
+        # Paper-only variants and the walled-off-start fallback use the base
+        # Euclidean heading (self._field is None in both cases).
+        if self._field is None:
+            return super()._heading_term(state, trajectory)
+
+        assert self._grid is not None  # a field implies a grid was built in reset()
+
+        goal_distance = float(np.linalg.norm(self._goal_xy - trajectory[-1]))
+        if goal_distance < GOAL_REACHED_RADIUS:
+            return 1.0
+
+        start_cell = world_to_grid(state[:2], self._grid)
+        end_cell = world_to_grid(trajectory[-1], self._grid)
+
+        if np.isinf(self._field[start_cell]):
+            # Defensive: should not happen after the reset start-unreachable guard.
+            return super()._heading_term(state, trajectory)
+        if np.isinf(self._field[end_cell]):
+            # The rollout ends inside a wall's inflation band — disfavour it.
+            return 0.0
+
+        # Positive = the rollout's final cell is closer to the goal than the start.
+        progress = self._field[start_cell] - self._field[end_cell]
+        return 0.5 + 0.5 * float(np.clip(progress / MAX_PROGRESS_CELLS, -1.0, 1.0))
+
     def _braking_trajectory(
         self, state: np.ndarray, v: float, w: float
     ) -> np.ndarray:
@@ -369,6 +472,7 @@ class DWAPredictiveController(PredictiveDWAController):
 
     name = "dwa_predictive"
     wants_truth = False
+    use_global_guidance = True
 
     def _make_tracker(self) -> Tracker:
         # Lazy: reset() has populated self._grid / self._bearings / self._geom by
@@ -388,6 +492,7 @@ class DWAPredictiveOracleController(PredictiveDWAController):
 
     name = "dwa_predictive_oracle"
     wants_truth = True
+    use_global_guidance = True
 
     def _make_tracker(self) -> Tracker:
         return OracleTracker()
