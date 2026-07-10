@@ -272,16 +272,35 @@ family (Phase 7)" in CLAUDE.md._
 _Also shipped (Phase 7): a **real** predictive planner that reasons in `(x, y, t)`
 instead of stamping a grid — space-time DWA. Where the D* Lite family paints an
 obstacle's whole future footprint onto the occupancy grid (collapsing the time
-axis), `dwa_predictive` advances each tracked obstacle at constant velocity INSIDE
-the DWA rollout and checks the robot against the obstacle at the matched time step,
-so a candidate that passes behind a crosser is kept and one that would meet it is
-rejected (Missura & Bennewitz ICRA 2019; MDPI Actuators 2025 14(5):207). It reuses
-the D* Lite predictive substrate (trackers + truth seam + `--predict-horizon`) and
-ships oracle-first as a two-layer model: vanilla DWA's present-position clearance as
-a safety floor, plus the space-time layer. `dwa_predictive` (lidar-estimated
-velocities) is promoted to canonical; `dwa_predictive_oracle` (perfect velocities,
-the ceiling) is experimental. See "The space-time predictive DWA family (Phase 7)"
-in CLAUDE.md._
+axis), the predictive DWA family advances each tracked obstacle at constant
+velocity INSIDE the DWA rollout and checks the robot against the obstacle at the
+matched time step, so a candidate that passes behind a crosser is kept and one
+that would meet it is rejected (Missura & Bennewitz ICRA 2019; MDPI Actuators
+2025 14(5):207). It reuses the D* Lite predictive substrate (trackers + truth
+seam + `--predict-horizon`)._
+
+_The family was rebuilt (`docs/plans/2026-07-10-predictive-dwa-braking.md`)
+after the first cut — a blanket space-time hard reject — measured net-harmful
+against plain `dwa` on a quick read. The rebuild keeps the present-position
+lidar floor unchanged and replaces the future layer with an emergency-braking
+inevitable-collision test (reject only when braking-to-a-stop-and-hold still
+collides) plus a soft yield term that lets a slower collision-free candidate
+outscore a faster grazing one. A static cost-to-go field (one Dijkstra from the
+goal at reset) was added as a second lever, to cure DWA's local-minima
+timeouts. This ships as a 2×2 ablation — {braking-only, braking+global-guidance}
+× {oracle, lidar} — four registry keys total. `dwa_predictive` (lidar +
+global guidance) stays the canonical planner; `dwa_predictive_oracle`,
+`dwa_predictive_paper`, and `dwa_predictive_paper_oracle` are experimental.
+`EXPERIMENTAL_KEYS` grows to 4; the canonical set stays 13._
+
+_The honest result (`docs/plans/2026-07-10-predictive-dwa-braking.findings.md`):
+the braking-inevitability policy is the genuine advance — the braking-only
+oracle beats plain `dwa` on the quick read — but the cost-to-go field measured
+net-harmful, driving the robot straight down the geodesic into traffic with no
+yielding, so the canonical `dwa_predictive` key (which carries the field) is
+currently worse than plain `dwa`. The field needs rework before the canonical
+key earns its scatter slot; that is future work, not resolved here. See "The
+space-time predictive DWA family (Phase 7, rebuilt)" in CLAUDE.md._
 
 This is the only phase that produces an *insight* rather than an
 artifact. Everything before it exists to make this comparison rigorous.
