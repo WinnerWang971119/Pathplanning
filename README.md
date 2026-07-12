@@ -38,7 +38,8 @@ pathplanning/
 │   ├── rrt.py                #   rrt_once / rrt_replan
 │   ├── rrt_star.py           #   rrt_star_once / rrt_star_replan
 │   ├── d_star_lite_predictive.py  # d_star_lite_predictive (canonical, h10) / d_star_lite_oracle (experimental)
-│   └── dwa_predictive.py     #   dwa_predictive (canonical, h10) / dwa_predictive_oracle (experimental) — space-time DWA
+│   ├── _costfield.py         #   cost-to-go field (Dijkstra-from-goal) for DWA global guidance
+│   └── dwa_predictive.py     #   space-time DWA: dwa_predictive (canonical, h10) + 3 experimental variants
 ├── runners/                  # experiment harness (Phase 1 + 3 + 5)
 │   ├── run_episode.py        #   one planner × one seed × one world → metrics + trace
 │   ├── run_experiment.py     #   one planner × the canonical 50 seeds → batch + manifest
@@ -130,10 +131,11 @@ follows them with a heading-gated speed schedule. All tuning knobs are the
 
 ## The planner families
 
-Fifteen controllers are registered. Thirteen are **canonical** (they land on the
+Seventeen controllers are registered. Thirteen are **canonical** (they land on the
 headline scatter, including the lidar-only `d_star_lite_predictive` and
-`dwa_predictive` at h10); two are **experimental** (`d_star_lite_oracle` and
-`dwa_predictive_oracle`, the perfect-velocity cheats, excluded from the canonical
+`dwa_predictive` at h10); four are **experimental** (`d_star_lite_oracle`,
+`dwa_predictive_oracle`, `dwa_predictive_paper`, `dwa_predictive_paper_oracle` —
+perfect-velocity cheats and braking-only ablations, excluded from the canonical
 comparison). Pick one with `--algorithm <key>`.
 
 | Key | Family | Notes |
@@ -151,8 +153,10 @@ comparison). Pick one with `--algorithm <key>`.
 | `rrt_star_replan` | sampling RRT* | Needs `--replan-k`. |
 | `d_star_lite_oracle` | predictive (experimental) | Stamps each obstacle's predicted future footprint onto the grid using **perfect** velocities (the motion-aware ceiling). Needs `--predict-horizon`. |
 | `d_star_lite_predictive` | predictive (canonical, h10) | Same stamp, velocities **estimated from lidar** (frame-differencing). Needs `--predict-horizon`; canonical planner runs at h10. |
-| `dwa_predictive` | predictive DWA (canonical, h10) | **Space-time** DWA: forward-simulates each obstacle inside the rollout and checks collision at the matched time (NOT a grid stamp). Velocities **estimated from lidar**. Needs `--predict-horizon`; canonical at h10. |
-| `dwa_predictive_oracle` | predictive DWA (experimental) | Same space-time DWA with **perfect** velocities (the ceiling). Needs `--predict-horizon`. |
+| `dwa_predictive` | predictive DWA (canonical, h10) | **Space-time** DWA: forward-simulates each obstacle inside the rollout and checks matched-time collision via an emergency-braking inevitable-collision test, plus a cost-to-go global guidance field. Velocities **estimated from lidar**. Needs `--predict-horizon`; canonical at h10. |
+| `dwa_predictive_oracle` | predictive DWA (experimental) | Same braking-inevitability + global guidance model with **perfect** velocities (the ceiling). Needs `--predict-horizon`. |
+| `dwa_predictive_paper` | predictive DWA (experimental) | The braking-inevitability layer **only**, no cost-to-go guidance field — the Missura-faithful ablation. Velocities estimated from lidar. Needs `--predict-horizon`. |
+| `dwa_predictive_paper_oracle` | predictive DWA (experimental) | Braking-only ablation with **perfect** velocities. Needs `--predict-horizon`. |
 
 The `_replan` families (`a_star_replan`, `dijkstra_replan`, `rrt_replan`,
 `rrt_star_replan`) require `--replan-k`; every other key rejects it. The
@@ -160,10 +164,17 @@ predictive keys require `--predict-horizon` and reject `--replan-k`. The
 reactive (`dwa`, `apf`) and `_once` planners are expected to stall or crash in
 the traffic world — that is the experimental signal, not a bug.
 
-The predictive family is documented in
+The D* Lite predictive family is documented in
 `docs/plans/2026-06-27-predictive-d-star-lite.md` and its findings (the oracle
 confirms motion-awareness helps; the v1 lidar estimator does not yet) in
-`docs/plans/2026-06-27-predictive-d-star-lite.findings.md`.
+`docs/plans/2026-06-27-predictive-d-star-lite.findings.md`. The predictive-DWA
+rebuild — the braking-inevitability collision model and the cost-to-go
+guidance field — is documented in
+`docs/plans/2026-07-10-predictive-dwa-braking.md`, with findings in
+`docs/plans/2026-07-10-predictive-dwa-braking.findings.md`: the braking policy
+beats plain `dwa` on a quick read, but the guidance field measured
+net-harmful, so the canonical `dwa_predictive` key currently trails plain
+`dwa` until the field is reworked.
 
 ---
 
@@ -451,14 +462,15 @@ calls `reset()` once, then `act()` until the Arena reports done.
 Register the class by self-registering into the `ALGORITHMS` registry: the
 controller module calls `register(name, cls)` from `planners/_grid.py` at import
 (see `a_star.py`), and importing the `planners` package populates the registry.
-The runner builds the instance via `build_controller`. Fifteen keys ship today
+The runner builds the instance via `build_controller`. Seventeen keys ship today
 — thirteen canonical (`a_star_once`, `a_star_replan`, `dijkstra_once`,
 `dijkstra_replan`, `d_star_lite`, `d_star_lite_predictive`, `dwa`, `dwa_predictive`,
-`apf`, `rrt_once`, `rrt_replan`, `rrt_star_once`, `rrt_star_replan`) and two
-experimental, motion-aware keys (`d_star_lite_oracle`, `dwa_predictive_oracle`) held out of the canonical
+`apf`, `rrt_once`, `rrt_replan`, `rrt_star_once`, `rrt_star_replan`) and four
+experimental, motion-aware keys (`d_star_lite_oracle`, `dwa_predictive_oracle`,
+`dwa_predictive_paper`, `dwa_predictive_paper_oracle`) held out of the canonical
 scatter via `EXPERIMENTAL_KEYS`. The `_replan` families take a required
 `--replan-k`; the predictive family takes a required `--predict-horizon` (the
-canonical `d_star_lite_predictive` runs at h10).
+canonical `d_star_lite_predictive` and `dwa_predictive` both run at h10).
 
 ---
 

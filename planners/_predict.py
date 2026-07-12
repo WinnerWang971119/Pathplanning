@@ -17,6 +17,7 @@ symbols inside functions.
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
@@ -70,6 +71,24 @@ MAX_ASSOCIATION_DISTANCE: float = 1.0
 # distinct ids and a stationary obstacle keeps a stable id across frames.
 # Assumes non-negative world bucket coordinates (the arena offset is (0, 0)).
 CLUSTER_ID_MULTIPLIER: int = 100000
+
+# --- Opt-in LidarTracker hardening tunables ---------------------------------
+# Both are OFF by default in LidarTracker.__init__ (smoothing_frames=0,
+# max_track_speed=inf), so a tracker built without them is byte-identical to the
+# pre-hardening estimator. They are used only by the DWA lidar-predict keys; the
+# other shared consumer (d_star_lite_predictive) does NOT pass them and stays
+# byte-unchanged.
+
+# Reported-velocity magnitude cap (m/s) for the clamp. Deliberately 2.0, the
+# ``fast`` obstacle-speed regime's max cap (0.5..2.0 * robot top speed), NOT 1.5:
+# a 1.5 cap would truncate the genuine fast-regime crossers the issue-#11 speed
+# sweep spawns, hiding real motion behind an artificial ceiling.
+MAX_TRACK_SPEED: float = 2.0
+
+# Window length (frames) for the velocity-smoothing mean: the reported velocity
+# is the mean over the last <= this many associated instantaneous velocities
+# (including the current frame).
+VELOCITY_SMOOTHING_FRAMES: int = 3
 
 # The near-rim no-hit deadband (RANGE_MAX_DEADBAND) the LidarTracker applies when
 # projecting beams now lives with the shared projection in planners._geometry.
@@ -200,7 +219,14 @@ class LidarTracker:
     band), clusters the surviving dynamic returns by grid bucket, associates
     each cluster to the nearest cluster from the PRIOR frame, and estimates the
     velocity as ``(centroid_now - centroid_prev) / dt``.  The prior-frame
-    centroids are the only mutable state.
+    centroids are the only cross-frame state on the default path; enabling
+    ``smoothing_frames`` adds a parallel per-cluster velocity-history state that
+    rides the same positional association chain (see ``__init__``).
+
+    The two ``__init__`` hardening knobs (``smoothing_frames``, ``max_track_speed``)
+    are KEYWORD-ONLY and default to OFF, so a tracker built without them (as
+    ``d_star_lite_predictive`` does) is byte-identical to the pre-hardening
+    estimator; they are opt-in for the DWA lidar-predict keys only.
 
     Determinism is the whole contract (the plan's "landmine"): the pipeline never
     iterates a ``set`` to build output or to order points, draws no RNG, and
@@ -218,6 +244,9 @@ class LidarTracker:
         grid: OccupancyGrid,
         bearings: np.ndarray,
         range_max: float = float("inf"),
+        *,
+        smoothing_frames: int = 0,
+        max_track_speed: float = float("inf"),
     ) -> None:
         """Store the static grid, the per-beam bearings, and the no-hit range.
 
@@ -236,6 +265,24 @@ class LidarTracker:
             ``np.linspace(angle_min, angle_max, number)`` (the exact recovery the
             rest of the harness uses — NOT ``i * angle_increment``).  No YAML is
             loaded and no bearings are recomputed here.
+        smoothing_frames:
+            OPT-IN velocity smoothing (KEYWORD-ONLY, default ``0`` = OFF). When
+            ``> 0`` the reported ``vx/vy`` is the windowed mean over the last
+            ``<= smoothing_frames`` associated instantaneous velocities (including
+            the current frame's), where the velocity history rides the existing
+            positional association chain: a current cluster that associates to
+            prior cluster P inherits P's velocity history, appends the current raw
+            instantaneous velocity, and truncates to the last ``smoothing_frames``
+            entries. A cluster with no prior association starts a fresh history.
+            At the default ``0`` the reported velocity is exactly the raw
+            instantaneous estimate — bit-for-bit unchanged from the pre-hardening
+            tracker — and NO history state is maintained.
+        max_track_speed:
+            OPT-IN reported-speed clamp (KEYWORD-ONLY, default ``inf`` = OFF).
+            When finite, the magnitude of the REPORTED velocity (after any
+            smoothing) is clamped to this value; the RAW instantaneous velocity
+            stored in the smoothing history is never clamped. At the default
+            ``inf`` no clamp is applied.
         """
         if grid is None:
             raise ValueError("LidarTracker requires a non-None OccupancyGrid.")
@@ -247,13 +294,30 @@ class LidarTracker:
                 f"{bearings_array.shape}."
             )
 
+        if smoothing_frames < 0:
+            raise ValueError(
+                f"smoothing_frames must be non-negative, received {smoothing_frames!r}."
+            )
+        if not max_track_speed > 0.0:
+            raise ValueError(
+                f"max_track_speed must be positive, received {max_track_speed!r}."
+            )
+
         self._grid = grid
         self._bearings = bearings_array
         self._range_max = float(range_max)
+        self._smoothing_frames = int(smoothing_frames)
+        self._max_track_speed = float(max_track_speed)
         # Prior-frame cluster centroids, stored in the current frame's
         # rep-cell-sorted order.  Empty until the first update(), so the first
         # update yields zero velocities.
         self._prev_centroids: list[tuple[float, float]] = []
+        # Prior-frame per-cluster velocity histories, aligned index-for-index
+        # with ``_prev_centroids`` (same current-sorted order). Each entry is a
+        # deque of RAW instantaneous velocities, maxlen ``smoothing_frames``.
+        # Populated ONLY when smoothing is enabled; on the default path it stays
+        # empty and untouched so the raw-velocity output is bit-for-bit unchanged.
+        self._prev_velocity_histories: list[deque[tuple[float, float]]] = []
 
     def update(
         self,
@@ -454,10 +518,35 @@ class LidarTracker:
         lowest prior index).  A cluster with no prior in range gets zero velocity
         (a freshly-appeared obstacle).  The current centroids replace the prior
         state for the next tick.  Tracks are returned sorted by ``id``.
+
+        When opt-in smoothing is enabled (``smoothing_frames > 0``) the reported
+        velocity is the windowed mean of the associated instantaneous-velocity
+        history, which RIDES the same positional ``best_index`` association chain:
+        a current cluster inherits its associated prior cluster's history (or
+        starts a fresh one), appends this frame's RAW instantaneous velocity, and
+        truncates to ``smoothing_frames`` entries. The per-cluster histories are
+        stored in the SAME current-sorted order as ``_prev_centroids`` so the
+        index-based inheritance stays consistent next tick. When the opt-in speed
+        clamp is enabled (``max_track_speed < inf``) the magnitude of the REPORTED
+        velocity (after smoothing) is scaled down to the cap; the raw velocity
+        stored in the history is never clamped.
+
+        With BOTH defaults (``smoothing_frames == 0``, ``max_track_speed == inf``)
+        the reported velocity is exactly the raw instantaneous estimate and no
+        history state is maintained — bit-for-bit identical to the pre-hardening
+        tracker.
         """
         ordered = sorted(clusters, key=lambda cluster: cluster.rep_cell)
         prior = self._prev_centroids
         used = [False] * len(prior)
+
+        smoothing_on = self._smoothing_frames > 0
+        clamp_on = self._max_track_speed < float("inf")
+        prior_histories = self._prev_velocity_histories
+        # This frame's per-cluster histories, built in the same ``ordered`` order
+        # as the tracks, so they align index-for-index with the centroids stored
+        # below. Only populated when smoothing is on.
+        new_histories: list[deque[tuple[float, float]]] = []
 
         tracks: list[Track] = []
         for cluster in ordered:
@@ -481,11 +570,51 @@ class LidarTracker:
             if best_index >= 0:
                 used[best_index] = True
                 prior_x, prior_y = prior[best_index]
-                velocity_x = (cluster.centroid_x - prior_x) / dt
-                velocity_y = (cluster.centroid_y - prior_y) / dt
+                raw_velocity_x = (cluster.centroid_x - prior_x) / dt
+                raw_velocity_y = (cluster.centroid_y - prior_y) / dt
             else:
-                velocity_x = 0.0
-                velocity_y = 0.0
+                raw_velocity_x = 0.0
+                raw_velocity_y = 0.0
+
+            if smoothing_on:
+                # The history rides the positional association chain: inherit the
+                # associated prior cluster's deque (a COPY, so mutating this
+                # frame's history never touches the stored prior one), else start
+                # fresh. Append the RAW instantaneous velocity; the bounded deque
+                # truncates to the last ``smoothing_frames`` entries.
+                if best_index >= 0 and best_index < len(prior_histories):
+                    history: deque[tuple[float, float]] = deque(
+                        prior_histories[best_index], maxlen=self._smoothing_frames
+                    )
+                else:
+                    history = deque(maxlen=self._smoothing_frames)
+                history.append((raw_velocity_x, raw_velocity_y))
+                new_histories.append(history)
+
+                # Windowed mean over the fixed-order deque (deterministic). Manual
+                # averaging over the sequence avoids any np.mean ordering subtlety.
+                count = len(history)
+                sum_x = 0.0
+                sum_y = 0.0
+                for hist_vx, hist_vy in history:
+                    sum_x += hist_vx
+                    sum_y += hist_vy
+                velocity_x = sum_x / count
+                velocity_y = sum_y / count
+            else:
+                # Default path: reported velocity is the raw instantaneous
+                # estimate, bit-for-bit unchanged.
+                velocity_x = raw_velocity_x
+                velocity_y = raw_velocity_y
+
+            if clamp_on:
+                # Clamp the REPORTED velocity magnitude only (never the stored
+                # raw history). Scale (vx, vy) by cap/speed when over the cap.
+                speed = math.sqrt(velocity_x * velocity_x + velocity_y * velocity_y)
+                if speed > self._max_track_speed:
+                    scale = self._max_track_speed / speed
+                    velocity_x *= scale
+                    velocity_y *= scale
 
             tracks.append(
                 Track(
@@ -507,6 +636,10 @@ class LidarTracker:
         self._prev_centroids = [
             (cluster.centroid_x, cluster.centroid_y) for cluster in ordered
         ]
+        # Store this frame's histories in the SAME order, so next tick's
+        # index-based inheritance stays aligned with ``_prev_centroids``. Left
+        # empty (and never read) on the default path.
+        self._prev_velocity_histories = new_histories
 
         tracks.sort(key=lambda track: track.id)
         return tracks

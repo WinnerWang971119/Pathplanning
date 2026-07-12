@@ -19,11 +19,27 @@ dynamic window, the sampling loop, the rollout, or the fallback:
 1. **Present-position safety FLOOR** — vanilla DWA's clearance check against the
    full live lidar cloud (walls AND movers at their *current* positions),
    hard-rejecting any candidate whose rollout grazes a currently-visible body. This
-   keeps the controller safe even when the tracker misses an obstacle.
-2. **Space-time predictive LAYER** — :func:`planners._predict.trajectory_conflict`
-   over the horizon: hard-reject candidates that collide with a track in matched
-   time, and add a predicted-clearance term to the score so the robot yields early
-   and smoothly rather than only at the last feasible instant.
+   keeps the controller safe even when the tracker misses an obstacle. The floor is
+   UNCHANGED: no live return is ever subtracted for a tracked mover, so an obstacle
+   with no track is still caught at its current position.
+2. **Space-time predictive LAYER** (braking-inevitability + soft yield) — this is
+   NOT a blanket space-time hard reject (that freezes the robot: any matched-time
+   conflict anywhere on the rollout kills every forward candidate). Instead, per
+   candidate, over the horizon via :func:`planners._predict.trajectory_conflict`:
+   - **Imminent backstop** — a conflict at the very next step (``ttc_step == 1``)
+     is rejected outright (too close to react).
+   - **Braking-inevitability (ICS) test** — simulate an emergency-braking
+     trajectory (decelerate to a stop at ``BRAKE_DECEL`` then hold, via
+     :meth:`_braking_trajectory`) and reject the candidate ONLY when even that
+     braking-and-holding path still collides in matched time. A conflict the robot
+     could brake out of is admitted (it is not an inevitable collision state), so
+     the layer cannot freeze the robot the way a blanket reject does.
+   - **Soft yield term** — a SYMMETRICALLY-clipped, un-floored predicted-clearance
+     score term (``PREDICTED_GAP_WEIGHT * clip(min_gap, -cap, cap)/cap``) added to
+     the base score. Being monotone in the matched-time gap and penalizing negative
+     gaps, it makes a slower collision-free candidate outscore a faster grazing one
+     — the mechanism that makes the robot yield early rather than only at the last
+     feasible instant.
 
 Velocity source behind the shared ``Tracker`` seam (mirrors D* Lite):
 - ``DWAPredictiveController`` (key ``"dwa_predictive"``): ``LidarTracker``
@@ -55,12 +71,18 @@ import numpy as np
 
 from manual_astar import (
     GRID_RESOLUTION,
+    MAX_LINEAR_SPEED,
     SAFETY_MARGIN,
     build_occupancy_grid,
     load_world,
+    world_to_grid,
+    wrap_to_pi,
 )
+from planners._costfield import build_cost_to_go_field
 from planners._predict import (
+    MAX_TRACK_SPEED,
     PREDICT_DT,
+    VELOCITY_SMOOTHING_FRAMES,
     LidarTracker,
     OracleTracker,
     Tracker,
@@ -69,17 +91,39 @@ from planners._predict import (
 from planners.dwa import (
     CLEARANCE_CAP,
     COLLISION_MARGIN,
+    CONTROL_DT,
+    GOAL_REACHED_RADIUS,
+    MAX_LINEAR_ACCEL,
     ROLLOUT_STEPS,
     DWAController,
 )
 
-# Weight on the space-time predicted-clearance term added to DWA's weighted-sum
-# score. Same scale as the present-position CLEARANCE_WEIGHT (0.3): it rewards
-# candidates that keep more matched-time margin from moving obstacles, so the robot
-# starts easing away from a predicted conflict before a hard space-time rejection
-# is forced. Tunable; a small default that biases toward foresight without
-# overwhelming the goal-heading term.
-PREDICTED_CLEARANCE_WEIGHT = 0.4
+# Braking-simulation deceleration (m/s^2) used by the inevitable-collision-state
+# test. The braking rollout decelerates the candidate's linear speed at this rate
+# to a stop, then holds — so it uses the dynamic window's OWN physics (the same
+# acceleration bound that shapes the reachable window each tick), rather than an
+# arbitrary braking constant.
+BRAKE_DECEL = MAX_LINEAR_ACCEL
+
+# Weight on the space-time predicted-clearance ("min_gap") soft-score term added
+# to DWA's weighted-sum score. The term is the SYMMETRICALLY-clipped, normalized
+# matched-time body gap: clip(min_gap, -CLEARANCE_CAP, CLEARANCE_CAP)/CLEARANCE_CAP
+# in [-1, 1]. Being un-floored (negative gaps penalize) makes a slower
+# collision-free candidate outscore a faster grazing/colliding one — the mechanism
+# that makes the robot yield rather than race a crosser. Small so foresight biases
+# the argmax without overwhelming the goal-heading term.
+PREDICTED_GAP_WEIGHT = 0.3
+
+# Normalizer for the global-guidance heading term's geodesic-progress score, in
+# CELL units to match the cost-to-go field (which stores octile distances in cell
+# units). It is the field-progress a full-speed straight rollout achieves over one
+# rollout window: MAX_LINEAR_SPEED * ROLLOUT_STEPS * CONTROL_DT metres, converted to
+# cells by dividing by GRID_RESOLUTION. Progress at or beyond this saturates the
+# term; the ratio is symmetrically clipped so a retreat of the same magnitude
+# saturates the low end (= 0.0). Evaluates to ~12.0 for the current constants (the
+# expression, kept verbatim so it tracks the constants, carries the usual 0.1
+# float error and lands at 12.000000000000002 rather than an exact 12.0).
+MAX_PROGRESS_CELLS = MAX_LINEAR_SPEED * ROLLOUT_STEPS * CONTROL_DT / GRID_RESOLUTION
 
 
 class PredictiveDWAController(DWAController):
@@ -97,6 +141,13 @@ class PredictiveDWAController(DWAController):
     # Opt-in live-truth flag; the oracle sets True so the runner feeds it the
     # dynamic-obstacle snapshot via observe_truth().
     wants_truth = False
+    # Opt-in cost-to-go global guidance. When True, reset() builds a static
+    # Dijkstra-from-goal field and the overridden _heading_term scores candidates by
+    # geodesic progress toward the goal (immune to the Euclidean-heading local minima
+    # a wall segment induces) instead of straight-line heading. The paper-only
+    # ablation classes leave this False (base Euclidean heading); the two global
+    # concrete classes flip it True. Default off so the base stays paper-behaviour.
+    use_global_guidance = False
 
     def _make_tracker(self) -> Tracker:
         """Return the velocity-source adapter (subclass responsibility)."""
@@ -128,9 +179,16 @@ class PredictiveDWAController(DWAController):
         # static grid + beam geometry; the OracleTracker is stateless.
         self._tracker: Tracker | None = None
         self._snapshot: tuple = ()
-        # Static inflated occupancy grid (built in reset(); consumed only by the
-        # LidarTracker's static-return subtraction, unused by the oracle).
+        # Static inflated occupancy grid (built in reset(); consumed by the
+        # LidarTracker's static-return subtraction — unused by the oracle — and, when
+        # global guidance is on, by the cost-to-go field build and per-candidate
+        # world_to_grid lookups).
         self._grid = None
+        # Static cost-to-go field (goal-distances in CELL units), or None when global
+        # guidance is off OR the start cell is walled off from the goal (the
+        # start-unreachable fallback: guidance disabled for the episode, base
+        # Euclidean heading used, planner_error stays null). Built in reset().
+        self._field: np.ndarray | None = None
         # Current-tick tracks, refreshed once per act() and read per candidate.
         self._tracks: list = []
 
@@ -166,6 +224,22 @@ class PredictiveDWAController(DWAController):
         self._tracks = []
         self.last_predicted_cells = []
         self.last_tracks = []
+
+        # Global guidance: build the static cost-to-go field once. Clear any
+        # prior-episode field first, so a reused instance whose second episode has
+        # guidance disabled (or a walled-off start) does not carry episode 1's field.
+        self._field = None
+        if self.use_global_guidance:
+            assert self._grid is not None and self._goal_xy is not None
+            goal_cell = world_to_grid(self._goal_xy, self._grid)
+            field = build_cost_to_go_field(self._grid, goal_cell)
+            start_cell = world_to_grid(np.asarray(state0, dtype=float)[:2], self._grid)
+            # Start-unreachable fallback: if the goal is walled off from the start
+            # the field is inf at the start cell — leave self._field None so
+            # _heading_term falls back to the base Euclidean heading for the whole
+            # episode. DWA never fails to plan, so planner_error stays null.
+            if not np.isinf(field[start_cell]):
+                self._field = field
 
     def observe_truth(self, snapshot: tuple) -> None:
         """Store the live dynamic-obstacle snapshot for the upcoming act() tick.
@@ -215,49 +289,180 @@ class PredictiveDWAController(DWAController):
         state: np.ndarray,
         trajectory: np.ndarray,
         v: float,
+        w: float,
         obstacle_points: np.ndarray,
     ) -> float | None:
-        """Two-layer per-candidate evaluation: present floor + space-time layer.
+        """Present floor + braking-inevitability space-time layer for one candidate.
 
         1. Present-position FLOOR + base score on the first ``ROLLOUT_STEPS`` (a
            forward prefix of the possibly-longer rollout) — identical to vanilla
-           DWA, so with no tracks this returns exactly the base score.
-        2. Space-time LAYER over the first ``horizon_steps``: hard-reject a
-           matched-time collision with any track; otherwise add a capped
-           predicted-clearance bonus so a candidate that keeps more space-time
-           margin from movers scores higher.
-        """
-        del state  # the trajectory already encodes the robot's future poses
+           DWA, so with no tracks this returns exactly the base score. The cloud
+           (``obstacle_points``) is the FULL live lidar projection: no mover return
+           is subtracted, so a tracker miss is still rejected here (AC6).
+        2. Space-time LAYER over the horizon: reject an imminent conflict
+           (``ttc_step == 1``); reject an INEVITABLE conflict (even the
+           braking-and-holding trajectory still collides in matched time); and add
+           the symmetric, un-floored predicted-clearance soft term so a slower
+           collision-free candidate outscores a faster grazing one (yielding).
 
+        The whole space-time block is wrapped so an unexpected raise degrades this
+        candidate to base scoring rather than propagating out of ``act()`` (AC11).
+        A deliberate ``return None`` reject inside the block is normal control flow,
+        not caught by the guard — it returns from the method directly.
+        """
         # Base heading/clearance/speed on the first ROLLOUT_STEPS (byte-identical
         # to plain DWA — the extra rollout steps feed only the space-time check).
+        # ``state`` is used below (the base ``_score`` ignores it, but the braking
+        # rollout needs the start pose), so it is NOT deleted here.
         base_trajectory = trajectory[:ROLLOUT_STEPS]
         clearance = self._trajectory_clearance(base_trajectory, obstacle_points)
         if clearance is None:
             return None
-        base_score = self._score(base_trajectory, v, clearance)
+        base_score = self._score(state, base_trajectory, v, clearance)
 
         # No tracks -> no space-time layer; behaves as plain DWA (also the h0 path).
         if not self._tracks:
             return base_score
 
         assert self._robot_radius is not None  # narrowed by super().act()'s guard
-        conflict = trajectory_conflict(
-            trajectory,
-            self._tracks,
-            float(self._robot_radius),
-            self._horizon_steps,
-            PREDICT_DT,
-            COLLISION_MARGIN,
-        )
-        if conflict.collides:
-            # The robot body would meet a moving obstacle at a matched time: reject.
-            return None
+        robot_radius = float(self._robot_radius)
 
-        # Predicted-clearance bonus: reward matched-time margin from movers, capped
-        # like the present-position clearance term and normalized to [0, 1].
-        predicted_clearance = min(max(conflict.min_gap, 0.0), CLEARANCE_CAP)
-        return base_score + PREDICTED_CLEARANCE_WEIGHT * (predicted_clearance / CLEARANCE_CAP)
+        try:
+            # Predicted matched-time conflict on the constant-(v, w) rollout. Pass
+            # the FULL (possibly longer) trajectory; trajectory_conflict clamps
+            # internally to min(horizon_steps, len).
+            conflict = trajectory_conflict(
+                trajectory,
+                self._tracks,
+                robot_radius,
+                self._horizon_steps,
+                PREDICT_DT,
+                COLLISION_MARGIN,
+            )
+
+            # Imminent backstop: a conflict at the very next step is too close to
+            # react to; reject outright.
+            if conflict.ttc_step == 1:
+                return None
+
+            # Braking-inevitability (ICS) test: if even an emergency-braking-and-
+            # holding trajectory still collides at a matched time, the collision is
+            # inevitable — reject. A conflict the robot could brake out of is
+            # admitted (the soft term below biases the argmax toward yielding).
+            braking = self._braking_trajectory(state, v, w)
+            braking_conflict = trajectory_conflict(
+                braking,
+                self._tracks,
+                robot_radius,
+                self._horizon_steps,
+                PREDICT_DT,
+                COLLISION_MARGIN,
+            )
+            if braking_conflict.collides:
+                return None
+
+            # Soft yield term: symmetric-clipped, un-floored matched-time gap in
+            # [-1, 1]. Negative gaps penalize, so a slower collision-free candidate
+            # outscores a faster grazing/colliding one.
+            gap = float(np.clip(conflict.min_gap, -CLEARANCE_CAP, CLEARANCE_CAP))
+            soft = PREDICTED_GAP_WEIGHT * (gap / CLEARANCE_CAP)
+            return base_score + soft
+        except Exception:
+            # AC11: an unexpected raise in the space-time layer degrades this
+            # candidate to base scoring; act() never raises mid-episode.
+            return base_score
+
+    def _heading_term(self, state: np.ndarray, trajectory: np.ndarray) -> float:
+        """Geodesic-progress heading score when global guidance is active.
+
+        When no cost-to-go field is available (guidance off, or the
+        start-unreachable fallback disabled it for the episode) this delegates to
+        the base Euclidean goal-heading term unchanged, so a paper-only variant and
+        the global-with-walled-off-start case behave exactly as plain DWA's heading.
+
+        With a field, the score is a NON-SATURATED, strictly-monotone function of
+        the geodesic progress the rollout makes toward the goal (the field-value
+        DROP from the start cell to the rollout's final cell, in CELL units):
+
+            0.5 + 0.5 * clip(progress / MAX_PROGRESS_CELLS, -1.0, 1.0)
+
+        so retreat (< 0.5) < no progress (0.5) < progress (> 0.5), and the interior
+        is never exactly 0 or 1. This cures the local-minima pathology a Euclidean
+        heading hits behind a wall segment (the straight-line bearing points into
+        the wall; the geodesic field points around it).
+
+        Guards, in order:
+        - Goal-reached: within GOAL_REACHED_RADIUS of the goal the heading is
+          ill-defined, so return 1.0 (same convention as the base term).
+        - Start cell unreachable: defensive — the reset guard should have disabled
+          guidance (self._field would be None), but if a start read still lands on
+          an inf cell, fall back to the base heading rather than divide meaning into
+          an inf progress.
+        - Rollout ends in a wall (end cell inf): disfavour with 0.0.
+
+        world_to_grid clips to the grid bounds, so both cell reads are always
+        in-bounds and this method never raises (AC11).
+        """
+        assert self._goal_xy is not None  # narrowed by act()'s guard
+
+        # Paper-only variants and the walled-off-start fallback use the base
+        # Euclidean heading (self._field is None in both cases).
+        if self._field is None:
+            return super()._heading_term(state, trajectory)
+
+        assert self._grid is not None  # a field implies a grid was built in reset()
+
+        goal_distance = float(np.linalg.norm(self._goal_xy - trajectory[-1]))
+        if goal_distance < GOAL_REACHED_RADIUS:
+            return 1.0
+
+        start_cell = world_to_grid(state[:2], self._grid)
+        end_cell = world_to_grid(trajectory[-1], self._grid)
+
+        if np.isinf(self._field[start_cell]):
+            # Defensive: should not happen after the reset start-unreachable guard.
+            return super()._heading_term(state, trajectory)
+        if np.isinf(self._field[end_cell]):
+            # The rollout ends inside a wall's inflation band — disfavour it.
+            return 0.0
+
+        # Positive = the rollout's final cell is closer to the goal than the start.
+        progress = self._field[start_cell] - self._field[end_cell]
+        return 0.5 + 0.5 * float(np.clip(progress / MAX_PROGRESS_CELLS, -1.0, 1.0))
+
+    def _braking_trajectory(
+        self, state: np.ndarray, v: float, w: float
+    ) -> np.ndarray:
+        """Forward-simulate an emergency-braking-then-hold rollout for the ICS test.
+
+        Mirrors :meth:`DWAController._rollout` exactly (same heading-first unicycle
+        update at CONTROL_DT), but the linear speed decelerates at ``BRAKE_DECEL``:
+        at sub-step ``k`` (1-based) the speed is
+        ``v_k = max(0, v - BRAKE_DECEL * k * CONTROL_DT)``. Once ``v_k`` hits 0 the
+        position increment is 0, so the robot HOLDS its stopped pose for the
+        remaining steps — a robot stopped in a crosser's lane is still an inevitable
+        collision state, so the space-time check must see the full braking+held
+        path. The angular velocity ``w`` is applied unchanged (heading keeps
+        turning), matching the base rollout's constant-``w`` assumption.
+
+        RNG-free and fixed step count (``self._rollout_steps``), so the extra
+        rollout is deterministic. Returns a ``(self._rollout_steps, 2)`` float64
+        array of predicted xy positions (excluding the start pose).
+        """
+        x = float(state[0])
+        y = float(state[1])
+        theta = float(state[2])
+
+        positions = np.empty((self._rollout_steps, 2), dtype=float)
+        for step_index in range(self._rollout_steps):
+            theta = wrap_to_pi(theta + w * CONTROL_DT)
+            v_k = max(0.0, v - BRAKE_DECEL * (step_index + 1) * CONTROL_DT)
+            x += v_k * np.cos(theta) * CONTROL_DT
+            y += v_k * np.sin(theta) * CONTROL_DT
+            positions[step_index, 0] = x
+            positions[step_index, 1] = y
+
+        return positions
 
 
 class DWAPredictiveController(PredictiveDWAController):
@@ -269,13 +474,24 @@ class DWAPredictiveController(PredictiveDWAController):
 
     name = "dwa_predictive"
     wants_truth = False
+    use_global_guidance = True
 
     def _make_tracker(self) -> Tracker:
         # Lazy: reset() has populated self._grid / self._bearings / self._geom by
         # the time this first fires (first non-h0 act()). The bearings are the exact
         # linspace recovery the rest of the harness uses (NOT i*angle_increment).
+        # Hardening (velocity smoothing + speed clamp) is opt-in on the LidarTracker
+        # and defaults OFF, so it must be requested explicitly here; it is used only
+        # by the DWA lidar keys, leaving d_star_lite_predictive's tracker construction
+        # (and TC63/TC64) byte-unchanged.
         assert self._grid is not None and self._bearings is not None and self._geom is not None
-        return LidarTracker(self._grid, self._bearings, range_max=self._geom.range_max)
+        return LidarTracker(
+            self._grid,
+            self._bearings,
+            range_max=self._geom.range_max,
+            smoothing_frames=VELOCITY_SMOOTHING_FRAMES,
+            max_track_speed=MAX_TRACK_SPEED,
+        )
 
 
 class DWAPredictiveOracleController(PredictiveDWAController):
@@ -288,9 +504,42 @@ class DWAPredictiveOracleController(PredictiveDWAController):
 
     name = "dwa_predictive_oracle"
     wants_truth = True
+    use_global_guidance = True
 
     def _make_tracker(self) -> Tracker:
         return OracleTracker()
+
+
+class DWAPredictivePaperController(DWAPredictiveController):
+    """Paper-only ablation: braking-inevitability layer WITHOUT global guidance.
+
+    Isolates the Missura & Bennewitz braking/soft-yield layer from the
+    cost-to-go guidance field by flipping ``use_global_guidance`` back off; the
+    base heading term is the plain Euclidean goal-heading DWA already uses.
+    Inherits the hardened ``LidarTracker`` construction from
+    :class:`DWAPredictiveController` unchanged (only ``name`` and
+    ``use_global_guidance`` differ). EXPERIMENTAL — an ablation cell reached only
+    through the runner, not the canonical main-scatter dot (that remains plain
+    ``dwa_predictive``, the paper+global lidar variant).
+    """
+
+    name = "dwa_predictive_paper"
+    use_global_guidance = False
+
+
+class DWAPredictivePaperOracleController(DWAPredictiveOracleController):
+    """Paper-only ablation of the oracle: braking-inevitability WITHOUT global guidance.
+
+    Same relationship to :class:`DWAPredictiveOracleController` as
+    :class:`DWAPredictivePaperController` has to :class:`DWAPredictiveController`:
+    only ``name`` and ``use_global_guidance`` change, so the oracle's
+    ``_make_tracker`` (perfect live velocities via the truth seam) is inherited
+    unchanged. EXPERIMENTAL — isolates the braking layer from the guidance field
+    on the oracle ceiling; not on the canonical main scatter.
+    """
+
+    name = "dwa_predictive_paper_oracle"
+    use_global_guidance = False
 
 
 # Self-register at import (mirrors dwa.py / d_star_lite_predictive.py). Imported
@@ -299,3 +548,5 @@ from planners._grid import register  # noqa: E402
 
 register("dwa_predictive", DWAPredictiveController)
 register("dwa_predictive_oracle", DWAPredictiveOracleController)
+register("dwa_predictive_paper", DWAPredictivePaperController)
+register("dwa_predictive_paper_oracle", DWAPredictivePaperOracleController)

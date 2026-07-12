@@ -201,7 +201,11 @@ class DWAController:
             for candidate_w in np.linspace(window.w_min, window.w_max, ANGULAR_SAMPLES):
                 trajectory = self._rollout(state, float(candidate_v), float(candidate_w))
                 score = self._evaluate_candidate(
-                    state, trajectory, float(candidate_v), obstacle_points
+                    state,
+                    trajectory,
+                    float(candidate_v),
+                    float(candidate_w),
+                    obstacle_points,
                 )
                 if score is None:
                     # Candidate rejected (present-position clearance, or a
@@ -232,6 +236,7 @@ class DWAController:
         state: np.ndarray,
         trajectory: np.ndarray,
         v: float,
+        w: float,
         obstacle_points: np.ndarray,
     ) -> float | None:
         """Score one rollout candidate, or reject it (return ``None``).
@@ -243,14 +248,18 @@ class DWAController:
         add its space-time layer (advance each tracked obstacle to the matched
         time and reject/penalize a future collision) WITHOUT reimplementing
         ``act()``; this base body is byte-identical to the old inline block, so
-        plain ``dwa`` is unchanged. ``state`` is unused by the base but is passed
-        for the subclass (which needs the robot pose to project obstacle motion).
+        plain ``dwa`` is unchanged. ``state`` is threaded through to
+        :meth:`_score` (and on to :meth:`_heading_term`) for the subclass, which
+        needs the robot pose to project obstacle motion / substitute a heading
+        target; the base ignores it there. ``w`` (the candidate angular velocity)
+        is threaded through for the predictive subclass's braking-inevitability
+        simulation; the base ignores it entirely.
         """
-        del state
+        del w  # only the predictive subclass's braking rollout needs it
         clearance = self._trajectory_clearance(trajectory, obstacle_points)
         if clearance is None:
             return None
-        return self._score(trajectory, v, clearance)
+        return self._score(state, trajectory, v, clearance)
 
     def _dynamic_window(self) -> _Window:
         """The feasible ``(v, w)`` window around the last command for one step.
@@ -330,14 +339,35 @@ class DWAController:
         body_clearance = min_distance - self._robot_radius
         return min(body_clearance, CLEARANCE_CAP)
 
-    def _score(self, trajectory: np.ndarray, v: float, clearance: float) -> float:
+    def _score(
+        self, state: np.ndarray, trajectory: np.ndarray, v: float, clearance: float
+    ) -> float:
         """Weighted sum of heading-to-goal, normalized clearance, and speed.
 
-        - Heading: 1 when the rollout's final pose points straight at the goal,
-          0 when it points directly away (``(pi - |error|) / pi``). Suppressed
-          when the final pose is essentially on the goal (heading is then noise).
+        - Heading: delegated to :meth:`_heading_term` (``state`` used by the
+          global-guidance subclass override; the base ignores it).
         - Clearance: ``clearance / CLEARANCE_CAP`` in ``[0, 1]``.
         - Velocity: ``v / MAX_LINEAR_SPEED`` in ``[0, 1]``.
+        """
+        heading_term = self._heading_term(state, trajectory)
+        clearance_term = clearance / CLEARANCE_CAP
+        velocity_term = v / MAX_LINEAR_SPEED
+
+        return (
+            HEADING_WEIGHT * heading_term
+            + CLEARANCE_WEIGHT * clearance_term
+            + VELOCITY_WEIGHT * velocity_term
+        )
+
+    def _heading_term(self, state: np.ndarray, trajectory: np.ndarray) -> float:
+        """Heading-to-goal alignment of a rollout's final pose, in ``[0, 1]``.
+
+        1 when the rollout's final pose points straight at the goal, 0 when it
+        points directly away (``(pi - |error|) / pi``). Suppressed to 1.0 when
+        the final pose is essentially on the goal (heading is then noise). The
+        base ignores ``state`` (it needs only ``self._goal_xy`` and
+        ``trajectory``); this is an overridable seam so the global-guidance
+        subclass can substitute a different heading target.
         """
         assert self._goal_xy is not None  # narrowed by act()'s guard
 
@@ -364,14 +394,7 @@ class DWAController:
                 heading_error = abs(wrap_to_pi(goal_bearing - final_heading))
             heading_term = (np.pi - heading_error) / np.pi
 
-        clearance_term = clearance / CLEARANCE_CAP
-        velocity_term = v / MAX_LINEAR_SPEED
-
-        return (
-            HEADING_WEIGHT * heading_term
-            + CLEARANCE_WEIGHT * clearance_term
-            + VELOCITY_WEIGHT * velocity_term
-        )
+        return heading_term
 
     def _lidar_to_world_points(
         self, state: np.ndarray, lidar: np.ndarray
