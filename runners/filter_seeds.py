@@ -591,8 +591,9 @@ def _parse_args(argv: list[str] | None) -> FilterArgs:
         default="all13",
         help="Required planner set: all13 (default; the canonical planners plus the "
         "experimental d_star_lite_oracle) or canonical (the canonical planners only). "
-        "'all13' is a legacy name; the roster grew when dwa_predictive was promoted to "
-        "canonical (dwa_predictive_oracle is not part of it).",
+        "'all13' is a legacy name; the roster grew when d_star_lite_predictive was "
+        "promoted to canonical (the experimental oracle/global-guidance keys are not "
+        "part of it).",
     )
     parser.add_argument(
         "--selfcheck",
@@ -1031,7 +1032,7 @@ def _tc_f10_canonical_only(tmp: Path) -> str:
     required = build_required_labels(10, 5, "canonical")
     assert len(required) == 13, f"expected 13 canonical labels, got {len(required)}"
     assert "d_star_lite_predictive_h10" in required, "the canonical predictive label must be required"
-    assert "dwa_predictive_h10" in required, "the canonical DWA predictive label must be required"
+    assert "dwa_predictive_paper_h10" in required, "the canonical DWA predictive label must be required"
     seed = 40
     _write_manifests_for_labels(world_dir, required, [seed])
     _write_seed_fixture(world_dir, seed, _default_outcomes(required, crash_step=1))

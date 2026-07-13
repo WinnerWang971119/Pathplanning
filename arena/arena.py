@@ -5114,8 +5114,8 @@ def tc69(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure in-process
 
     Importing planners + run_all does not raise (the import-time
     set(_CANONICAL_ORDER) == set(ALGORITHMS) - EXPERIMENTAL_KEYS assertion holds),
-    dwa_predictive is canonical, dwa_predictive_oracle is experimental (not
-    canonical), and both DWA predict keys are in PREDICT_FAMILIES.
+    dwa_predictive_paper (braking-only) is canonical, dwa_predictive (global) is
+    experimental (not canonical), and both DWA predict keys are in PREDICT_FAMILIES.
     """
     _ensure_repo_root_on_path()
     from planners import ALGORITHMS, EXPERIMENTAL_KEYS, PREDICT_FAMILIES  # type: ignore[import-not-found]
@@ -5128,10 +5128,10 @@ def tc69(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure in-process
     assert len(canonical_planner_set()) == 13, (
         f"TC69: canonical set must be 13, got {len(canonical_planner_set())}"
     )
-    assert "dwa_predictive" in canonical, "TC69: dwa_predictive must be canonical"
-    assert "dwa_predictive_oracle" in EXPERIMENTAL_KEYS, "TC69: dwa_predictive_oracle must be experimental"
-    assert "dwa_predictive_oracle" not in canonical, "TC69: the DWA oracle must not be canonical"
-    assert {"dwa_predictive", "dwa_predictive_oracle"} <= PREDICT_FAMILIES, (
+    assert "dwa_predictive_paper" in canonical, "TC69: dwa_predictive_paper must be canonical"
+    assert "dwa_predictive" in EXPERIMENTAL_KEYS, "TC69: dwa_predictive (global) must be experimental"
+    assert "dwa_predictive" not in canonical, "TC69: the global-guidance DWA key must not be canonical"
+    assert {"dwa_predictive_paper", "dwa_predictive"} <= PREDICT_FAMILIES, (
         "TC69: both DWA predict keys must be in PREDICT_FAMILIES"
     )
 
@@ -6185,7 +6185,7 @@ def tck(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure in-process,
 
     set(run_all._CANONICAL_ORDER) has 13 entries and equals
     set(ALGORITHMS) - EXPERIMENTAL_KEYS; EXPERIMENTAL_KEYS == {d_star_lite_oracle,
-    dwa_predictive_oracle, dwa_predictive_paper, dwa_predictive_paper_oracle}; all
+    dwa_predictive, dwa_predictive_oracle, dwa_predictive_paper_oracle}; all
     four dwa_predictive* keys are in PREDICT_FAMILIES; importing runners.run_all
     does not raise (the import-time assertion already ran by the time this
     function body executes, so a prior raise would have failed collection, not
@@ -6205,8 +6205,8 @@ def tck(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure in-process,
     )
     assert set(EXPERIMENTAL_KEYS) == {
         "d_star_lite_oracle",
+        "dwa_predictive",
         "dwa_predictive_oracle",
-        "dwa_predictive_paper",
         "dwa_predictive_paper_oracle",
     }, (
         f"TCk: EXPERIMENTAL_KEYS must be exactly the 4 documented cheats/ablations, "
@@ -6222,8 +6222,9 @@ def tck(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure in-process,
         f"TCk: all four dwa_predictive* keys must be in PREDICT_FAMILIES; missing "
         f"{four_dwa_keys - set(PREDICT_FAMILIES)}"
     )
-    assert "dwa_predictive" in canonical and "dwa_predictive_paper" not in canonical, (
-        "TCk: dwa_predictive must be canonical and dwa_predictive_paper must not"
+    assert "dwa_predictive_paper" in canonical and "dwa_predictive" not in canonical, (
+        "TCk: dwa_predictive_paper (braking-only) must be canonical and "
+        "dwa_predictive (global) must not"
     )
 
 

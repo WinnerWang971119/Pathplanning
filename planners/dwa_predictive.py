@@ -43,8 +43,10 @@ dynamic window, the sampling loop, the rollout, or the fallback:
 
 Velocity source behind the shared ``Tracker`` seam (mirrors D* Lite):
 - ``DWAPredictiveController`` (key ``"dwa_predictive"``): ``LidarTracker``
-  frame-differencing estimator, ``wants_truth=False`` — the Mission-faithful,
-  CANONICAL variant.
+  frame-differencing estimator, ``wants_truth=False``, with the cost-to-go global
+  guidance field ON. The global field measured net-harmful (see the braking
+  findings), so this key is EXPERIMENTAL; the canonical lidar DWA is its braking-only
+  sibling ``DWAPredictivePaperController`` (key ``"dwa_predictive_paper"``).
 - ``DWAPredictiveOracleController`` (key ``"dwa_predictive_oracle"``):
   ``OracleTracker`` perfect live velocities via the truth seam,
   ``wants_truth=True`` — the EXPERIMENTAL ceiling. Its ONLY difference from the
@@ -466,10 +468,13 @@ class PredictiveDWAController(DWAController):
 
 
 class DWAPredictiveController(PredictiveDWAController):
-    """Lidar-fed space-time DWA: estimated velocities (the Mission-faithful, canonical key).
+    """Lidar-fed space-time DWA WITH cost-to-go global guidance (EXPERIMENTAL).
 
     Velocities come from frame-differencing the live lidar (``LidarTracker``), not
-    the truth seam (``wants_truth=False``). Promoted to a canonical study planner.
+    the truth seam (``wants_truth=False``), and the cost-to-go guidance field is ON.
+    The global field measured net-harmful on the braking-rebuild quick read, so this
+    key is EXPERIMENTAL; the canonical lidar DWA is its braking-only sibling
+    :class:`DWAPredictivePaperController` (``"dwa_predictive_paper"``).
     """
 
     name = "dwa_predictive"
@@ -511,16 +516,16 @@ class DWAPredictiveOracleController(PredictiveDWAController):
 
 
 class DWAPredictivePaperController(DWAPredictiveController):
-    """Paper-only ablation: braking-inevitability layer WITHOUT global guidance.
+    """Braking-inevitability layer WITHOUT global guidance — the CANONICAL lidar DWA.
 
     Isolates the Missura & Bennewitz braking/soft-yield layer from the
     cost-to-go guidance field by flipping ``use_global_guidance`` back off; the
     base heading term is the plain Euclidean goal-heading DWA already uses.
     Inherits the hardened ``LidarTracker`` construction from
     :class:`DWAPredictiveController` unchanged (only ``name`` and
-    ``use_global_guidance`` differ). EXPERIMENTAL — an ablation cell reached only
-    through the runner, not the canonical main-scatter dot (that remains plain
-    ``dwa_predictive``, the paper+global lidar variant).
+    ``use_global_guidance`` differ). The braking-only policy is the DWA winner (the
+    global field measured net-harmful), so this key holds the canonical predictive-DWA
+    main-scatter dot; its paper+global sibling ``dwa_predictive`` is now experimental.
     """
 
     name = "dwa_predictive_paper"

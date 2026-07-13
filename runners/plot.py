@@ -105,16 +105,18 @@ STRAIGHT_LINE_IDEAL_M = 46.0 * (2.0 ** 0.5)   # ~= 65.05 m
 # (registry name, replan_k or None, predict_horizon or None, family, display).
 # load_world_results() folds the replan_k / predict_horizon into the dir label
 # (a_star_replan_k5 / d_star_lite_predictive_h10) so the label matches the dir
-# run_experiment wrote. These are exactly the 12 canonical Mission planners run_all
-# writes — the same set, and the same order, as run_all._CANONICAL_ORDER. The
-# canonical predictive key d_star_lite_predictive folds its canonical horizon (h10)
-# into the label. The one remaining experimental motion-aware key
-# (d_star_lite_oracle) is EXCLUDED here on purpose: it is held out of run_all's
-# canonical set (EXPERIMENTAL_KEYS), so its `_h<steps>` label dir is never written
-# by the documented run_all -> plot workflow. Charting it here would draw a
-# data-less line on every chart (the headline A1 scatter included). The oracle's
-# results live on the horizon-sweep charts (`runners.plot_horizon_sweep`), its
-# proper experimental venue.
+# run_experiment wrote. These are exactly the 13 canonical Mission planners run_all
+# writes — the same set, and the same order, as run_all._CANONICAL_ORDER. The two
+# canonical predictive keys — d_star_lite_predictive (grid-stamping) and
+# dwa_predictive_paper (the space-time braking-only policy) — fold their canonical
+# horizon (h10) into the label. The experimental motion-aware keys
+# (d_star_lite_oracle, dwa_predictive, dwa_predictive_oracle,
+# dwa_predictive_paper_oracle) are EXCLUDED here on purpose: they are held out of
+# run_all's canonical set (EXPERIMENTAL_KEYS), so their `_h<steps>` label dirs are
+# never written by the documented run_all -> plot workflow. Charting them here would
+# draw a data-less line on every chart (the headline A1 scatter included). The
+# oracle/global-guidance results live on the horizon-sweep charts
+# (`runners.plot_horizon_sweep`), their proper experimental venue.
 CANONICAL: list[tuple[str, int | None, int | None, str, str]] = [
     ("a_star_once",            None, None, "grid",        "A* once"),
     ("a_star_replan",          5,    None, "grid",        "A* replan (K=5)"),
@@ -123,7 +125,7 @@ CANONICAL: list[tuple[str, int | None, int | None, str, str]] = [
     ("d_star_lite",            None, None, "incremental", "D* Lite"),
     ("d_star_lite_predictive", None, 10,   "predictive",  "D* Lite predictive (h10)"),
     ("dwa",                    None, None, "reactive",    "DWA"),
-    ("dwa_predictive",         None, 10,   "predictive",  "DWA predictive (h10)"),
+    ("dwa_predictive_paper",   None, 10,   "predictive",  "DWA predictive (h10)"),
     ("apf",                    None, None, "reactive",    "APF"),
     ("rrt_once",               None, None, "sampling",    "RRT once"),
     ("rrt_replan",             5,    None, "sampling",    "RRT replan (K=5)"),
@@ -2586,7 +2588,7 @@ def _tc_p10_run_all_canonical(_tmp: Path) -> str:
     assert len(planners) == 13, f"canonical_planner_set must return 13 tuples, got {len(planners)}"
 
     replan_families = {"a_star_replan", "dijkstra_replan", "rrt_replan", "rrt_star_replan"}
-    predict_canonical = {"d_star_lite_predictive", "dwa_predictive"}
+    predict_canonical = {"d_star_lite_predictive", "dwa_predictive_paper"}
     seen_replan = set()
     seen_predictive = set()
     for algorithm, replan_k, predict_horizon, label in planners:

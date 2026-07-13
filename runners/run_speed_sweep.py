@@ -41,10 +41,11 @@ CLI:
 
 Planner sets:
     --algorithms focus (default) — the 5 non-replan planners in FOCUS_SET
-        (a_star_once, d_star_lite, dwa, dwa_predictive, apf): the static baseline,
+        (a_star_once, d_star_lite, dwa, dwa_predictive_paper, apf): the static baseline,
         the incremental planner the hypothesis is about, the two reactive planners
-        the issue calls out, and the space-time-predictive DWA. dwa_predictive is a
-        predict family (carries --predict-horizon); the rest are non-replan/non-predict.
+        the issue calls out, and the canonical space-time-predictive DWA (the
+        braking-only paper policy). dwa_predictive_paper is a predict family (carries
+        --predict-horizon); the rest are non-replan/non-predict.
     --algorithms all — the 11 canonical labels, reused verbatim from
         run_all.canonical_planner_set() (so a registry change cannot desync the
         sweep from the study); the replan families carry --replan-k 5.
@@ -95,18 +96,19 @@ SPEED_SUBDIR_PREFIX = "speed_"           # results-dir suffix per regime; the ch
 
 # The hypothesis set: the static baseline (a_star_once), the incremental planner
 # the D* Lite hypothesis is about, the two reactive planners whose degradation the
-# issue calls out (dwa, apf), and the space-time-predictive DWA (issue #11: does
-# true (x,y,t) prediction floor the crash rate as the obstacle-speed cap rises?).
-# All non-replan, so replan_k is None; dwa_predictive is a predict family, so it
-# carries the canonical PREDICT_HORIZON (the others carry None).
-FOCUS_SET: tuple[str, ...] = ("a_star_once", "d_star_lite", "dwa", "dwa_predictive", "apf")
+# issue calls out (dwa, apf), and the canonical space-time-predictive DWA
+# (dwa_predictive_paper, the braking-only policy) (issue #11: does true (x,y,t)
+# prediction floor the crash rate as the obstacle-speed cap rises?). All non-replan,
+# so replan_k is None; dwa_predictive_paper is a predict family, so it carries the
+# canonical PREDICT_HORIZON (the others carry None).
+FOCUS_SET: tuple[str, ...] = ("a_star_once", "d_star_lite", "dwa", "dwa_predictive_paper", "apf")
 
 
 def focus_planner_set() -> list[tuple[str, int | None, int | None, str]]:
     """The FOCUS_SET as ``(algorithm, replan_k, predict_horizon, label)`` tuples, in order.
 
     Every focus planner is non-replan, so ``replan_k`` is ``None``. A predict-family
-    focus planner (``dwa_predictive``) carries the canonical ``PREDICT_HORIZON`` and
+    focus planner (``dwa_predictive_paper``) carries the canonical ``PREDICT_HORIZON`` and
     folds ``_h<H>`` into its label; every other carries ``None`` for the horizon and
     uses its bare key. Pure and side-effect-free, so it can be asserted on directly.
     The 4-tuple shape matches ``run_all.canonical_planner_set()`` so the two feed the

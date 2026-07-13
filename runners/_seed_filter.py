@@ -71,7 +71,7 @@ _CANONICAL_ORDER: tuple[str, ...] = (
     "d_star_lite",
     "d_star_lite_predictive",
     "dwa",
-    "dwa_predictive",
+    "dwa_predictive_paper",
     "apf",
     "rrt_once",
     "rrt_replan",
@@ -86,12 +86,13 @@ _REPLAN_FAMILIES = frozenset(
 )
 
 # The canonical predict-family keys — folded with `_h<predict_horizon>` the same
-# way `planners._grid.algorithm_label` folds a PREDICT_FAMILIES key. The lidar
-# predictive variants (d_star_lite_predictive, dwa_predictive) are canonical (h10);
-# the oracles (d_star_lite_oracle, dwa_predictive_oracle) stay experimental. The
-# "all13" set appends the d_star_lite_oracle label separately in
-# `build_required_labels` (dwa_predictive_oracle is not part of the roster).
-_PREDICT_CANONICAL = frozenset({"d_star_lite_predictive", "dwa_predictive"})
+# way `planners._grid.algorithm_label` folds a PREDICT_FAMILIES key. The canonical
+# predictive variants (d_star_lite_predictive, dwa_predictive_paper — the braking-only
+# DWA policy) fold at h10; the oracles (d_star_lite_oracle, dwa_predictive_oracle),
+# the global-guidance dwa_predictive, and dwa_predictive_paper_oracle stay
+# experimental. The "all13" set appends the d_star_lite_oracle label separately in
+# `build_required_labels` (the other experimental keys are not part of the roster).
+_PREDICT_CANONICAL = frozenset({"d_star_lite_predictive", "dwa_predictive_paper"})
 
 
 def _canonical_label(name: str, replan_k: int, predict_horizon: int) -> str:

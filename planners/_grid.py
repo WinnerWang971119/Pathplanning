@@ -474,23 +474,26 @@ PREDICT_FAMILIES = frozenset(
 )
 
 # EXPERIMENTAL_KEYS is a STRICT SUBSET of PREDICT_FAMILIES (6 predict keys, 4
-# experimental): the lidar-fed, paper+global-guidance predictive variants
-# (d_star_lite_predictive, dwa_predictive) are full canonical study planners (run
-# at h10 by run_all and charted on the main plots). Carved OUT of the canonical
-# set are the perfect-velocity oracle cheats (d_star_lite_oracle,
-# dwa_predictive_oracle) AND the paper-only ablation pair (dwa_predictive_paper,
-# dwa_predictive_paper_oracle) — the ablation that isolates the braking layer from
-# the cost-to-go guidance, reached only through the runner. All six predict
-# families still take --predict-horizon and label with _h<steps> (that is
-# PREDICT_FAMILIES, unchanged); membership here is ONLY about the canonical-set
-# carve-out, not the horizon/label machinery. run_all's canonical-set assertion
-# tolerates these four via this set, so they never land on the canonical scatter;
-# the canonical set stays 13.
+# experimental). The two canonical study planners are the lidar-fed
+# d_star_lite_predictive (grid-stamping) and dwa_predictive_paper (the space-time
+# braking-inevitability policy, no cost-to-go field) — run at h10 by run_all and
+# charted on the main plots. Carved OUT of the canonical set are the
+# perfect-velocity oracle cheats (d_star_lite_oracle, dwa_predictive_oracle) AND
+# the two global-guidance DWA variants (dwa_predictive, dwa_predictive_paper_oracle).
+# The braking-only paper policy is the DWA winner; the cost-to-go global field
+# measured net-harmful (see docs/Finidings/2026-07-10-predictive-dwa-braking.findings.md),
+# so dwa_predictive (lidar + global) is demoted to experimental and its braking-only
+# sibling dwa_predictive_paper takes the canonical slot. All six predict families
+# still take --predict-horizon and label with _h<steps> (that is PREDICT_FAMILIES,
+# unchanged); membership here is ONLY about the canonical-set carve-out, not the
+# horizon/label machinery. run_all's canonical-set assertion tolerates these four
+# via this set, so they never land on the canonical scatter; the canonical set
+# stays 13.
 EXPERIMENTAL_KEYS = frozenset(
     {
         "d_star_lite_oracle",
+        "dwa_predictive",
         "dwa_predictive_oracle",
-        "dwa_predictive_paper",
         "dwa_predictive_paper_oracle",
     }
 )
