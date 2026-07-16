@@ -96,6 +96,7 @@ from planners.dwa import (
     MAX_LINEAR_ACCEL,
     ROLLOUT_STEPS,
     DWAController,
+    _Window,
 )
 
 # Braking-simulation deceleration (m/s^2) used by the inevitable-collision-state
@@ -257,6 +258,9 @@ class PredictiveDWAController(DWAController):
         loop, per-candidate space-time scoring (via the overridden
         :meth:`_evaluate_candidate`), and fallback all run inside ``super().act``.
         """
+        # Save the current state for the overridden _dynamic_window speed clamp near the goal.
+        self._current_state = state
+
         # h0 fast path: a true no-op. No tracker update (no side effect), no
         # space-time layer, base rollout length -> byte-identical to plain dwa
         # (TC65). _evaluate_candidate returns the bare base score because
@@ -283,6 +287,22 @@ class PredictiveDWAController(DWAController):
         self.last_predicted_cells = []  # DWA has no grid stamp to draw
 
         return super().act(state, lidar)
+
+    def _dynamic_window(self) -> _Window:
+        """Override the dynamic window to scale down the maximum speed when close to the goal.
+
+        This prevents the robot from overshooting the goal and orbiting it indefinitely in high-speed circles.
+        """
+        window = super()._dynamic_window()
+        if hasattr(self, "_current_state") and self._current_state is not None and self._goal_xy is not None:
+            dist_to_goal = float(np.linalg.norm(self._goal_xy - self._current_state[:2]))
+            # If within 1.0 meter of the goal, linearly scale max speed down.
+            if dist_to_goal < 1.0:
+                v_limit = max(0.05, dist_to_goal)
+                v_max = min(window.v_max, v_limit)
+                v_min = min(window.v_min, v_max)
+                return _Window(v_min=v_min, v_max=v_max, w_min=window.w_min, w_max=window.w_max)
+        return window
 
     def _evaluate_candidate(
         self,
@@ -345,10 +365,7 @@ class PredictiveDWAController(DWAController):
             if conflict.ttc_step == 1:
                 return None
 
-            # Braking-inevitability (ICS) test: if even an emergency-braking-and-
-            # holding trajectory still collides at a matched time, the collision is
-            # inevitable — reject. A conflict the robot could brake out of is
-            # admitted (the soft term below biases the argmax toward yielding).
+            # Braking-inevitability (ICS) test.
             braking = self._braking_trajectory(state, v, w)
             braking_conflict = trajectory_conflict(
                 braking,
@@ -358,14 +375,21 @@ class PredictiveDWAController(DWAController):
                 PREDICT_DT,
                 COLLISION_MARGIN,
             )
-            if braking_conflict.collides:
+
+            # Unified Rejection: Reject ONLY if BOTH the constant-velocity rollout
+            # and the braking rollout collide (true Inevitable Collision State).
+            if conflict.collides and braking_conflict.collides:
                 return None
 
-            # Soft yield term: symmetric-clipped, un-floored matched-time gap in
-            # [-1, 1]. Negative gaps penalize, so a slower collision-free candidate
-            # outscores a faster grazing/colliding one.
+            # Soft yield and progress collision penalty.
             gap = float(np.clip(conflict.min_gap, -CLEARANCE_CAP, CLEARANCE_CAP))
             soft = PREDICTED_GAP_WEIGHT * (gap / CLEARANCE_CAP)
+
+            # If the candidate trajectory collides (but has a braking backup),
+            # apply a large negative penalty to make sure DWA prefers non-colliding options.
+            if conflict.collides:
+                soft -= 2.0
+
             return base_score + soft
         except Exception:
             # AC11: an unexpected raise in the space-time layer degrades this
