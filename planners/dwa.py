@@ -78,6 +78,24 @@ GOAL_REACHED_RADIUS = 0.3
 # undefined (a near-stationary candidate has no meaningful direction).
 MIN_ROLLOUT_STEP_SQ = 1e-12
 
+# Endgame goal-capture. Fixes the differential-drive limit cycle where the robot
+# orbits the goal just outside irsim's 0.1 m arrival threshold and times out:
+# near the goal the heading term is ill-defined (suppressed to 1.0) and the
+# velocity reward actively prefers motion, so every candidate ties on heading and
+# the fastest one wins, holding a stable circle. Once the robot's CURRENT pose is
+# within GOAL_CAPTURE_RADIUS of the goal, `_score` switches to minimizing the
+# rollout's FINAL distance to the goal, so the best candidate drives onto the
+# goal and stops (a stationary rollout ends ON the goal -> minimal distance)
+# instead of circling. The radius sits well above the ~0.3 m orbit radius the old
+# scoring settled into, so the switch always engages before the trap; collision
+# rejection (`_trajectory_clearance`) still runs, so the endgame stays
+# obstacle-safe.
+GOAL_CAPTURE_RADIUS = 0.6
+# Weight (per meter) on the negated rollout-final distance to goal inside the
+# capture radius. Dominates the retained clearance term so distance reduction
+# wins the argmax, while clearance still biases the approach away from a mover.
+GOAL_APPROACH_WEIGHT = 1.0
+
 # In-place-rotation fallback when every candidate collides. The turn direction
 # is chosen toward the side (left vs right half of the scan) with more mean
 # clearance; magnitude is a fixed fraction of the angular limit.
@@ -348,9 +366,28 @@ class DWAController:
           global-guidance subclass override; the base ignores it).
         - Clearance: ``clearance / CLEARANCE_CAP`` in ``[0, 1]``.
         - Velocity: ``v / MAX_LINEAR_SPEED`` in ``[0, 1]``.
+
+        Endgame override: once the robot's CURRENT pose is within
+        ``GOAL_CAPTURE_RADIUS`` of the goal, the objective switches to minimizing
+        the rollout's FINAL distance to the goal (plus the retained clearance
+        term). This collapses the near-goal orbit — driving onto the goal and
+        stopping outscores circling it — so irsim's 0.1 m arrival latches instead
+        of the robot timing out. The heading/velocity objective is only used
+        outside the capture radius, so open-space DWA behavior is unchanged.
         """
-        heading_term = self._heading_term(state, trajectory)
+        assert self._goal_xy is not None  # narrowed by act()'s guard
+
         clearance_term = clearance / CLEARANCE_CAP
+
+        current_goal_distance = float(np.linalg.norm(self._goal_xy - state[:2]))
+        if current_goal_distance < GOAL_CAPTURE_RADIUS:
+            final_goal_distance = float(np.linalg.norm(self._goal_xy - trajectory[-1]))
+            return (
+                GOAL_APPROACH_WEIGHT * (-final_goal_distance)
+                + CLEARANCE_WEIGHT * clearance_term
+            )
+
+        heading_term = self._heading_term(state, trajectory)
         velocity_term = v / MAX_LINEAR_SPEED
 
         return (
