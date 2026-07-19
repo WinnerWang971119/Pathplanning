@@ -172,8 +172,8 @@ class PredictiveDStarLiteController(DStarLiteController):
         state this subclass adds in ``__init__``. The ``Controller`` contract allows
         an instance to be reset and reused for a second episode, so without this
         override the lazy ``if self._tracker is None`` guard would be skipped on
-        reuse and episode 2's first frame would be differenced against episode 1's
-        final centroids — bogus velocities, phantom stamps. Null every added member
+        reuse and episode 2's first frame would be tracked against episode 1's
+        final track state — bogus velocities, phantom stamps. Null every added member
         back to its constructed state (``_horizon_steps`` / ``geometry`` /
         ``wants_truth`` are construction-time config, not episode state, so they are
         left intact). The tracker rebuilds lazily on the next non-h0 ``act()``.

@@ -208,8 +208,8 @@ class PredictiveDWAController(DWAController):
         the STATIC inflated occupancy grid the ``LidarTracker`` needs for
         static-return subtraction (harmless/unused for the oracle), and null every
         per-episode member so a reused instance (the ``Controller`` contract allows
-        a second episode) does not difference episode 2's first frame against
-        episode 1's final tracker state.
+        a second episode) does not carry episode 1's final tracker state into
+        episode 2's first frame.
         """
         super().reset(world_yaml, initial_snapshot, lidar0, state0)
 
@@ -516,7 +516,7 @@ class DWAPredictivePaperController(DWAPredictiveController):
     Isolates the Missura & Bennewitz braking/soft-yield layer from the
     cost-to-go guidance field by flipping ``use_global_guidance`` back off; the
     base heading term is the plain Euclidean goal-heading DWA already uses.
-    Inherits the hardened ``LidarTracker`` construction from
+    Inherits the ``LidarTracker`` (Kalman MOT) construction from
     :class:`DWAPredictiveController` unchanged (only ``name`` and
     ``use_global_guidance`` differ). EXPERIMENTAL — an ablation cell reached only
     through the runner, not the canonical main-scatter dot (that remains plain

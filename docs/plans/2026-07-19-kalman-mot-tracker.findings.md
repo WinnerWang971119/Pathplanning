@@ -128,8 +128,11 @@ timeouts (the robot yields/reroutes correctly rather than driving into a
 mis-estimated obstacle). The improvement is real but modest, consistent with
 the finding that most residual reroutes were legitimate anticipation or cone
 over-stamping — not velocity phantoms — so the headline failure rate moves
-only a few points. `results/` is gitignored, so this table — not the raw JSON
-— is the durable record of the comparison.
+only a few points. The plain-`dwa` control (VAL2's third key) is not re-run as
+a table row: `planners/dwa.py` is untouched by this change and TC65 pins plain
+`dwa`'s trace byte-unchanged inside `--check`, which is a stronger guarantee
+than a rerun. `results/` is gitignored, so this table — not the raw JSON — is
+the durable record of the comparison.
 
 ### Reproduce
 

@@ -21,7 +21,7 @@ so a fix to either now lands in one place instead of three:
   predicted stamp can never drift from the cells the lidar fold marks.
 - :func:`lidar_to_world_points` — the finite-beam lidar -> world projection. The
   single source behind ``_grid.lidar_to_occupancy``'s fold, ``DWA``'s obstacle
-  points, and the ``LidarTracker``'s frame differencing, with an optional near-rim
+  points, and the ``LidarTracker``'s velocity estimation, with an optional near-rim
   no-hit deadband for the tracker.
 """
 
