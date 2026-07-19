@@ -105,16 +105,17 @@ STRAIGHT_LINE_IDEAL_M = 46.0 * (2.0 ** 0.5)   # ~= 65.05 m
 # (registry name, replan_k or None, predict_horizon or None, family, display).
 # load_world_results() folds the replan_k / predict_horizon into the dir label
 # (a_star_replan_k5 / d_star_lite_predictive_h10) so the label matches the dir
-# run_experiment wrote. These are exactly the 12 canonical Mission planners run_all
-# writes — the same set, and the same order, as run_all._CANONICAL_ORDER. The
-# canonical predictive key d_star_lite_predictive folds its canonical horizon (h10)
-# into the label. The one remaining experimental motion-aware key
-# (d_star_lite_oracle) is EXCLUDED here on purpose: it is held out of run_all's
-# canonical set (EXPERIMENTAL_KEYS), so its `_h<steps>` label dir is never written
-# by the documented run_all -> plot workflow. Charting it here would draw a
-# data-less line on every chart (the headline A1 scatter included). The oracle's
-# results live on the horizon-sweep charts (`runners.plot_horizon_sweep`), its
-# proper experimental venue.
+# run_experiment wrote. These are the 13 canonical Mission planners run_all writes
+# — the same order as run_all._CANONICAL_ORDER — PLUS one deliberately-charted
+# experimental key, dwa_predictive_paper (the braking-only DWA-predictive ablation).
+# The canonical predictive keys d_star_lite_predictive / dwa_predictive fold their
+# canonical horizon (h10) into the label. dwa_predictive_paper is NOT in run_all's
+# canonical set (it is in EXPERIMENTAL_KEYS), so the standard run_all -> plot
+# workflow does not write its `_h<steps>` dir on its own; charting it is opt-in on
+# the study operator running that key by hand (as here), and on any world where its
+# dir is absent the loader warns and it draws a data-less line. The other
+# experimental key (d_star_lite_oracle) stays EXCLUDED — its results live on the
+# horizon-sweep charts (`runners.plot_horizon_sweep`), its proper experimental venue.
 CANONICAL: list[tuple[str, int | None, int | None, str, str]] = [
     ("a_star_once",            None, None, "grid",        "A* once"),
     ("a_star_replan",          5,    None, "grid",        "A* replan (K=5)"),
@@ -124,6 +125,7 @@ CANONICAL: list[tuple[str, int | None, int | None, str, str]] = [
     ("d_star_lite_predictive", None, 10,   "predictive",  "D* Lite predictive (h10)"),
     ("dwa",                    None, None, "reactive",    "DWA"),
     ("dwa_predictive",         None, 10,   "predictive",  "DWA predictive (h10)"),
+    ("dwa_predictive_paper",   None, 10,   "predictive",  "DWA predictive paper (h10)"),
     ("apf",                    None, None, "reactive",    "APF"),
     ("rrt_once",               None, None, "sampling",    "RRT once"),
     ("rrt_replan",             5,    None, "sampling",    "RRT replan (K=5)"),
@@ -3162,16 +3164,28 @@ def _resolve_out_dir(args: PlotArgs, world_stem: str) -> Path:
 # --- Degenerate-seed filter (issue #9) --------------------------------------
 
 def _plotted_labels(replan_k: int) -> list[str]:
-    """The results-dir labels `load_world_results` will actually load for the
-    CANONICAL set, derived the SAME way (via `algorithm_label`) so the sidecar
-    coverage check (`sidecar_covers`) tests the exact label strings the plotter
-    charts. Imports `planners` lazily (like `load_world_results`), so it never
-    runs at module import — `import runners.plot` stays headless.
+    """The CANONICAL-study results-dir labels the sidecar coverage check
+    (`sidecar_covers`) must see covered, derived the SAME way (via
+    `algorithm_label`) as `load_world_results` so the coverage test compares the
+    exact label strings. Imports `planners` lazily (like `load_world_results`), so
+    it never runs at module import — `import runners.plot` stays headless.
+
+    Deliberately-charted EXPERIMENTAL extras (`EXPERIMENTAL_KEYS`, e.g.
+    `dwa_predictive_paper`) are skipped: `filter_seeds` only ever builds a
+    canonical / all13 `required_labels` set, which by construction cannot contain
+    an experimental label. Were an experimental extra left in this coverage set,
+    `sidecar_covers` would always read as not-covering and the degenerate-seed
+    filter would silently disable on every world charting it. The extra is still
+    charted (it stays in CANONICAL); it just does not participate in the filter's
+    coverage contract, which guards only the canonical study set.
     """
     from planners import algorithm_label
+    from planners._grid import EXPERIMENTAL_KEYS
 
     labels: list[str] = []
     for name, default_k, default_h, _family, _display in CANONICAL:
+        if name in EXPERIMENTAL_KEYS:
+            continue
         effective_k = replan_k if default_k is not None else None
         labels.append(algorithm_label(name, effective_k, default_h))
     return labels
