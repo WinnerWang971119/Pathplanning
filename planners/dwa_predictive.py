@@ -43,7 +43,7 @@ dynamic window, the sampling loop, the rollout, or the fallback:
 
 Velocity source behind the shared ``Tracker`` seam (mirrors D* Lite):
 - ``DWAPredictiveController`` (key ``"dwa_predictive"``): ``LidarTracker``
-  frame-differencing estimator, ``wants_truth=False`` — the Mission-faithful,
+  Kalman multi-object tracker, ``wants_truth=False`` — the Mission-faithful,
   CANONICAL variant.
 - ``DWAPredictiveOracleController`` (key ``"dwa_predictive_oracle"``):
   ``OracleTracker`` perfect live velocities via the truth seam,
@@ -470,8 +470,9 @@ class PredictiveDWAController(DWAController):
 class DWAPredictiveController(PredictiveDWAController):
     """Lidar-fed space-time DWA: estimated velocities (the Mission-faithful, canonical key).
 
-    Velocities come from frame-differencing the live lidar (``LidarTracker``), not
-    the truth seam (``wants_truth=False``). Promoted to a canonical study planner.
+    Velocities come from the Kalman multi-object tracker (``LidarTracker``) over the
+    live lidar, not the truth seam (``wants_truth=False``). Promoted to a canonical
+    study planner.
     """
 
     name = "dwa_predictive"

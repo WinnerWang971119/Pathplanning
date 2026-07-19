@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 # float jitter scatters a few just under it; the Arena's strict ``< range_max``
 # filter only catches the >= side, so those survivors reach a consumer as a ring
 # of points at the sensing rim. Without this cut they cluster into phantom
-# "obstacles" with spurious frame-differenced velocities (the rim moves with the
+# "obstacles" with spurious estimated velocities (the rim moves with the
 # robot). 0.05 m sits in the clean gap between real returns (<= ~4.9 m here) and
 # the ~range_max no-hit ring, and costs only the outermost 5 cm of a 5 m sensor.
 # Only consumers that pass a finite ``range_max`` to :func:`lidar_to_world_points`

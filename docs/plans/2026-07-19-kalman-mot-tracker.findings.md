@@ -112,14 +112,24 @@ All rows: `arena_v1.yaml`, traffic on, `--jobs 6`, `--predict-horizon 10`,
 
 | Key | Baseline (frame-diff) failure rate | KF failure rate | Delta |
 |---|---|---|---|
-| `d_star_lite_predictive` | (pending benchmark) | (pending benchmark) | (pending benchmark) |
-| `dwa_predictive` | (pending benchmark) | (pending benchmark) | (pending benchmark) |
-| `dwa_predictive_paper` | (pending benchmark) | (pending benchmark) | (pending benchmark) |
+| `d_star_lite_predictive` | 0.350 (35 crash, 0 timeout) | **0.330** (31 crash, 2 timeout) | **−0.020** |
+| `dwa_predictive` | 0.350 (35 crash, 0 timeout) | **0.290** (28 crash, 1 timeout) | **−0.060** |
+| `dwa_predictive_paper` | 0.330 (33 crash, 0 timeout) | **0.320** (32 crash, 0 timeout) | **−0.010** |
 
-A 100-seed run for these three keys is in progress at the time of writing;
-the orchestrating session will fill in the numeric cells above (and state
-whether AC9/AC10 pass) once it completes. `results/` is gitignored, so this
-table — not the raw JSON — is the durable record of the comparison.
+**Verdict: the KF beats the frame-differencer on all three keys.** AC9 passes
+(the primary key `d_star_lite_predictive` is strictly lower: 0.330 < 0.350).
+AC10 passes and then some — the two DWA lidar keys do not regress, they
+*improve* (`dwa_predictive` −0.060, `dwa_predictive_paper` −0.010). The
+canonical `dwa_predictive` gained the most, confirming that the same
+estimator rot was silently degrading it (a 5 m/s ghost velocity fed into the
+space-time rollout manufactures phantom matched-time conflicts). The gains
+come from converting crashes into successes, at the cost of a couple of new
+timeouts (the robot yields/reroutes correctly rather than driving into a
+mis-estimated obstacle). The improvement is real but modest, consistent with
+the finding that most residual reroutes were legitimate anticipation or cone
+over-stamping — not velocity phantoms — so the headline failure rate moves
+only a few points. `results/` is gitignored, so this table — not the raw JSON
+— is the durable record of the comparison.
 
 ### Reproduce
 
