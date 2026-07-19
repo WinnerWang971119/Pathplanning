@@ -80,9 +80,7 @@ from manual_astar import (
 )
 from planners._costfield import build_cost_to_go_field
 from planners._predict import (
-    MAX_TRACK_SPEED,
     PREDICT_DT,
-    VELOCITY_SMOOTHING_FRAMES,
     LidarTracker,
     OracleTracker,
     Tracker,
@@ -484,17 +482,14 @@ class DWAPredictiveController(PredictiveDWAController):
         # Lazy: reset() has populated self._grid / self._bearings / self._geom by
         # the time this first fires (first non-h0 act()). The bearings are the exact
         # linspace recovery the rest of the harness uses (NOT i*angle_increment).
-        # Hardening (velocity smoothing + speed clamp) is opt-in on the LidarTracker
-        # and defaults OFF, so it must be requested explicitly here; it is used only
-        # by the DWA lidar keys, leaving d_star_lite_predictive's tracker construction
-        # (and TC63/TC64) byte-unchanged.
+        # LidarTracker is now the Kalman-filter MOT; it takes no hardening kwargs
+        # (smoothing/speed-clamp are subsumed by the KF gain and the association
+        # gate), so this construction is identical to d_star_lite_predictive's.
         assert self._grid is not None and self._bearings is not None and self._geom is not None
         return LidarTracker(
             self._grid,
             self._bearings,
             range_max=self._geom.range_max,
-            smoothing_frames=VELOCITY_SMOOTHING_FRAMES,
-            max_track_speed=MAX_TRACK_SPEED,
         )
 
 
