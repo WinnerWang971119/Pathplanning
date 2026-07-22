@@ -17,7 +17,6 @@ symbols inside functions.
 from __future__ import annotations
 
 import math
-from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
@@ -41,7 +40,7 @@ PREDICT_DT: float = 0.1
 # tuned later by the lidar variant (T12).  The capsule geometry ignores it.
 CONE_GROWTH_PER_STEP: float = 0.05
 
-# --- LidarTracker tunables (frame-differencing velocity estimator) ----------
+# --- LidarTracker detector tunables ------------------------------------------
 
 # Grid-bucket edge length (metres) for clustering surviving dynamic lidar
 # returns into obstacle clusters.  Roughly one obstacle radius (the arena's
@@ -50,45 +49,79 @@ CONE_GROWTH_PER_STEP: float = 0.05
 # cluster, while two distinct obstacles a metre apart stay separate.
 CLUSTER_RESOLUTION: float = 0.3
 
-# Floor (metres) on a cluster's estimated radius.  A one-point cluster has zero
-# extent, so without a floor its predicted disk would collapse to nothing; lidar
-# only ever sees the near surface and under-estimates the true radius anyway
-# (the cone geometry in T12 widens to cover that), so a small sane floor is all
-# that is required.
+# Floor (metres) on a detection's estimated radius; also the floor on the seed
+# of a track's radius EMA at birth.  A one-point cluster has zero extent, so
+# without a floor its predicted disk would collapse to nothing; lidar only ever
+# sees the near surface and under-estimates the true radius anyway (the cone
+# geometry widens to cover that), so a small sane floor is all that is required.
 MIN_TRACK_RADIUS: float = 0.15
 
-# Maximum centroid displacement (metres) accepted when associating a current
-# cluster to a prior-frame cluster.  The fastest obstacle moves
-# 1.5 * MAX_LINEAR_SPEED(=1.0) * PREDICT_DT(=0.1) = 0.15 m per frame, so 1.0 m
-# comfortably covers that plus clustering/centroid jitter while staying tight
-# enough to reject a spurious cross-association to an unrelated obstacle.
-MAX_ASSOCIATION_DISTANCE: float = 1.0
+# --- LidarTracker Kalman-filter MOT tunables ---------------------------------
 
-# Multiplier folding a cluster's representative (smallest) bucket cell
-# ``(row, col)`` into a single integer track id: ``id = row * MULT + col``.
-# Chosen larger than any column index a 50x50 world reaches at
-# CLUSTER_RESOLUTION (~167 buckets), so distinct representative cells map to
-# distinct ids and a stationary obstacle keeps a stable id across frames.
-# Assumes non-negative world bucket coordinates (the arena offset is (0, 0)).
-CLUSTER_ID_MULTIPLIER: int = 100000
+# Constant-velocity process-noise intensity q (accel white noise, m^2/s^3),
+# feeding the continuous CV process noise
+# Q(q, dt) = [[q*dt^3/3, q*dt^2/2], [q*dt^2/2, q*dt]].  Sized so the filter
+# follows a ~1 m/s straight-line mover without lag while damping merge-frame
+# centroid spikes.
+KF_PROCESS_NOISE: float = 4.0
 
-# --- Opt-in LidarTracker hardening tunables ---------------------------------
-# Both are OFF by default in LidarTracker.__init__ (smoothing_frames=0,
-# max_track_speed=inf), so a tracker built without them is byte-identical to the
-# pre-hardening estimator. They are used only by the DWA lidar-predict keys; the
-# other shared consumer (d_star_lite_predictive) does NOT pass them and stays
-# byte-unchanged.
+# Centroid measurement variance r (m^2), ~ (0.14 m)^2 for the near-surface
+# centroid jitter of a clustered lidar arc.  Must stay positive: the scalar
+# innovation variance is Sm = P00 + r and the Kalman gain divides by it
+# (checked at construction, so no per-update division guard is needed).
+KF_MEASUREMENT_NOISE: float = 0.02
 
-# Reported-velocity magnitude cap (m/s) for the clamp. Deliberately 2.0, the
-# ``fast`` obstacle-speed regime's max cap (0.5..2.0 * robot top speed), NOT 1.5:
-# a 1.5 cap would truncate the genuine fast-regime crossers the issue-#11 speed
-# sweep spawns, hiding real motion behind an artificial ceiling.
-MAX_TRACK_SPEED: float = 2.0
+# Birth covariance on the position states (m^2): a first detection's centroid
+# is trusted to within roughly two grid cells.
+KF_INITIAL_POSITION_VARIANCE: float = 0.05
 
-# Window length (frames) for the velocity-smoothing mean: the reported velocity
-# is the mean over the last <= this many associated instantaneous velocities
-# (including the current frame).
-VELOCITY_SMOOTHING_FRAMES: int = 3
+# Birth covariance on the velocity states (m^2/s^2): deliberately wide, so the
+# first gated hits move the velocity estimate freely instead of dragging a
+# zero-velocity prior.
+KF_INITIAL_VELOCITY_VARIANCE: float = 4.0
+
+# Fastest obstacle speed the tracker must be able to follow (m/s).  Deliberately
+# 2.0 — the ``fast`` obstacle-speed regime's max cap (0.5..2.0 * robot top
+# speed) — NOT the ``current`` regime's 1.5: a gate sized to 1.5 would make
+# every genuine fast-regime crosser fail association each frame, coast out, and
+# die, silently un-tracking exactly the traffic the issue-#11 speed sweep spawns.
+MAX_PLAUSIBLE_SPEED: float = 2.0
+
+# Centroid/cluster jitter allowance (metres) added to the physical per-frame
+# displacement bound when sizing the association gate.
+GATE_SLACK: float = 0.15
+
+# Maximum detection-centroid-to-PREDICTED-track-position distance (metres) for
+# a valid association.  A fixed Euclidean physics gate (NOT a Mahalanobis /
+# innovation-covariance gate): the fastest plausible mover displaces at most
+# MAX_PLAUSIBLE_SPEED * PREDICT_DT per frame beyond its prediction, plus slack
+# for centroid jitter (~0.35 m total).
+ASSOCIATION_GATE_DISTANCE: float = MAX_PLAUSIBLE_SPEED * PREDICT_DT + GATE_SLACK
+
+# Consecutive gated hits (counting the birth detection) required to promote a
+# TENTATIVE track to CONFIRMED.  Tentative tracks are withheld from update()
+# output, so a 1-2 frame spurious cluster is never emitted (or stamped).
+CONFIRM_HITS: int = 3
+
+# Consecutive misses a CONFIRMED track coasts on its prediction before
+# deletion: it stays emitted (at its PREDICTED position) through misses
+# 1..COAST_MISSES — <= 0.3 s at PREDICT_DT — then deletes on the next miss.
+COAST_MISSES: int = 3
+
+# Radius EMA weight: filtered = beta * measured + (1 - beta) * previous.
+RADIUS_EMA_BETA: float = 0.3
+
+# Hard cap (metres) on a track's filtered radius — 1.5x the arena's true 0.3 m
+# mover.  Applied to the birth seed AND to every EMA update, so no reported
+# Track.radius can exceed it even when a merge balloons the raw cluster radius
+# (AC6).
+RADIUS_MAX: float = 0.45
+
+# A detection whose measured radius jumps above this ratio times the track's
+# filtered radius is treated as a merge suspect: the radius EMA update is
+# SKIPPED that frame (the position update still happens).  Never applied on the
+# birth frame — there is no prior filtered radius to compare against.
+RADIUS_MERGE_SUSPECT_RATIO: float = 1.5
 
 # The near-rim no-hit deadband (RANGE_MAX_DEADBAND) the LidarTracker applies when
 # projecting beams now lives with the shared projection in planners._geometry.
@@ -111,7 +144,7 @@ class ThreatKey(NamedTuple):
 class Track:
     """A single tracked obstacle at the current tick."""
 
-    id: int          # stable identity (oracle: obstacle id; lidar: synthesized cluster id)
+    id: int          # stable identity (oracle: obstacle id; lidar: per-episode birth-counter id)
     x: float
     y: float
     vx: float        # m/s, world frame
@@ -125,8 +158,9 @@ class Tracker(Protocol):
     OracleTracker.update reads *snapshot* (ignores state/lidar/dt) — velocities
     are exact/known from the live truth seam.
 
-    The future LidarTracker (T11) reads *state* and *lidar* (ignores snapshot) —
-    velocities are estimated from frame-differencing.
+    LidarTracker reads *state* and *lidar* (ignores snapshot) — velocities are
+    estimated by a constant-velocity Kalman-filter multi-object tracker over
+    clustered dynamic lidar returns.
 
     Both return tracks sorted by id ascending to guarantee deterministic ordering.
     """
@@ -195,48 +229,151 @@ class OracleTracker:
 class _Cluster:
     """One connected-component cluster of dynamic lidar returns (internal).
 
-    ``rep_cell`` is the smallest bucket key in the component (its deterministic
-    representative); ``track_id`` is that cell folded into a single integer. It is
-    stable WITHIN a frame (distinct components have distinct rep_cells), and stable
-    across frames only while the obstacle is stationary — a moving obstacle's
-    rep_cell (and thus id) shifts as its return arc moves. Nothing relies on
-    cross-frame id stability: cross-frame state is carried positionally via
-    ``_prev_centroids``, and each tick's prediction is computed fresh.
+    A per-frame DETECTION, not a track.  ``rep_cell`` is the smallest bucket
+    key in the component — its deterministic representative, unique within a
+    frame (distinct components have distinct rep_cells) — and fixes the frame's
+    detection order: detections are ranked in ``rep_cell``-ascending order for
+    the association sweep.  Cross-frame identity lives in the tracker's
+    persistent ``_KTrack`` records, which carry monotonic birth-counter ids.
     """
 
-    track_id: int
     rep_cell: tuple[int, int]
     centroid_x: float
     centroid_y: float
     radius: float
 
 
+@dataclass
+class _KTrack:
+    """Internal per-track record for the CV-KF multi-object tracker.
+
+    Mutable by design: the tracker advances the Kalman state in place each
+    frame.  ``id`` is a monotonic per-episode birth counter, assigned at birth
+    and never reused.  The Kalman state is ``[x, y, vx, vy]`` with a DECOUPLED
+    covariance: axis-symmetric noise makes the x and y axes two identical
+    2-state filters sharing one covariance recursion, so a single symmetric
+    2x2 ``[[p00, p01], [p01, p11]]`` (position variance, position-velocity
+    cross term, velocity variance) serves both axes and the Kalman gain is one
+    shared 2-vector.  ``radius`` is a separate capped EMA, not part of the KF
+    state.  ``hits`` / ``misses`` / ``confirmed`` drive the N-hit/M-miss
+    lifecycle.
+    """
+
+    id: int
+    x: float
+    y: float
+    vx: float
+    vy: float
+    p00: float
+    p01: float
+    p11: float
+    radius: float
+    hits: int
+    misses: int
+    confirmed: bool
+
+
+def _kf_predict(track: _KTrack, dt: float) -> None:
+    """Time-advance one track's decoupled CV Kalman filter in place.
+
+    Per axis: ``s <- F s`` with ``F = [[1, dt], [0, 1]]`` (position advances by
+    velocity, velocity persists), and the shared 2x2 covariance advances by
+    ``P <- F P F^T + Q(q, dt)`` with the continuous constant-velocity process
+    noise ``Q = [[q*dt^3/3, q*dt^2/2], [q*dt^2/2, q*dt]]``.  Scalar mul/add
+    only, in a fixed expression order — no matrices, no linear-algebra library
+    call (AC3).
+    """
+    track.x += track.vx * dt
+    track.y += track.vy * dt
+
+    q = KF_PROCESS_NOISE
+    p00 = track.p00
+    p01 = track.p01
+    p11 = track.p11
+    track.p00 = p00 + dt * (2.0 * p01 + dt * p11) + q * dt * dt * dt / 3.0
+    track.p01 = p01 + dt * p11 + q * dt * dt / 2.0
+    track.p11 = p11 + q * dt
+
+
+def _kf_update(track: _KTrack, measured_x: float, measured_y: float) -> None:
+    """Fold one centroid measurement into a track's Kalman state in place.
+
+    The measurement is position-only (``H = [1, 0]``) with scalar variance
+    ``r = KF_MEASUREMENT_NOISE``, so the innovation variance is the SCALAR
+    ``Sm = P00 + r`` and the shared gain is the 2-vector
+    ``K = [P00/Sm, P01/Sm]``.  Both axes apply the same gain to their own
+    position innovation; the covariance update ``P <- (I - K H) P`` reduces to
+    three scalar assignments (symmetry is preserved exactly:
+    ``p01 - K1*p00 == (1 - K0)*p01`` algebraically).  No matrix inverse
+    anywhere (AC3).
+    """
+    innovation_variance = track.p00 + KF_MEASUREMENT_NOISE
+    gain_position = track.p00 / innovation_variance
+    gain_velocity = track.p01 / innovation_variance
+
+    innovation_x = measured_x - track.x
+    innovation_y = measured_y - track.y
+    track.x += gain_position * innovation_x
+    track.vx += gain_velocity * innovation_x
+    track.y += gain_position * innovation_y
+    track.vy += gain_velocity * innovation_y
+
+    p00 = track.p00
+    p01 = track.p01
+    p11 = track.p11
+    track.p00 = (1.0 - gain_position) * p00
+    track.p01 = (1.0 - gain_position) * p01
+    track.p11 = p11 - gain_velocity * p01
+
+
 class LidarTracker:
-    """Frame-differencing velocity estimator — the lidar-only ``Tracker``.
+    """Deterministic CV-KF multi-object tracker — the lidar-only ``Tracker``.
 
-    Each tick it projects the live lidar frame to world points, drops returns
-    that land on the STATIC inflated grid (walls / pillars and their inflation
-    band), clusters the surviving dynamic returns by grid bucket, associates
-    each cluster to the nearest cluster from the PRIOR frame, and estimates the
-    velocity as ``(centroid_now - centroid_prev) / dt``.  The prior-frame
-    centroids are the only cross-frame state on the default path; enabling
-    ``smoothing_frames`` adds a parallel per-cluster velocity-history state that
-    rides the same positional association chain (see ``__init__``).
+    Each tick the DETECTOR projects the live lidar frame to world points, drops
+    returns that land on the STATIC inflated grid (walls / pillars and their
+    inflation band), and clusters the surviving dynamic returns by grid bucket
+    into per-frame detections.  The ESTIMATOR then carries persistent tracks
+    across frames:
 
-    The two ``__init__`` hardening knobs (``smoothing_frames``, ``max_track_speed``)
-    are KEYWORD-ONLY and default to OFF, so a tracker built without them (as
-    ``d_star_lite_predictive`` does) is byte-identical to the pre-hardening
-    estimator; they are opt-in for the DWA lidar-predict keys only.
+    1. Every track's constant-velocity Kalman filter is time-advanced by ``dt``
+       (state AND covariance), so gating happens against PREDICTED positions,
+       not last-seen ones.
+    2. Detections associate to tracks by a prediction-gated, globally-sorted
+       greedy assignment: every (track, detection) pair within
+       ``ASSOCIATION_GATE_DISTANCE`` of the track's predicted position forms a
+       ``(distance, track_id, detection_rank)`` triple; one global sort, then a
+       greedy sweep consumes each track and each detection at most once.  The
+       FULL triple is the sort key — a total order over the two int fields —
+       because symmetric arena geometry produces exactly-equal float distances
+       and a bare distance sort would leak nondeterministic tie order.
+    3. N-hit/M-miss lifecycle: an unassociated detection births a TENTATIVE
+       track, withheld from output; ``CONFIRM_HITS`` consecutive gated hits
+       (counting the birth) promote it to CONFIRMED, the only state ``update``
+       emits.  A tentative track dies on its first miss.  A confirmed track
+       with no association COASTS — it emits its PREDICTED position (never a
+       frozen one) through ``COAST_MISSES`` consecutive misses, then deletes.
+       Coast-through-merge falls out of the tight gate: a merged blob's
+       centroid fails both parents' gates, so both parents coast under their
+       pre-merge birth-counter ids instead of being yanked or reborn.
+    4. Radius is a capped EMA seeded at birth from the floored measured radius,
+       with a merge-suspect gate that skips the radius update (position still
+       updates) when the measured radius jumps past
+       ``RADIUS_MERGE_SUSPECT_RATIO`` times the filtered one.
 
-    Determinism is the whole contract (the plan's "landmine"): the pipeline never
-    iterates a ``set`` to build output or to order points, draws no RNG, and
-    feeds every ``np.mean`` reduction a fixed, sorted-order array, so two
-    ``update`` sequences on byte-identical inputs (same constructor args, same
-    per-frame ``state`` / ``lidar``) return byte-identical ``Track`` lists — even
-    across a frame where the cluster count changes (an obstacle enters / leaves).
+    Track ids are a monotonic per-episode birth counter, reset on CONSTRUCTION
+    only — each episode builds a fresh tracker via ``_make_tracker``, so the
+    per-episode reset is automatic; there is deliberately no per-``update``
+    reset (mirrors the irsim ``id_iter`` reset-on-make convention).
 
-    The first ``update`` has no prior frame, so it yields zero velocities; that
-    is correct (one frame cannot reveal motion).
+    Determinism is the whole contract (the plan's "landmine"): the pipeline
+    never iterates a ``set`` to build output or to order operations, draws no
+    RNG, feeds every reduction a fixed sorted-order sequence, and breaks
+    association ties by the total-order sort key above, so two ``update``
+    sequences on byte-identical inputs return byte-identical ``Track`` lists.
+
+    The first ``update`` on a fresh tracker births only tentative tracks, so it
+    returns ``[]`` (cold start); an obstacle is first emitted on the frame its
+    track is promoted to confirmed.
     """
 
     def __init__(
@@ -244,9 +381,6 @@ class LidarTracker:
         grid: OccupancyGrid,
         bearings: np.ndarray,
         range_max: float = float("inf"),
-        *,
-        smoothing_frames: int = 0,
-        max_track_speed: float = float("inf"),
     ) -> None:
         """Store the static grid, the per-beam bearings, and the no-hit range.
 
@@ -265,24 +399,6 @@ class LidarTracker:
             ``np.linspace(angle_min, angle_max, number)`` (the exact recovery the
             rest of the harness uses — NOT ``i * angle_increment``).  No YAML is
             loaded and no bearings are recomputed here.
-        smoothing_frames:
-            OPT-IN velocity smoothing (KEYWORD-ONLY, default ``0`` = OFF). When
-            ``> 0`` the reported ``vx/vy`` is the windowed mean over the last
-            ``<= smoothing_frames`` associated instantaneous velocities (including
-            the current frame's), where the velocity history rides the existing
-            positional association chain: a current cluster that associates to
-            prior cluster P inherits P's velocity history, appends the current raw
-            instantaneous velocity, and truncates to the last ``smoothing_frames``
-            entries. A cluster with no prior association starts a fresh history.
-            At the default ``0`` the reported velocity is exactly the raw
-            instantaneous estimate — bit-for-bit unchanged from the pre-hardening
-            tracker — and NO history state is maintained.
-        max_track_speed:
-            OPT-IN reported-speed clamp (KEYWORD-ONLY, default ``inf`` = OFF).
-            When finite, the magnitude of the REPORTED velocity (after any
-            smoothing) is clamped to this value; the RAW instantaneous velocity
-            stored in the smoothing history is never clamped. At the default
-            ``inf`` no clamp is applied.
         """
         if grid is None:
             raise ValueError("LidarTracker requires a non-None OccupancyGrid.")
@@ -294,30 +410,24 @@ class LidarTracker:
                 f"{bearings_array.shape}."
             )
 
-        if smoothing_frames < 0:
+        # Guard the Kalman update against a nonsensical tuning edit: the scalar
+        # innovation variance Sm = P00 + r is the gain's divisor, and r > 0
+        # keeps it strictly positive with no per-update division guard.
+        if not KF_MEASUREMENT_NOISE > 0.0:
             raise ValueError(
-                f"smoothing_frames must be non-negative, received {smoothing_frames!r}."
-            )
-        if not max_track_speed > 0.0:
-            raise ValueError(
-                f"max_track_speed must be positive, received {max_track_speed!r}."
+                "KF_MEASUREMENT_NOISE must be positive, received "
+                f"{KF_MEASUREMENT_NOISE!r}."
             )
 
         self._grid = grid
         self._bearings = bearings_array
         self._range_max = float(range_max)
-        self._smoothing_frames = int(smoothing_frames)
-        self._max_track_speed = float(max_track_speed)
-        # Prior-frame cluster centroids, stored in the current frame's
-        # rep-cell-sorted order.  Empty until the first update(), so the first
-        # update yields zero velocities.
-        self._prev_centroids: list[tuple[float, float]] = []
-        # Prior-frame per-cluster velocity histories, aligned index-for-index
-        # with ``_prev_centroids`` (same current-sorted order). Each entry is a
-        # deque of RAW instantaneous velocities, maxlen ``smoothing_frames``.
-        # Populated ONLY when smoothing is enabled; on the default path it stays
-        # empty and untouched so the raw-velocity output is bit-for-bit unchanged.
-        self._prev_velocity_histories: list[deque[tuple[float, float]]] = []
+        # Persistent track list, maintained in id-ascending (birth) order.
+        self._tracks: list[_KTrack] = []
+        # Monotonic per-episode birth counter for track ids.  Initialized HERE,
+        # on construction, and never reset per update: each episode builds a
+        # fresh tracker, so ids restart per episode automatically.
+        self._next_track_id: int = 0
 
     def update(
         self,
@@ -327,7 +437,7 @@ class LidarTracker:
         lidar: np.ndarray,
         dt: float,
     ) -> list[Track]:
-        """Estimate one Track per dynamic cluster, sorted by ``id`` ascending.
+        """Advance the tracker one frame; return CONFIRMED Tracks sorted by ``id``.
 
         Parameters
         ----------
@@ -337,9 +447,12 @@ class LidarTracker:
             ``(3,)`` ``[x, y, theta]`` robot pose in the world frame.
         lidar:
             ``(number,)`` range scan (NaN = no return), one entry per bearing.
+            An empty / all-NaN frame is valid: every confirmed track takes a
+            miss (coasting up to ``COAST_MISSES``), tentatives die, no
+            exception.
         dt:
             Frame interval in seconds (the caller passes ``PREDICT_DT``); the
-            velocity denominator.  Must be positive.
+            Kalman prediction timestep.  Must be positive.
         """
         del snapshot  # lidar-only: the truth snapshot is ignored.
 
@@ -470,13 +583,13 @@ class LidarTracker:
         component_keys: list[tuple[int, int]],
         buckets: dict[tuple[int, int], list[tuple[float, float]]],
     ) -> _Cluster:
-        """Reduce one connected component to a centroid, radius, and stable id.
+        """Reduce one connected component to a centroid, radius, and rep cell.
 
         Member points are gathered and sorted by ``(bucket_key, x, y)`` into a
         fixed order, so the centroid ``np.mean`` reduces an identically-ordered
         array every run.  The radius is the max centroid-to-member distance,
-        floored at ``MIN_TRACK_RADIUS``.  The id is the smallest bucket key
-        folded by ``CLUSTER_ID_MULTIPLIER``.
+        floored at ``MIN_TRACK_RADIUS``.  The representative cell is the
+        smallest bucket key — the deterministic detection-order key.
         """
         member_points: list[tuple[tuple[int, int], float, float]] = []
         for bucket_key in component_keys:
@@ -498,9 +611,7 @@ class LidarTracker:
         radius = max(float(distances.max()), MIN_TRACK_RADIUS)
 
         rep_cell = min(component_keys)
-        track_id = rep_cell[0] * CLUSTER_ID_MULTIPLIER + rep_cell[1]
         return _Cluster(
-            track_id=track_id,
             rep_cell=rep_cell,
             centroid_x=centroid_x,
             centroid_y=centroid_y,
@@ -510,139 +621,137 @@ class LidarTracker:
     def _associate_and_build(
         self, clusters: list[_Cluster], dt: float
     ) -> list[Track]:
-        """Associate current clusters to the prior frame and build Tracks.
+        """Run one predict/associate/lifecycle cycle; return confirmed Tracks.
 
-        Greedy, sorted, first-match-wins: current clusters are processed in
-        ``rep_cell`` ascending order, each claiming the nearest UNUSED prior
-        centroid within ``MAX_ASSOCIATION_DISTANCE`` (distance ties broken by the
-        lowest prior index).  A cluster with no prior in range gets zero velocity
-        (a freshly-appeared obstacle).  The current centroids replace the prior
-        state for the next tick.  Tracks are returned sorted by ``id``.
-
-        When opt-in smoothing is enabled (``smoothing_frames > 0``) the reported
-        velocity is the windowed mean of the associated instantaneous-velocity
-        history, which RIDES the same positional ``best_index`` association chain:
-        a current cluster inherits its associated prior cluster's history (or
-        starts a fresh one), appends this frame's RAW instantaneous velocity, and
-        truncates to ``smoothing_frames`` entries. The per-cluster histories are
-        stored in the SAME current-sorted order as ``_prev_centroids`` so the
-        index-based inheritance stays consistent next tick. When the opt-in speed
-        clamp is enabled (``max_track_speed < inf``) the magnitude of the REPORTED
-        velocity (after smoothing) is scaled down to the cap; the raw velocity
-        stored in the history is never clamped.
-
-        With BOTH defaults (``smoothing_frames == 0``, ``max_track_speed == inf``)
-        the reported velocity is exactly the raw instantaneous estimate and no
-        history state is maintained — bit-for-bit identical to the pre-hardening
-        tracker.
+        The frame's clusters become detections in ``rep_cell``-ascending order
+        (``detection_rank`` = index in that order).  Every track is first
+        time-advanced by ``dt`` (KF predict), so the association gate and a
+        coasting track's emitted position are both the PREDICTED state.
+        Association is globally-sorted greedy over the gate-passing
+        ``(distance, track_id, detection_rank)`` triples; lifecycle, birth, and
+        radius rules follow the module constants above.  Output is confirmed
+        tracks only, sorted by ``id`` ascending.
         """
-        ordered = sorted(clusters, key=lambda cluster: cluster.rep_cell)
-        prior = self._prev_centroids
-        used = [False] * len(prior)
+        detections = sorted(clusters, key=lambda cluster: cluster.rep_cell)
 
-        smoothing_on = self._smoothing_frames > 0
-        clamp_on = self._max_track_speed < float("inf")
-        prior_histories = self._prev_velocity_histories
-        # This frame's per-cluster histories, built in the same ``ordered`` order
-        # as the tracks, so they align index-for-index with the centroids stored
-        # below. Only populated when smoothing is on.
-        new_histories: list[deque[tuple[float, float]]] = []
+        # 1. KF time-advance every track (state AND covariance) exactly once
+        #    per frame.  After this, (track.x, track.y) IS the predicted
+        #    position: the association gate reads it, an associated track's
+        #    measurement update refines it, and a coasting track emits it
+        #    unchanged — never a frozen last-seen position.
+        for track in self._tracks:
+            _kf_predict(track, dt)
 
-        tracks: list[Track] = []
-        for cluster in ordered:
-            best_index = -1
-            best_distance: float | None = None
-            for prior_index in range(len(prior)):
-                if used[prior_index]:
-                    continue
-                prior_x, prior_y = prior[prior_index]
-                delta_x = cluster.centroid_x - prior_x
-                delta_y = cluster.centroid_y - prior_y
+        # 2. Prediction-gated, globally-sorted greedy association.  Build every
+        #    gate-passing (distance, track_id, detection_rank) triple, sort
+        #    ONCE, consume greedily (each track and each detection at most
+        #    once).  THE determinism landmine: the sort key is the FULL triple
+        #    — symmetric arena geometry produces exactly-equal float distances,
+        #    and the two int fields make the order total, so ties can never
+        #    resolve nondeterministically.
+        candidate_pairs: list[tuple[float, int, int]] = []
+        for track in self._tracks:
+            for rank, detection in enumerate(detections):
+                delta_x = detection.centroid_x - track.x
+                delta_y = detection.centroid_y - track.y
                 distance = math.sqrt(delta_x * delta_x + delta_y * delta_y)
-                # First-match-wins on equal distance: strict `<` keeps the lowest
-                # prior index (we iterate prior_index ascending).
-                if distance <= MAX_ASSOCIATION_DISTANCE and (
-                    best_distance is None or distance < best_distance
-                ):
-                    best_distance = distance
-                    best_index = prior_index
+                if distance <= ASSOCIATION_GATE_DISTANCE:
+                    candidate_pairs.append((distance, track.id, rank))
+        candidate_pairs.sort()
 
-            if best_index >= 0:
-                used[best_index] = True
-                prior_x, prior_y = prior[best_index]
-                raw_velocity_x = (cluster.centroid_x - prior_x) / dt
-                raw_velocity_y = (cluster.centroid_y - prior_y) / dt
-            else:
-                raw_velocity_x = 0.0
-                raw_velocity_y = 0.0
+        assignment: dict[int, int] = {}  # track id -> detection rank
+        used_ranks: set[int] = set()     # membership checks only, never iterated
+        for _distance, track_id, rank in candidate_pairs:
+            if track_id in assignment or rank in used_ranks:
+                continue
+            assignment[track_id] = rank
+            used_ranks.add(rank)
 
-            if smoothing_on:
-                # The history rides the positional association chain: inherit the
-                # associated prior cluster's deque (a COPY, so mutating this
-                # frame's history never touches the stored prior one), else start
-                # fresh. Append the RAW instantaneous velocity; the bounded deque
-                # truncates to the last ``smoothing_frames`` entries.
-                if best_index >= 0 and best_index < len(prior_histories):
-                    history: deque[tuple[float, float]] = deque(
-                        prior_histories[best_index], maxlen=self._smoothing_frames
+        # 3. Lifecycle sweep over the existing tracks, in id (list) order.
+        survivors: list[_KTrack] = []
+        for track in self._tracks:
+            rank = assignment.get(track.id)
+            if rank is not None:
+                # Gated hit: fold the measurement in, then advance the
+                # lifecycle.  CONFIRM_HITS consecutive gated hits (counting the
+                # birth detection) promote a tentative track; the promotion
+                # frame is also its first emitted frame.
+                detection = detections[rank]
+                _kf_update(track, detection.centroid_x, detection.centroid_y)
+                track.hits += 1
+                track.misses = 0
+                if not track.confirmed and track.hits >= CONFIRM_HITS:
+                    track.confirmed = True
+                # Capped-EMA radius with the merge-suspect gate: a measured
+                # radius jumping past the ratio marks a probable merged blob,
+                # so the radius update is SKIPPED this frame (the position
+                # update above still happened).  The birth frame never reaches
+                # here — births happen in step 4 — so the gate structurally
+                # cannot apply to the birth seed.
+                if detection.radius <= RADIUS_MERGE_SUSPECT_RATIO * track.radius:
+                    blended = (
+                        RADIUS_EMA_BETA * detection.radius
+                        + (1.0 - RADIUS_EMA_BETA) * track.radius
                     )
-                else:
-                    history = deque(maxlen=self._smoothing_frames)
-                history.append((raw_velocity_x, raw_velocity_y))
-                new_histories.append(history)
+                    track.radius = min(max(blended, MIN_TRACK_RADIUS), RADIUS_MAX)
+                survivors.append(track)
+            elif track.confirmed:
+                # Confirmed miss: COAST on the prediction (already advanced in
+                # step 1).  The track stays emitted through misses
+                # 1..COAST_MISSES (its radius untouched), then deletes on the
+                # next consecutive miss — <= 0.3 s of coasting at PREDICT_DT.
+                track.misses += 1
+                if track.misses <= COAST_MISSES:
+                    survivors.append(track)
+            # else: a TENTATIVE track dies on its first miss (dropped here).
 
-                # Windowed mean over the fixed-order deque (deterministic). Manual
-                # averaging over the sequence avoids any np.mean ordering subtlety.
-                count = len(history)
-                sum_x = 0.0
-                sum_y = 0.0
-                for hist_vx, hist_vy in history:
-                    sum_x += hist_vx
-                    sum_y += hist_vy
-                velocity_x = sum_x / count
-                velocity_y = sum_y / count
-            else:
-                # Default path: reported velocity is the raw instantaneous
-                # estimate, bit-for-bit unchanged.
-                velocity_x = raw_velocity_x
-                velocity_y = raw_velocity_y
-
-            if clamp_on:
-                # Clamp the REPORTED velocity magnitude only (never the stored
-                # raw history). Scale (vx, vy) by cap/speed when over the cap.
-                speed = math.sqrt(velocity_x * velocity_x + velocity_y * velocity_y)
-                if speed > self._max_track_speed:
-                    scale = self._max_track_speed / speed
-                    velocity_x *= scale
-                    velocity_y *= scale
-
-            tracks.append(
-                Track(
-                    id=cluster.track_id,
-                    x=cluster.centroid_x,
-                    y=cluster.centroid_y,
-                    vx=velocity_x,
-                    vy=velocity_y,
-                    radius=cluster.radius,
+        # 4. Births: every unassociated detection starts a TENTATIVE track,
+        #    withheld from output until confirmed.  Iterated in rank order so
+        #    birth ids assign deterministically; appended after the survivors,
+        #    which keeps the track list id-ascending (new ids are the largest).
+        for rank, detection in enumerate(detections):
+            if rank in used_ranks:
+                continue
+            survivors.append(
+                _KTrack(
+                    id=self._next_track_id,
+                    x=detection.centroid_x,
+                    y=detection.centroid_y,
+                    vx=0.0,
+                    vy=0.0,
+                    p00=KF_INITIAL_POSITION_VARIANCE,
+                    p01=0.0,
+                    p11=KF_INITIAL_VELOCITY_VARIANCE,
+                    # The birth seed is the floored measured radius — the
+                    # merge-suspect gate does not apply (no prior filtered
+                    # radius), but the hard cap does: AC6 bounds every reported
+                    # radius, including a first-seen merged blob's.
+                    radius=min(max(detection.radius, MIN_TRACK_RADIUS), RADIUS_MAX),
+                    hits=1,
+                    misses=0,
+                    confirmed=False,
                 )
             )
+            self._next_track_id += 1
 
-        # Store this frame's centroids (in current sorted order) for next tick.
-        # A frame with zero dynamic returns (all-static or all-NaN) leaves this
-        # empty, so the NEXT frame restarts every track at zero velocity. That is
-        # an inherent frame-differencing limitation, deterministic, and accepted
-        # for v1 (the cone widening + gate + fail-open peel absorb a one-frame
-        # zero-velocity blip).
-        self._prev_centroids = [
-            (cluster.centroid_x, cluster.centroid_y) for cluster in ordered
+        self._tracks = survivors
+
+        # 5. Emit CONFIRMED tracks only.  The track list is id-ascending by
+        #    construction; the sort restates the output contract.
+        confirmed_tracks = [
+            Track(
+                id=track.id,
+                x=track.x,
+                y=track.y,
+                vx=track.vx,
+                vy=track.vy,
+                radius=track.radius,
+            )
+            for track in self._tracks
+            if track.confirmed
         ]
-        # Store this frame's histories in the SAME order, so next tick's
-        # index-based inheritance stays aligned with ``_prev_centroids``. Left
-        # empty (and never read) on the default path.
-        self._prev_velocity_histories = new_histories
-
-        tracks.sort(key=lambda track: track.id)
-        return tracks
+        confirmed_tracks.sort(key=lambda track: track.id)
+        return confirmed_tracks
 
 
 def predict_blocked_cells(

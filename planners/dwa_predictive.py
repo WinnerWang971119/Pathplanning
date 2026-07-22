@@ -43,7 +43,7 @@ dynamic window, the sampling loop, the rollout, or the fallback:
 
 Velocity source behind the shared ``Tracker`` seam (mirrors D* Lite):
 - ``DWAPredictiveController`` (key ``"dwa_predictive"``): ``LidarTracker``
-  frame-differencing estimator, ``wants_truth=False`` — the Mission-faithful,
+  Kalman multi-object tracker, ``wants_truth=False`` — the Mission-faithful,
   CANONICAL variant.
 - ``DWAPredictiveOracleController`` (key ``"dwa_predictive_oracle"``):
   ``OracleTracker`` perfect live velocities via the truth seam,
@@ -80,9 +80,7 @@ from manual_astar import (
 )
 from planners._costfield import build_cost_to_go_field
 from planners._predict import (
-    MAX_TRACK_SPEED,
     PREDICT_DT,
-    VELOCITY_SMOOTHING_FRAMES,
     LidarTracker,
     OracleTracker,
     Tracker,
@@ -210,8 +208,8 @@ class PredictiveDWAController(DWAController):
         the STATIC inflated occupancy grid the ``LidarTracker`` needs for
         static-return subtraction (harmless/unused for the oracle), and null every
         per-episode member so a reused instance (the ``Controller`` contract allows
-        a second episode) does not difference episode 2's first frame against
-        episode 1's final tracker state.
+        a second episode) does not carry episode 1's final tracker state into
+        episode 2's first frame.
         """
         super().reset(world_yaml, initial_snapshot, lidar0, state0)
 
@@ -472,8 +470,9 @@ class PredictiveDWAController(DWAController):
 class DWAPredictiveController(PredictiveDWAController):
     """Lidar-fed space-time DWA: estimated velocities (the Mission-faithful, canonical key).
 
-    Velocities come from frame-differencing the live lidar (``LidarTracker``), not
-    the truth seam (``wants_truth=False``). Promoted to a canonical study planner.
+    Velocities come from the Kalman multi-object tracker (``LidarTracker``) over the
+    live lidar, not the truth seam (``wants_truth=False``). Promoted to a canonical
+    study planner.
     """
 
     name = "dwa_predictive"
@@ -484,17 +483,14 @@ class DWAPredictiveController(PredictiveDWAController):
         # Lazy: reset() has populated self._grid / self._bearings / self._geom by
         # the time this first fires (first non-h0 act()). The bearings are the exact
         # linspace recovery the rest of the harness uses (NOT i*angle_increment).
-        # Hardening (velocity smoothing + speed clamp) is opt-in on the LidarTracker
-        # and defaults OFF, so it must be requested explicitly here; it is used only
-        # by the DWA lidar keys, leaving d_star_lite_predictive's tracker construction
-        # (and TC63/TC64) byte-unchanged.
+        # LidarTracker is now the Kalman-filter MOT; it takes no hardening kwargs
+        # (smoothing/speed-clamp are subsumed by the KF gain and the association
+        # gate), so this construction is identical to d_star_lite_predictive's.
         assert self._grid is not None and self._bearings is not None and self._geom is not None
         return LidarTracker(
             self._grid,
             self._bearings,
             range_max=self._geom.range_max,
-            smoothing_frames=VELOCITY_SMOOTHING_FRAMES,
-            max_track_speed=MAX_TRACK_SPEED,
         )
 
 
@@ -520,7 +516,7 @@ class DWAPredictivePaperController(DWAPredictiveController):
     Isolates the Missura & Bennewitz braking/soft-yield layer from the
     cost-to-go guidance field by flipping ``use_global_guidance`` back off; the
     base heading term is the plain Euclidean goal-heading DWA already uses.
-    Inherits the hardened ``LidarTracker`` construction from
+    Inherits the ``LidarTracker`` (Kalman MOT) construction from
     :class:`DWAPredictiveController` unchanged (only ``name`` and
     ``use_global_guidance`` differ). EXPERIMENTAL — an ablation cell reached only
     through the runner, not the canonical main-scatter dot (that remains plain

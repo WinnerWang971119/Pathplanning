@@ -12,7 +12,8 @@ seam.
 Per-tick (cheap) — ``_extra_blocked_cells``:
 
 1. asks its :class:`~planners._predict.Tracker` for the current obstacle tracks
-   (the oracle reads the live truth snapshot; the lidar variant frame-differences);
+   (the oracle reads the live truth snapshot; the lidar variant estimates velocities
+   via the Kalman multi-object tracker);
 2. predicts each track's future footprint over the horizon via the pure
    :func:`~planners._predict.predict_blocked_cells` (threat-ordered groups,
    robot-exclusion zone already removed, gated to the planned-path corridor);
@@ -171,8 +172,8 @@ class PredictiveDStarLiteController(DStarLiteController):
         state this subclass adds in ``__init__``. The ``Controller`` contract allows
         an instance to be reset and reused for a second episode, so without this
         override the lazy ``if self._tracker is None`` guard would be skipped on
-        reuse and episode 2's first frame would be differenced against episode 1's
-        final centroids — bogus velocities, phantom stamps. Null every added member
+        reuse and episode 2's first frame would be tracked against episode 1's
+        final track state — bogus velocities, phantom stamps. Null every added member
         back to its constructed state (``_horizon_steps`` / ``geometry`` /
         ``wants_truth`` are construction-time config, not episode state, so they are
         left intact). The tracker rebuilds lazily on the next non-h0 ``act()``.
@@ -485,11 +486,11 @@ class DStarLiteOracleController(PredictiveDStarLiteController):
 class DStarLitePredictiveController(PredictiveDStarLiteController):
     """Lidar-fed predictive D* Lite: estimated velocities, widening cone.
 
-    The Mission-faithful variant: velocities come from frame-differencing the
-    live lidar (LidarTracker), not the truth seam (wants_truth=False). The cone
-    geometry widens the predicted footprint with the lookahead step to absorb
-    the estimator's velocity error, where the oracle's exact velocities warrant
-    only a constant-radius capsule.
+    The Mission-faithful variant: velocities come from the Kalman multi-object
+    tracker (LidarTracker) over the live lidar, not the truth seam
+    (wants_truth=False). The cone geometry widens the predicted footprint with
+    the lookahead step to absorb the estimator's residual velocity error, where
+    the oracle's exact velocities warrant only a constant-radius capsule.
     """
 
     name = "d_star_lite_predictive"
