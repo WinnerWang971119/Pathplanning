@@ -1,8 +1,9 @@
 """Phase 2 crossing-traffic substrate for the Arena harness.
 
 This module provides `DynamicObstacleState` (a frozen per-tick snapshot record)
-and `TrafficSpawner` (the live spawner/advancer/despawner/refiller). It is
-designed to be deterministic under a fixed `traffic_rng` seed: same seed +
+and `TrafficSpawner` (the live spawner/advancer/wall-bouncer). Obstacles reflect
+off the arena walls rather than exiting; the despawn/refill path is a safety net.
+It is designed to be deterministic under a fixed `traffic_rng` seed: same seed +
 same static world + same step count must produce the same sequence of
 `state_sha256()` digests.
 
@@ -37,6 +38,10 @@ SPEED_MIN_FACTOR = 0.3
 SPEED_MAX_FACTOR = 1.5
 SPAWN_OVERLAP_BUFFER = 1.0
 DESPAWN_BUFFER = 0.5
+# Finite-difference step for the static-obstacle surface normal (used when bouncing
+# an obstacle off an interior wall/pillar). Small enough to sample the local normal,
+# large enough to stay clear of float noise.
+STATIC_NORMAL_EPS = 1e-4
 # Generous attempt budget: a spawn almost always succeeds in 1-2 tries, so a high
 # cap makes a silent short-population (the TC18 invariant) effectively impossible
 # without changing RNG consumption on the common path.
@@ -71,8 +76,17 @@ class _LiveObstacle:
 
 
 class TrafficSpawner:
-    """Spawns, advances, despawns, and refills circular dynamic obstacles
-    around a square arena perimeter. Deterministic under fixed RNG state.
+    """Spawns and advances circular dynamic obstacles around a square arena.
+    Deterministic under fixed RNG state.
+
+    Obstacles spawn on the perimeter with an inward heading, then travel in
+    straight lines and BOUNCE (elastic reflection) off both the arena walls (the
+    [0,W]x[0,H] boundary) AND the interior static obstacles (walls/pillars), so
+    the population stays inside, never exits, and never passes through a static
+    obstacle. The despawn/refill machinery is retained only as a safety net: with
+    reflection keeping every center in-bounds it is inert in normal operation, but
+    a fresh obstacle would still refill if one ever escaped, keeping the
+    population at the target.
 
     `live_ids` and `_next_idx` are intentionally distinct: `live_ids`
     reflects which irsim object ids exist *right now*; `_next_idx` is a
@@ -257,13 +271,100 @@ class TrafficSpawner:
 
     def _advance(self) -> None:
         for live in self._live.values():
-            # Update the spawner-side cache FIRST (source of truth for determinism),
-            # then push to the irsim handle once for lidar/collision consumers.
-            live.x = live.x + live.vx * self._dt
-            live.y = live.y + live.vy * self._dt
+            # Integrate, then bounce off (1) interior static walls/pillars and (2) the
+            # arena rectangle [0,W]x[0,H], so obstacles stay inside and never pass through
+            # a static obstacle. The spawner-side cache is the source of truth for
+            # determinism; push to the irsim handle once for lidar/collision consumers.
+            # Both reflections are pure geometry (no RNG draw), so every spawn-draw
+            # determinism guard (TC50's 3-draws-per-spawn) is untouched.
+            x = live.x + live.vx * self._dt
+            y = live.y + live.vy * self._dt
+            vx, vy = live.vx, live.vy
+            # Statics first, then the arena walls LAST so the wall reflection is the final
+            # in-bounds clamp (a static push-out toward the boundary can never leave the
+            # obstacle outside the arena). One arena reflection per axis suffices: the max
+            # per-tick step |v|*dt = 2.0*0.1 = 0.2 m is far smaller than the 50 m span.
+            x, y, vx, vy = self._reflect_off_statics(x, y, vx, vy, live.radius)
+            x, vx = self._reflect(x, vx, self._arena_w)
+            y, vy = self._reflect(y, vy, self._arena_h)
+            live.x, live.y, live.vx, live.vy = x, y, vx, vy
             self._write_xy(live.handle, live.x, live.y)
 
+    @staticmethod
+    def _reflect(pos: float, vel: float, upper: float) -> tuple[float, float]:
+        """Reflect a 1-D position/velocity across the walls at 0 and ``upper``.
+
+        Mirrors the position back inside and flips the velocity sign (speed is
+        conserved — an elastic bounce). A center that lands exactly on a wall or
+        stays inside is returned unchanged.
+        """
+        if pos < 0.0:
+            return -pos, -vel
+        if pos > upper:
+            return 2.0 * upper - pos, -vel
+        return pos, vel
+
+    def _reflect_off_statics(
+        self, x: float, y: float, vx: float, vy: float, radius: float
+    ) -> tuple[float, float, float, float]:
+        """Bounce a moving obstacle off any interior static obstacle it is touching.
+
+        Contact is when the obstacle CENTER is within ``radius`` of a static surface
+        (`point_to_obstacle_distance < radius`). On contact the center is pushed back
+        out to the surface (so it never sinks in or tunnels through) and the velocity
+        is reflected across the surface normal, `v' = v - 2 (v·n) n`, but only when it
+        is moving INTO the surface (`v·n < 0`) so a grazing obstacle is not flipped.
+
+        The normal is the gradient of the analytic distance field (finite differences),
+        which is valid for every obstacle kind — circle, rectangle, polygon, linestring.
+        Detecting at `d < radius` (center still ``radius`` outside the boundary) keeps
+        the gradient well-defined and, since the per-tick step (<=0.2 m) is smaller than
+        the ``radius`` (0.3 m) contact band, prevents tunnelling through a thin wall.
+        """
+        if not self._static_obstacles:
+            return x, y, vx, vy
+        pos = np.array([x, y], dtype=np.float64)
+        vel = np.array([vx, vy], dtype=np.float64)
+        for static_obs in self._static_obstacles:
+            d = self._point_to_obstacle_distance(pos, static_obs)
+            if d >= radius:
+                continue
+            normal = self._surface_normal(pos, static_obs)
+            if normal is None:
+                continue
+            pos = pos + (radius - d) * normal
+            v_dot_n = float(vel @ normal)
+            if v_dot_n < 0.0:
+                vel = vel - 2.0 * v_dot_n * normal
+        return float(pos[0]), float(pos[1]), float(vel[0]), float(vel[1])
+
+    def _surface_normal(self, pos: np.ndarray, static_obs: Any) -> np.ndarray | None:
+        """Outward unit normal of a static obstacle at ``pos`` via central differences
+        of the distance field. Returns None when the gradient is degenerate (e.g. the
+        obstacle center coincides with a pillar center, or ``pos`` is inside a polygon
+        where the clamped-to-0 distance has no slope)."""
+        eps = STATIC_NORMAL_EPS
+        dx = np.array([eps, 0.0])
+        dy = np.array([0.0, eps])
+        grad = np.array(
+            [
+                self._point_to_obstacle_distance(pos + dx, static_obs)
+                - self._point_to_obstacle_distance(pos - dx, static_obs),
+                self._point_to_obstacle_distance(pos + dy, static_obs)
+                - self._point_to_obstacle_distance(pos - dy, static_obs),
+            ],
+            dtype=np.float64,
+        )
+        norm = float(np.linalg.norm(grad))
+        if norm < 1e-9:
+            return None
+        return grad / norm
+
     def _despawn(self) -> None:
+        # Safety net only. Obstacles now reflect off the arena walls in _advance, so a
+        # center never leaves [0,W]x[0,H] and this buffer (outside [-DESPAWN_BUFFER,
+        # W+DESPAWN_BUFFER]) is never crossed in normal operation. Kept so a numerically
+        # escaped obstacle would still be removed and refilled rather than lingering.
         lo_x = -DESPAWN_BUFFER
         hi_x = self._arena_w + DESPAWN_BUFFER
         lo_y = -DESPAWN_BUFFER

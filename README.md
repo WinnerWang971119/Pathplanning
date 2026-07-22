@@ -187,8 +187,10 @@ Each layer is usable from the command line.
 `arena/arena.py` wraps irsim and exposes a uniform
 `step(action) -> (state, lidar, done, info)` interface. The canonical world is
 `arena/arena_v1.yaml` (50×50, two staggered length-30 walls + 12 circle
-pillars). Pass `traffic=True` to spawn a continuously refilled ~20-obstacle
-population of straight-line crossing traffic.
+pillars). Pass `traffic=True` to spawn a 20-obstacle population of crossing
+traffic that travels in straight lines and bounces off the arena walls and the
+interior static obstacles (so it stays inside, never passes through an obstacle,
+and the robot can't wait it out).
 
 ```powershell
 # Visible smoke loop — drive the world and watch the render window
