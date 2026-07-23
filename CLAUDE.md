@@ -120,7 +120,7 @@ Optional flags: `--render` (opens the irsim render window) and `--results-dir <d
 
 ## The traffic harness (Phase 2)
 
-`arena/dynamic.py` adds Mission.md's crossing-traffic substrate. `Arena(..., traffic=True)` instantiates a `TrafficSpawner` that maintains a ~20-obstacle population of straight-line, edge-spawned, uniformly-on-perimeter-distributed dynamic obstacles. Each obstacle is a circle (r=0.3 m) registered into irsim via `env.create_obstacle({'name':'omni'}, ...) + env.add_object`, so lidar and `robot.collision_flag` see them natively — no custom collision code. Traffic runs pass `log_level="ERROR"` to `irsim.make` to mute the per-tick `Behavior not defined` omni warning irsim emits for every obstacle.
+`arena/dynamic.py` adds Mission.md's crossing-traffic substrate. `Arena(..., traffic=True)` instantiates a `TrafficSpawner` that maintains a 20-obstacle population of edge-spawned, uniformly-on-perimeter-distributed dynamic obstacles that travel in straight lines and BOUNCE (elastic reflection) off both the arena walls (the `[0,W]x[0,H]` boundary) AND the interior static obstacles (walls/pillars) in `_advance`, so obstacles stay inside, never exit — the robot can't wait out the traffic — and never pass through a static. The static bounce reflects velocity across the surface normal (the finite-difference gradient of `manual_astar.point_to_obstacle_distance`, valid for every obstacle kind) and pushes the center back to the surface; contact is detected at center-distance `< radius`, so the 0.2 m/tick step never tunnels the 0.3 m contact band. Both reflections are pure geometry (no RNG draw), so the spawn-draw determinism guards are untouched; the despawn/refill path is retained only as an inert safety net (a numerically-escaped obstacle would refill). Each obstacle is a circle (r=0.3 m) registered into irsim via `env.create_obstacle({'name':'omni'}, ...) + env.add_object`, so lidar and `robot.collision_flag` see them natively — no custom collision code. Traffic runs pass `log_level="ERROR"` to `irsim.make` to mute the per-tick `Behavior not defined` omni warning irsim emits for every obstacle.
 
 **API:**
 - `Arena(yaml, seed, traffic=True, ...)` — opt-in flag; default `False` for Phase 0/1 compatibility.
@@ -143,7 +143,7 @@ Optional flags: `--render` (opens the irsim render window) and `--results-dir <d
 
 **TC17–TC24** (added to `python arena/arena.py arena/arena_v1.yaml --check`):
 - TC17: init population of 20, every spawn on a perimeter edge with inward heading.
-- TC18: refill maintains population at 20 across a full-traversal window (verifies the despawn/respawn cycle).
+- TC18: obstacles bounce off the arena walls AND the interior statics across a full-traversal window — population holds at 20, every obstacle center stays inside `[0,W]x[0,H]`, no obstacle penetrates a static obstacle (center-to-surface gap stays `>= radius - 0.05`), the live-id set does not churn (no despawn/respawn), and at least one reflection fires.
 - TC19: robot-vs-dynamic-obstacle collision fires `info.crashed` via `_inject_for_test`.
 - TC20: two same-seed runs produce identical `dynamic_obstacles_sha256` sequences (per-tick).
 - TC21: `initial_dynamic_snapshot` is a tuple of frozen `DynamicObstacleState` of length 20; mutation raises `FrozenInstanceError`.
@@ -273,8 +273,8 @@ The dynamic-obstacle speed band is now a swept parameter, so the harness can mea
 - TC48: regime table + resolver — `SPEED_REGIMES` is the exact 4 bands, `resolve_speed_factors("current",None,None)==(0.3,1.5)` and equals the spawner constants, both overrides return them, an unknown regime raises.
 - TC49: spawner bound validation — `speed_min_factor<=0` and `speed_max_factor<speed_min_factor` each raise `ValueError`; `min==max` is allowed.
 - TC50: baseline determinism preservation + draw-count guard — `Arena(traffic=True)` vs explicit `(0.3,1.5)` give byte-identical `dynamic_obstacles_sha256`, `--speed-regime current` trace == no-flag trace, `--speed-regime fast` differs, and the per-spawn `traffic_rng` draw count is asserted unchanged (3 per attempt).
-- TC51: band wired + controlled-experiment property — at one seed two regimes' initial `initialize()` snapshots give identical spawn `(x,y)` and identical velocity direction per obstacle id, with only speeds scaled by the band (initial snapshot only; refills diverge once an obstacle despawns).
-- TC52: non-baseline determinism across a despawn/refill — two same-seed `Arena(traffic=True, speed_min_factor=0.5, speed_max_factor=2.0)` runs give identical sha256 sequences over enough ticks to force a refill.
+- TC51: band wired + controlled-experiment property — at one seed two regimes' initial `initialize()` snapshots give identical spawn `(x,y)` and identical velocity direction per obstacle id, with only speeds scaled by the band (initial snapshot only; once stepping begins, faster obstacles reach the walls and reflect sooner, so the regimes diverge).
+- TC52: non-baseline determinism across a bounce cycle — two same-seed `Arena(traffic=True, speed_min_factor=0.5, speed_max_factor=2.0)` runs give identical sha256 sequences over ~180 ticks (long enough for the fast obstacles to reach the walls and reflect); the window must exercise at least one reflection and the live-id set must not churn.
 - TC-CLI: speed-flag CLI rejection — subprocess `run_episode` with regime+override / lone min / lone max / unknown regime / non-positive min / max < min each exits 2 and writes no `<seed>.json`.
 - TC-FWD: `run_experiment` flag forwarding — the pure child-command builder emits `--speed-regime <regime>` (or the float overrides) in the child argv and the manifest carries the three provenance fields.
 

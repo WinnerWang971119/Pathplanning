@@ -1252,36 +1252,77 @@ def tc17(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own se
 
 
 def tc18(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own seed
-    """Refill maintains population at 20 across a full-traversal window, with at least one despawn."""
-    from arena.dynamic import TARGET_POPULATION
+    """Obstacles bounce off the arena walls AND the interior statics: population
+    stays 20, every obstacle stays inside the arena, never penetrates a static
+    obstacle, no despawn churn, and at least one reflection fires."""
+    from arena.dynamic import TARGET_POPULATION, OBSTACLE_RADIUS
+    from manual_astar import load_world, point_to_obstacle_distance
 
     arena = Arena(yaml_path, seed=1, traffic=True)
     try:
         _, _, _ = arena.reset()
         initial_live_ids = set(arena.initial_dynamic_snapshot[i].id for i in range(TARGET_POPULATION))
 
-        # Run enough ticks for the slowest obstacle (0.3 m/s) to traverse 50 m at dt=0.1:
+        # Read the world dims from the YAML so the bounds check tracks any arena resize.
+        import yaml as _yaml
+        with open(yaml_path, "r", encoding="utf-8") as fh:
+            world_data = _yaml.safe_load(fh)
+        W = float(world_data["world"]["width"])
+        H = float(world_data["world"]["height"])
+        tol = 1e-9
+        # Static obstacles the movers must bounce off (not pass through). The push-out
+        # pins a contacting obstacle at its surface (gap ~= 0); a true pass-through would
+        # sink the center inward (gap ~= -radius). 0.05 m cleanly separates the two —
+        # measured worst gap over 6870 ticks x 20 seeds was ~0 (float noise).
+        statics = load_world(yaml_path).obstacles
+        pen_tol = 0.05
+
+        # Run long enough for the slowest obstacle (0.3 m/s) to cross 50 m and bounce:
         # 50 / 0.3 ≈ 167 ticks, plus 50 margin.
         max_ticks = int(50.0 / 0.3 / arena._dt) + 50
         zero = np.array([[0.0], [0.0]], dtype=float)
+        assert arena._spawner is not None
+        prev_vel = {s.id: (s.vx, s.vy) for s in arena.initial_dynamic_snapshot}
+        reflected = False
         for _ in range(max_ticks):
             _, _, _, info = arena.step(zero)
             assert info.dynamic_obstacle_count == TARGET_POPULATION, (
-                f"TC18: dynamic_obstacle_count fell to {info.dynamic_obstacle_count} at step {info.step_idx}; "
-                f"refill broken"
+                f"TC18: dynamic_obstacle_count fell to {info.dynamic_obstacle_count} at step "
+                f"{info.step_idx}; population must hold at {TARGET_POPULATION}"
             )
+            # Every obstacle center must stay inside the arena rectangle (reflection working).
+            for s in arena._spawner.snapshot():
+                assert -tol <= s.x <= W + tol and -tol <= s.y <= H + tol, (
+                    f"TC18: obstacle {s.id} left the arena at ({s.x}, {s.y}) — "
+                    f"reflection failed (W={W}, H={H})"
+                )
+                # And must never penetrate an interior static obstacle (it bounces off).
+                center = np.array([s.x, s.y], dtype=np.float64)
+                for obs in statics:
+                    gap = point_to_obstacle_distance(center, obs) - s.radius
+                    assert gap >= -pen_tol, (
+                        f"TC18: obstacle {s.id} at ({s.x:.3f}, {s.y:.3f}) penetrated a "
+                        f"static (gap={gap:.4f} m < -{pen_tol}); it should bounce off, "
+                        "not pass through."
+                    )
+                # A velocity-component sign flip is a bounce off a wall or static.
+                pvx, pvy = prev_vel.get(s.id, (s.vx, s.vy))
+                if pvx * s.vx < 0.0 or pvy * s.vy < 0.0:
+                    reflected = True
+                prev_vel[s.id] = (s.vx, s.vy)
             if info.crashed or info.timed_out or info.reached_goal:
-                # Done early — should not happen with a stationary robot in arena_v1's
-                # safe (2,2) start, but break cleanly if it does.
                 break
-        # initial_dynamic_snapshot is frozen at t=0, so read the final live set
-        # straight from the spawner to detect despawn churn.
-        assert arena._spawner is not None
+        # Obstacles bounce instead of exiting, so the live-id set must NOT churn.
         final_live_ids = set(arena._spawner.live_ids)
-        churned = initial_live_ids.symmetric_difference(final_live_ids)
-        assert len(churned) > 0, (
-            f"TC18: expected at least one despawn over {max_ticks} ticks, but the live-id set "
-            f"is unchanged ({len(initial_live_ids)} ids). Despawn path may be broken."
+        assert final_live_ids == initial_live_ids, (
+            f"TC18: live-id set churned over {max_ticks} ticks "
+            f"(added={sorted(final_live_ids - initial_live_ids)}, "
+            f"removed={sorted(initial_live_ids - final_live_ids)}). Obstacles should "
+            "bounce off the walls, not despawn/respawn."
+        )
+        assert reflected, (
+            f"TC18: no obstacle reflected off a wall over {max_ticks} ticks "
+            f"(radius={OBSTACLE_RADIUS}); the bounce path was never exercised."
         )
     finally:
         arena.close()
@@ -3399,7 +3440,7 @@ def tc45(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own in
 # reordered/added traffic_rng draw breaks the byte-identical baseline here);
 # TC51 proves the band is wired at the t=0 snapshot only (positions/heading
 # identical across regimes, speeds scaled); TC52 is non-baseline determinism
-# across a despawn/refill cycle; TC-CLI subprocess-asserts the runner rejects
+# across a bounce cycle; TC-CLI subprocess-asserts the runner rejects
 # bad/conflicting speed flags with exit 2; TC-FWD proves run_experiment's pure
 # command-builder forwards the flags and the manifest records the band.
 # ---------------------------------------------------------------------------
@@ -3560,9 +3601,9 @@ def tc51(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own se
     Overlap rejection is position-only and speed-independent, so at a fixed seed
     the two regimes' t=0 spawn population shares identical (x, y) and identical
     velocity DIRECTION; only the speed magnitude scales with the band. This holds
-    ONLY at the initial snapshot — once a (faster) obstacle despawns and refills,
-    the regimes draw a differing count of traffic_rng values and diverge — so we
-    assert on the snapshot only, NEVER after stepping.
+    ONLY at the initial snapshot — once the arena advances, faster obstacles reach
+    the walls and reflect sooner, so the regimes' positions/velocities diverge — so
+    we assert on the snapshot only, NEVER after stepping.
     """
     import math
 
@@ -3622,19 +3663,20 @@ def tc51(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own se
 
 
 def tc52(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own seed
-    """Non-baseline determinism across a despawn/refill cycle.
+    """Non-baseline determinism across a bounce cycle.
 
     Two same-seed Arenas at the fast band (0.5, 2.0) must produce byte-identical
-    dynamic_obstacles_sha256 sequences over enough ticks to force at least one
-    despawn+refill. Fast obstacles clear the arena quickly, so ~180 ticks
-    guarantees the refill RNG path is exercised — proving determinism holds at a
-    non-baseline cap, not just at the baseline TC50 covers.
+    dynamic_obstacles_sha256 sequences over ~180 ticks — long enough for the fast
+    obstacles to reach the walls and reflect — proving determinism holds at a
+    non-baseline cap, not just at the baseline TC50 covers. The window must
+    actually exercise the reflection path (at least one wall bounce), and the
+    population must bounce rather than churn (the live-id set stays put).
     """
     seed_value = 11
     n_ticks = 180
     zero = np.array([[0.0], [0.0]], dtype=float)
 
-    def collect_hashes() -> tuple[list[str], frozenset[int], frozenset[int]]:
+    def collect_hashes() -> tuple[list[str], frozenset[int], frozenset[int], bool]:
         arena = Arena(
             yaml_path,
             seed=seed_value,
@@ -3649,6 +3691,8 @@ def tc52(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own se
             )
             assert arena._spawner is not None, "TC52: spawner must be live with traffic=True"
             initial_ids = frozenset(obs.id for obs in arena.initial_dynamic_snapshot)
+            prev_vel = {s.id: (s.vx, s.vy) for s in arena.initial_dynamic_snapshot}
+            reflected = False
             hashes = [info0.dynamic_obstacles_sha256]
             for _ in range(n_ticks):
                 _, _, _, info = arena.step(zero)
@@ -3656,33 +3700,39 @@ def tc52(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own se
                     f"TC52: step {info.step_idx} sha256 is None with traffic on"
                 )
                 hashes.append(info.dynamic_obstacles_sha256)
+                for s in arena._spawner.snapshot():
+                    pvx, pvy = prev_vel.get(s.id, (s.vx, s.vy))
+                    if pvx * s.vx < 0.0 or pvy * s.vy < 0.0:
+                        reflected = True
+                    prev_vel[s.id] = (s.vx, s.vy)
                 if info.crashed or info.timed_out or info.reached_goal:
                     break
             # Read the final live id-set straight from the spawner (the t=0
-            # initial_dynamic_snapshot is frozen) so the despawn/refill turnover
-            # is observable.
+            # initial_dynamic_snapshot is frozen) so churn is observable.
             final_ids = frozenset(arena._spawner.live_ids)
-            return hashes, initial_ids, final_ids
+            return hashes, initial_ids, final_ids, reflected
         finally:
             arena.close()
 
-    hashes_a, initial_ids, final_ids = collect_hashes()
-    hashes_b, _, _ = collect_hashes()
+    hashes_a, initial_ids, final_ids, reflected = collect_hashes()
+    hashes_b, _, _, _ = collect_hashes()
     assert hashes_a == hashes_b, (
         "TC52: two same-seed fast-band runs produced differing sha256 sequences; "
         "non-baseline determinism is broken. First mismatch at tick "
         f"{next((i for i, (a, b) in enumerate(zip(hashes_a, hashes_b)) if a != b), 'n/a')}"
     )
-    # The label "across a despawn/refill cycle" must hold: the population has to
-    # actually turn over (at least one id despawned AND a new id appeared), else
-    # the fast-band refill RNG path was never exercised.
-    despawned = initial_ids - final_ids
-    appeared = final_ids - initial_ids
-    assert despawned and appeared, (
-        f"TC52: expected a despawn/refill turnover over {n_ticks} ticks at the fast band, "
-        f"but the live-id set did not turn over (despawned={sorted(despawned)}, "
-        f"appeared={sorted(appeared)}). The refill path was not exercised, so the "
-        "non-baseline determinism claim is not actually testing a refill cycle."
+    # The window must actually exercise the reflection path, else it degenerates to
+    # a static-population determinism check the baseline TC50 already covers.
+    assert reflected, (
+        f"TC52: no obstacle reflected off a wall over {n_ticks} ticks at the fast band; "
+        "the bounce path was not exercised, so the non-baseline determinism claim is "
+        "not actually testing a dynamic cycle."
+    )
+    # Obstacles bounce rather than despawn/respawn, so the live-id set must not churn.
+    assert final_ids == initial_ids, (
+        f"TC52: live-id set churned at the fast band "
+        f"(added={sorted(final_ids - initial_ids)}, removed={sorted(initial_ids - final_ids)}); "
+        "obstacles should bounce off the walls, not despawn/respawn."
     )
 
 
@@ -6645,7 +6695,7 @@ def _run_checks(yaml_path: str, seed: int) -> int:
         ("TC15: determinism — same seed -> byte-identical trace", tc15),
         ("TC16: planner failure on arena_no_path.yaml", tc16),
         ("TC17: init population (20 on edges, inward)", tc17),
-        ("TC18: refill maintained across full-traversal window", tc18),
+        ("TC18: obstacles bounce off walls (population held, in-bounds, no churn)", tc18),
         ("TC19: robot-vs-dynamic-obstacle collision via _inject_for_test", tc19),
         ("TC20: traffic determinism — sha256 sequences match", tc20),
         ("TC21: snapshot shape, type, immutability", tc21),
@@ -6679,7 +6729,7 @@ def _run_checks(yaml_path: str, seed: int) -> int:
         ("TC49: speed-band bound validation (one-sided/bad bounds raise)", tc49),
         ("TC50: baseline determinism + draw-order guard (binding gate)", tc50),
         ("TC51: band wired at initial snapshot (positions equal, speeds scaled)", tc51),
-        ("TC52: non-baseline determinism across a despawn/refill cycle", tc52),
+        ("TC52: non-baseline determinism across a bounce cycle", tc52),
         ("TC-CLI: speed-flag CLI rejection (exit 2, no JSON)", tc_cli),
         ("TC-FWD: run_experiment flag forwarding + manifest provenance", tc_fwd),
         ("TC53: predict_blocked_cells capsule geometry (disk train, sorted, deterministic)", tc53),

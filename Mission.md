@@ -18,7 +18,7 @@ properties trade off.
 | Start / goal | **Fixed**: `(2, 2) → (48, 48)` (opposite corners), all seeds |
 | Goal-reached detection | Use irsim's built-in goal detection |
 | Crash detection | Use irsim's built-in collision flag |
-| Dynamic obstacle model | **Spawned + linear** crossing traffic: random heading/speed at the edges, straight-line motion, despawn on exit |
+| Dynamic obstacle model | **Spawned + linear** crossing traffic: random heading/speed at the edges, straight-line motion, **bounces off the arena walls and the interior statics** (elastic reflection) so it stays inside and never passes through an obstacle |
 | **Population is maintained at ~20** | New obstacles respawn as soon as old ones exit. Robot can't game the experiment by waiting for traffic to clear. |
 | Dynamic obstacle speed | **0.3 – 1.5 × robot top speed**, sampled per obstacle |
 | Dynamic obstacle shape | Uniform small circles, **r = 0.3 m** |
@@ -73,8 +73,10 @@ obstacles yet) and confirm:
 ## Phase 2 — Dynamic obstacles (crossing traffic)
 
 Crossing-traffic model: obstacles spawn at the arena edges with random
-heading and speed, travel straight, despawn when they exit. Population
-maintained at **~20** by respawning immediately.
+heading and speed, travel straight, and **bounce off the arena walls and the
+interior static obstacles** (elastic reflection) so they stay inside and never
+pass through an obstacle. Population is a fixed **20** — with nothing exiting,
+the count holds without respawn churn.
 
 - `DynamicObstacle` class with `step(dt, rng)` advancing position.
 - `TrafficSpawner` maintains the target population and uses the seeded RNG
@@ -83,9 +85,10 @@ maintained at **~20** by respawning immediately.
 - Each obstacle is rendered into the irsim world so the lidar sees it
   naturally — no special observation channel.
 
-Critical design constraint: **population must be continuously refilled**.
-Otherwise the robot can wait out the traffic, which collapses the
-experiment.
+Critical design constraint: **traffic must never clear**. Bouncing obstacles
+off the walls satisfies this structurally — nothing exits, so the robot can't
+wait out the traffic, which would collapse the experiment. (The despawn/refill
+path is kept only as an inert safety net.)
 
 Open questions:
 
